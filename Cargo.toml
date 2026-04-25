@@ -1,9 +1,7 @@
 [workspace]
 members = [
     "crates/stowken",
-    "crates/stowken-enterprise",
     "crates/stowken-python",
-    "crates/stowken-node",
     "crates/stowken-cli",
 ]
 resolver = "2"

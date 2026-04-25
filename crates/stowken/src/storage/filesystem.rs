@@ -9,7 +9,6 @@
 //! The metadata SQLite database lives at:
 //!   `{root}/metadata.db`
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,10 +16,7 @@ use async_trait::async_trait;
 use tokio::fs;
 use tokio::sync::Mutex;
 
-use crate::types::{
-    AnalyticsQuery, ConversationManifest, SegmentHash, SegmentTypeStats,
-    StoredSegment, TokenUsageStats,
-};
+use crate::types::{AnalyticsQuery, ConversationManifest, SegmentHash, StoredSegment};
 
 use super::backend::{StorageBackend, StorageError, StorageResult};
 
@@ -165,14 +161,6 @@ impl StorageBackend for FilesystemBackend {
         Ok(self.segment_path(hash).exists())
     }
 
-    async fn has_segments(&self, hashes: &[SegmentHash]) -> StorageResult<Vec<SegmentHash>> {
-        Ok(hashes
-            .iter()
-            .filter(|h| self.segment_path(h).exists())
-            .cloned()
-            .collect())
-    }
-
     async fn increment_ref(&self, hash: &SegmentHash) -> StorageResult<()> {
         let _guard = self.mu.lock().await;
         let mut meta = self.read_meta(hash).await?;
@@ -271,69 +259,12 @@ impl StorageBackend for FilesystemBackend {
         Ok(ids.into_iter().skip(offset as usize).take(limit as usize).collect())
     }
 
-    // ── Analytics ─────────────────────────────────────────────────────────
-    // For the filesystem backend, analytics are driven by the MetadataIndex in vault.rs.
-    // These methods provide minimal implementations.
-
-    async fn get_stats(&self) -> StorageResult<TokenUsageStats> {
-        Ok(TokenUsageStats {
-            total_tokens: 0,
-            total_conversations: 0,
-            unique_segments: 0,
-            total_segments: 0,
-            dedup_ratio: 0.0,
-            compression_ratio: 1.0,
-            storage_bytes: 0,
-            naive_bytes: 0,
-            savings_percentage: 0.0,
-        })
-    }
-
-    async fn get_segment_type_stats(&self) -> StorageResult<Vec<SegmentTypeStats>> {
-        Ok(vec![])
-    }
-
-    async fn query_analytics(
-        &self,
-        _query: &AnalyticsQuery,
-    ) -> StorageResult<Vec<HashMap<String, serde_json::Value>>> {
-        Ok(vec![])
-    }
-
-    async fn list_unique_system_prompts(&self) -> StorageResult<Vec<(SegmentHash, u32, u64)>> {
-        Ok(vec![])
-    }
-
-    async fn find_conversations_by_segment(
-        &self,
-        hash: &SegmentHash,
-    ) -> StorageResult<Vec<String>> {
-        // Scan all manifests — expensive for large stores; use MetadataIndex instead.
-        let manifest_dir = self.root.join("manifests");
-        let mut read_dir = fs::read_dir(&manifest_dir).await?;
-        let mut ids = Vec::new();
-        while let Some(entry) = read_dir.next_entry().await? {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.ends_with(".json") {
-                let id = name_str.trim_end_matches(".json").to_owned();
-                if let Ok(manifest) = self.get_manifest(&id).await {
-                    if manifest.segments.iter().any(|s| &s.hash == hash) {
-                        ids.push(id);
-                    }
-                }
-            }
-        }
-        Ok(ids)
-    }
-
-    async fn garbage_collect(&self) -> StorageResult<u64> {
+    async fn list_garbage(&self) -> StorageResult<Vec<SegmentHash>> {
         let segments_dir = self.root.join("segments");
-        let mut deleted: u64 = 0;
+        let mut out = Vec::new();
         if !segments_dir.exists() {
-            return Ok(0);
+            return Ok(out);
         }
-        // Walk the two-level prefix directory
         let mut top = fs::read_dir(&segments_dir).await?;
         while let Some(prefix1) = top.next_entry().await? {
             let mut mid = fs::read_dir(prefix1.path()).await?;
@@ -348,12 +279,21 @@ impl StorageBackend for FilesystemBackend {
                     let hash = SegmentHash(name_str.to_string());
                     if let Ok(meta) = self.read_meta(&hash).await {
                         if meta.ref_count == 0 {
-                            self.delete_segment(&hash).await?;
-                            deleted += 1;
+                            out.push(hash);
                         }
                     }
                 }
             }
+        }
+        Ok(out)
+    }
+
+    async fn garbage_collect(&self) -> StorageResult<u64> {
+        let candidates = self.list_garbage().await?;
+        let mut deleted = 0u64;
+        for hash in candidates {
+            self.delete_segment(&hash).await?;
+            deleted += 1;
         }
         Ok(deleted)
     }
@@ -426,6 +366,7 @@ mod tests {
 
     fn make_manifest(id: &str) -> ConversationManifest {
         ConversationManifest {
+            schema_version: crate::types::MANIFEST_SCHEMA_VERSION,
             id: id.to_owned(),
             application: None,
             model: "gpt-4".to_owned(),
@@ -644,6 +585,7 @@ mod tests {
         let (b, _dir) = backend().await;
         for i in 0..20 {
             let m = ConversationManifest {
+                schema_version: crate::types::MANIFEST_SCHEMA_VERSION,
                 id: format!("conv-{i:02}"),
                 application: None,
                 model: "gpt-4".to_owned(),

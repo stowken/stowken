@@ -74,8 +74,8 @@ pub async fn export_jsonl<B: StorageBackend + 'static>(
         // Emit paired turns
         let pair_count = user_segs.len().min(asst_segs.len());
         for i in 0..pair_count {
-            let user_hash = format!("{:x}", md5_tokens(&user_segs[i]));
-            let asst_hash = format!("{:x}", md5_tokens(&asst_segs[i]));
+            let user_hash = format!("{:x}", hash_pair_key(&user_segs[i]));
+            let asst_hash = format!("{:x}", hash_pair_key(&asst_segs[i]));
             total_pairs += 1;
 
             if config.deduplicate_pairs {
@@ -135,8 +135,10 @@ pub async fn export_jsonl<B: StorageBackend + 'static>(
     })
 }
 
-/// Lightweight 64-bit hash of a token slice used for dedup key generation.
-fn md5_tokens(tokens: &[u32]) -> u64 {
+/// Lightweight non-cryptographic 64-bit hash of a token slice used as the
+/// dedup key for `(user, assistant)` pair comparison. Not collision-resistant;
+/// good enough for in-corpus dedup signaling at typical sizes.
+fn hash_pair_key(tokens: &[u32]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     tokens.hash(&mut hasher);

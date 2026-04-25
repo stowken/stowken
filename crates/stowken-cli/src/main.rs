@@ -14,7 +14,8 @@ use tabled::{Table, Tabled};
 use stowken::{
     storage::FilesystemBackend,
     types::{
-        Conversation, ExportConfig, ExportFormat, Message, MessageContent, StowkenConfig,
+        AnalyticsQuery, Conversation, ExportConfig, ExportFormat, Message, MessageContent,
+        StowkenConfig,
     },
     Stowken,
 };
@@ -134,6 +135,40 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Audit unique system prompts by reference count (find prompt drift).
+    AuditSystemPrompts {
+        /// Show only prompts with at least this many references.
+        #[arg(long, default_value_t = 1)]
+        min_refs: u64,
+        /// Maximum number of prompts to print.
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
+    },
+
+    /// Token attribution by model, application, segment type, or day.
+    Cost {
+        /// Comma-separated grouping dimensions: model, application, segment_type, day.
+        /// Example: --by application,model
+        #[arg(long, default_value = "model")]
+        by: String,
+        /// Filter by model.
+        #[arg(long)]
+        model: Option<String>,
+        /// Filter by application.
+        #[arg(long)]
+        application: Option<String>,
+    },
+
+    /// Find heavily-referenced segments — refactor candidates.
+    FindDuplicates {
+        /// Minimum reference count to surface.
+        #[arg(long, default_value_t = 10)]
+        threshold: u64,
+        /// Maximum number of segments to print.
+        #[arg(long, default_value_t = 25)]
+        limit: u64,
+    },
+
     /// Print the resolved data directory and exit.
     DataDir,
 }
@@ -147,9 +182,6 @@ async fn main() -> Result<()> {
     let data_dir = resolve_data_dir(cli.data_dir)?;
     let config = StowkenConfig {
         enable_compression: !cli.no_compression,
-        dictionary_path: None,
-        tenant_id: None,
-        ..StowkenConfig::default()
     };
 
     match cli.command {
@@ -213,6 +245,15 @@ async fn main() -> Result<()> {
         }
         Command::Gc { dry_run } => {
             cmd_gc(&data_dir, config, dry_run).await?;
+        }
+        Command::AuditSystemPrompts { min_refs, limit } => {
+            cmd_audit_system_prompts(&data_dir, config, min_refs, limit, cli.json).await?;
+        }
+        Command::Cost { by, model, application } => {
+            cmd_cost(&data_dir, config, &by, model, application, cli.json).await?;
+        }
+        Command::FindDuplicates { threshold, limit } => {
+            cmd_find_duplicates(&data_dir, config, threshold, limit, cli.json).await?;
         }
     }
 
@@ -482,18 +523,198 @@ async fn cmd_segment_stats(data_dir: &PathBuf, config: StowkenConfig, json: bool
 }
 
 async fn cmd_gc(data_dir: &PathBuf, config: StowkenConfig, dry_run: bool) -> Result<()> {
+    let vault = open_vault(data_dir, config).await?;
     if dry_run {
-        let vault = open_vault(data_dir, config).await?;
-        let s = vault.stats().await.context("fetching stats")?;
-        // Approximation: segments with ref_count == 0 aren't tracked in the
-        // aggregate stats until GC is run — report current storage for context.
-        println!("Dry run: storage currently {} ({} unique segments)",
-            format_bytes(s.storage_bytes), s.unique_segments);
-        println!("Run without --dry-run to collect garbage.");
+        let candidates = vault.gc_candidates().await.context("listing GC candidates")?;
+        if candidates.is_empty() {
+            println!("Dry run: 0 segment(s) eligible for GC.");
+        } else {
+            println!("Dry run: {} segment(s) eligible for GC:", candidates.len());
+            for hash in &candidates {
+                println!("  {}", hash.0);
+            }
+            println!("Run without --dry-run to delete them.");
+        }
     } else {
-        let vault = open_vault(data_dir, config).await?;
         let deleted = vault.gc().await.context("running GC")?;
         println!("GC complete: deleted {deleted} orphaned segment(s)");
+    }
+    Ok(())
+}
+
+async fn cmd_audit_system_prompts(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    min_refs: u64,
+    limit: u64,
+    json: bool,
+) -> Result<()> {
+    let vault = open_vault(data_dir, config).await?;
+    let prompts = vault
+        .list_system_prompts()
+        .await
+        .context("listing system prompts")?;
+    let filtered: Vec<_> = prompts
+        .into_iter()
+        .filter(|p| p.ref_count >= min_refs)
+        .take(limit as usize)
+        .collect();
+
+    if json {
+        let out: Vec<serde_json::Value> = filtered
+            .iter()
+            .map(|p| serde_json::json!({
+                "hash":        p.hash.0,
+                "token_count": p.token_count,
+                "ref_count":   p.ref_count,
+            }))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if filtered.is_empty() {
+        println!("No system prompts with ref_count >= {min_refs}.");
+    } else {
+        #[derive(Tabled)]
+        struct Row {
+            #[tabled(rename = "Refs")]
+            ref_count: u64,
+            #[tabled(rename = "Tokens")]
+            token_count: u32,
+            #[tabled(rename = "Hash")]
+            hash: String,
+        }
+        let rows: Vec<Row> = filtered
+            .iter()
+            .map(|p| Row {
+                ref_count: p.ref_count,
+                token_count: p.token_count,
+                hash: format!("{}…", &p.hash.0[..16]),
+            })
+            .collect();
+        println!("{}", Table::new(rows));
+        println!(
+            "{} unique system prompt(s). High duplicate counts on different hashes \
+             may indicate prompt drift (interpolated values, formatting differences).",
+            filtered.len()
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_cost(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    by: &str,
+    model: Option<String>,
+    application: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let valid_dims = ["model", "application", "segment_type", "day"];
+    let group_by: Vec<String> = by
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for dim in &group_by {
+        if !valid_dims.contains(&dim.as_str()) {
+            anyhow::bail!(
+                "unknown --by dimension '{dim}'; valid: {}",
+                valid_dims.join(", ")
+            );
+        }
+    }
+
+    let vault = open_vault(data_dir, config).await?;
+    let query = AnalyticsQuery {
+        model,
+        application,
+        group_by: Some(group_by.clone()),
+        ..Default::default()
+    };
+    let rows = vault.query(query).await.context("running cost query")?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else if rows.is_empty() {
+        println!("No data matching the query.");
+    } else {
+        // Render dynamically — group_by columns first, then total_tokens.
+        let mut headers: Vec<String> = group_by.clone();
+        headers.push("total_tokens".to_owned());
+        println!("{}", headers.join("\t"));
+        println!("{}", "-".repeat(headers.iter().map(|h| h.len()).sum::<usize>() + headers.len() * 2));
+        for row in &rows {
+            let cells: Vec<String> = headers
+                .iter()
+                .map(|h| match row.get(h.as_str()) {
+                    Some(serde_json::Value::Null) | None => "—".to_owned(),
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(other) => other.to_string(),
+                })
+                .collect();
+            println!("{}", cells.join("\t"));
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_find_duplicates(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    threshold: u64,
+    limit: u64,
+    json: bool,
+) -> Result<()> {
+    let vault = open_vault(data_dir, config).await?;
+    let dups = vault
+        .find_duplicates(threshold, limit)
+        .await
+        .context("finding duplicates")?;
+
+    if json {
+        let out: Vec<serde_json::Value> = dups
+            .iter()
+            .map(|d| serde_json::json!({
+                "hash":         d.hash.0,
+                "segment_type": d.segment_type.to_string(),
+                "token_count":  d.token_count,
+                "ref_count":    d.ref_count,
+                "wasted_bytes": d.wasted_bytes,
+            }))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if dups.is_empty() {
+        println!("No segments with ref_count >= {threshold}.");
+    } else {
+        #[derive(Tabled)]
+        struct Row {
+            #[tabled(rename = "Refs")]
+            refs: u64,
+            #[tabled(rename = "Type")]
+            seg_type: String,
+            #[tabled(rename = "Tokens")]
+            tokens: u32,
+            #[tabled(rename = "Saved")]
+            saved: String,
+            #[tabled(rename = "Hash")]
+            hash: String,
+        }
+        let total_saved: u64 = dups.iter().map(|d| d.wasted_bytes).sum();
+        let rows: Vec<Row> = dups
+            .iter()
+            .map(|d| Row {
+                refs: d.ref_count,
+                seg_type: d.segment_type.to_string(),
+                tokens: d.token_count,
+                saved: format_bytes(d.wasted_bytes),
+                hash: format!("{}…", &d.hash.0[..16]),
+            })
+            .collect();
+        println!("{}", Table::new(rows));
+        println!(
+            "{} segment(s) shown — dedup is saving {} on these alone.",
+            dups.len(),
+            format_bytes(total_saved)
+        );
     }
     Ok(())
 }

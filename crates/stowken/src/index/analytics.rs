@@ -204,6 +204,7 @@ mod tests {
         idx.upsert_segment(&seg).unwrap();
 
         let manifest = ConversationManifest {
+            schema_version: crate::types::MANIFEST_SCHEMA_VERSION,
             id: "c1".to_owned(),
             application: Some("app-a".to_owned()),
             model: "gpt-4".to_owned(),

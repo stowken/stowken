@@ -1,8 +1,6 @@
 # Contributing to Stowken
 
-Thank you for your interest in contributing! This document covers the open-source
-`stowken` crate. The `stowken-enterprise` crate is proprietary and not
-open to external contributions.
+Stowken is a single Apache-2.0 workspace. All three crates (`stowken`, `stowken-cli`, `stowken-python`) accept contributions.
 
 ## Development setup
 
@@ -16,22 +14,25 @@ cd stowken
 cargo build --workspace
 
 # Run tests
-cargo test -p stowken
+cargo test --workspace
 
-# Run clippy (must be clean with -D warnings)
-cargo clippy -p stowken -- -D warnings
+# Run clippy (should be clean)
+cargo clippy --workspace -- -D warnings
+
+# Python bindings (optional)
+cd crates/stowken-python
+PYO3_PYTHON=python3.13 maturin build --release
+pip install --force-reinstall ../../target/wheels/stowken-*.whl
+pytest python/tests/
 ```
 
 ## Pull request guidelines
 
-- **One logical change per PR.** Bug fixes, features, and refactors should be
-  separate PRs.
-- **Tests required.** New functionality must have unit or integration tests.
-- **Clippy clean.** `cargo clippy -p stowken -- -D warnings` must pass.
-- **No new dependencies** without discussion. The open-source crate has a
-  carefully curated dependency footprint.
-- **No unsafe code** without a detailed justification and a comment explaining
-  the invariants that make it safe.
+- **One logical change per PR.** Bug fixes, features, and refactors should be separate.
+- **Tests required.** New functionality must have unit or integration coverage.
+- **Clippy clean.** `cargo clippy --workspace -- -D warnings` must pass.
+- **No new dependencies** without discussion. The dependency footprint is intentionally small.
+- **No unsafe code** without a detailed justification and a comment explaining the invariants that make it safe.
 
 ## Commit style
 
@@ -39,36 +40,21 @@ cargo clippy -p stowken -- -D warnings
 <type>(<scope>): <short summary>
 
 Types: feat, fix, refactor, test, docs, chore
-Scope: compression, dedup, storage, vault, export, index
+Scope: compression, dedup, storage, vault, export, index, cli, python
 ```
 
 Examples:
-- `feat(storage): add S3 presigned URL support`
 - `fix(varint): handle u32::MAX correctly in 5-byte escape path`
 - `test(dedup): add exact-dedup collision test`
+- `feat(cli): add --since flag to find-duplicates`
 
-## What belongs in the open-source crate
+## On-disk format changes
 
-The `stowken` crate (Apache 2.0) includes:
+Stowken's frame format and manifest schema are versioned. Any change that alters how segments or manifests are written on disk must:
 
-- Core types (`types.rs`)
-- Varint encoding and zstd compression
-- Exact deduplication (SHA-256)
-- `StorageBackend` trait + `MemoryBackend` + `FilesystemBackend`
-- Conversation segmenter
-- SQLite metadata index
-- `Stowken` orchestrator
-- JSONL training export
-- Analytics queries
-
-The following are enterprise-only and not accepted as open-source contributions:
-- Cloud backends (S3, GCS, Azure)
-- Near-dedup (MinHash LSH)
-- Encryption at rest
-- Multi-tenant isolation
-- GDPR compliance tooling
-- Advanced analytics
-- Parquet export
+1. Bump the version (new frame byte, or `MANIFEST_SCHEMA_VERSION + 1`).
+2. Keep the old version readable.
+3. Add a roundtrip test that covers both old-format and new-format data.
 
 ## Reporting bugs
 
@@ -80,5 +66,4 @@ Open an issue on GitHub with:
 
 ## Security vulnerabilities
 
-Please do **not** open a public issue for security vulnerabilities. Email
-security@stowken.dev instead.
+Please do not open a public issue for security vulnerabilities. Email security@stowken.dev instead.

@@ -5,40 +5,40 @@
 //!
 //! Usage:
 //!   import stowken
-//!   vault = stowken.Stowken()
+//!   vault = stowken.Stowken()                       # in-memory
+//!   vault = stowken.Stowken.open("/var/lib/sk")     # filesystem-backed
 //!   result = vault.store({"model": "gpt-4", "messages": [...]})
-//!   stats  = vault.stats()
+//!   conv   = vault.retrieve(result.id)              # includes tokens
+
+use std::sync::OnceLock;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use tokio::runtime::Runtime;
 
-// Alias the dependency to avoid ambiguity with this lib's own name.
-extern crate stowken as tv;
+extern crate stowken as sk;
 
-use tv::{
-    storage::MemoryBackend,
+use sk::{
+    storage::{FilesystemBackend, MemoryBackend},
     types::{Conversation, Message, MessageContent, StowkenConfig},
     Stowken,
 };
 
-// ── Runtime ──────────────────────────────────────────────────────────────────
+// ── Shared runtime ───────────────────────────────────────────────────────────
 
-fn rt() -> PyResult<tokio::runtime::Runtime> {
-    tokio::runtime::Runtime::new()
-        .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))
+/// One Tokio runtime shared across every PyO3 call. Constructing a runtime
+/// per-call (the previous behaviour) made every store/retrieve dominate-cost
+/// even on local data.
+fn runtime() -> &'static Runtime {
+    static RT: OnceLock<Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        Runtime::new().expect("failed to construct shared tokio runtime")
+    })
 }
 
 fn py_err(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
-}
-
-fn block<F, T>(py: Python<'_>, f: F) -> PyResult<T>
-where
-    F: FnOnce() -> PyResult<T> + Send,
-    T: Send,
-{
-    py.allow_threads(f)
 }
 
 // ── Python-visible result types ───────────────────────────────────────────────
@@ -107,16 +107,9 @@ impl TokenUsageStats {
 
 // ── Parsing helpers ───────────────────────────────────────────────────────────
 
-/// Encode a text string to u32 token IDs using UTF-8 byte pairs.
-///
-/// This is a simple fallback tokenizer: each pair of consecutive UTF-8 bytes
-/// is packed into a u32. It is not equivalent to any real LLM tokenizer but
-/// lets the vault function without an external tokenizer dependency.
 fn parse_message(obj: &pyo3::Bound<'_, PyAny>) -> PyResult<Message> {
     let role: String = obj.get_item("role")?.extract()?;
 
-    // Prefer explicit token arrays; otherwise pass text through so the vault's
-    // built-in tiktoken tokenizer handles it automatically.
     let content = if let Ok(tokens_raw) = obj.get_item("tokens") {
         let tokens: Vec<u32> = tokens_raw.extract()?;
         MessageContent::Tokens(tokens)
@@ -174,29 +167,45 @@ fn parse_conversation(dict: &pyo3::Bound<'_, PyDict>) -> PyResult<Conversation> 
     Ok(Conversation { id, model, tokenizer, application, metadata: None, messages })
 }
 
+// ── Backend variants ─────────────────────────────────────────────────────────
+
+/// Wraps either an in-memory or filesystem-backed `Stowken`.
+///
+/// Held inside an `Arc` so we can run the inner future on the shared runtime
+/// without lifetime juggling.
+enum VaultKind {
+    Memory(Stowken<MemoryBackend>),
+    Filesystem(Stowken<FilesystemBackend>),
+}
+
 // ── Main Python class ─────────────────────────────────────────────────────────
 
-/// In-memory Stowken instance.
+/// Compressed, deduplicated storage for LLM token sequences.
+///
+/// Default constructor opens an ephemeral in-memory vault. For persistence
+/// use :meth:`open` with a directory path.
 ///
 /// Example::
 ///
 ///     import stowken
 ///
+///     # Ephemeral
 ///     vault = stowken.Stowken()
-///     result = vault.store({
+///
+///     # Persistent
+///     vault = stowken.Stowken.open("/var/lib/stowken")
+///
+///     vault.store({
 ///         "model": "gpt-4",
 ///         "messages": [
 ///             {"role": "system",    "content": "You are helpful."},
 ///             {"role": "user",      "content": "Hello!"},
 ///             {"role": "assistant", "content": "Hi there!"},
-///         ]
+///         ],
 ///     })
-///     print(result)
-///     stats = vault.stats()
-///     print(f"Saved {stats.savings_percentage:.1f}%")
 #[pyclass(name = "Stowken")]
 pub struct PyStowken {
-    inner: Stowken<MemoryBackend>,
+    inner: VaultKind,
 }
 
 #[pymethods]
@@ -207,28 +216,55 @@ impl PyStowken {
     ///     enable_compression (bool): Enable zstd compression. Default ``True``.
     #[new]
     #[pyo3(signature = (enable_compression=true))]
-    fn new(py: Python<'_>, enable_compression: bool) -> PyResult<Self> {
-        let config = StowkenConfig { enable_compression, dictionary_path: None, tenant_id: None, ..StowkenConfig::default() };
+    fn new(_py: Python<'_>, enable_compression: bool) -> PyResult<Self> {
+        let config = StowkenConfig { enable_compression };
         let backend = MemoryBackend::new();
-        let inner = block(py, || {
-            rt()?.block_on(Stowken::new(backend, config)).map_err(py_err)
-        })?;
-        Ok(Self { inner })
+        let inner = runtime()
+            .block_on(Stowken::new(backend, config))
+            .map_err(py_err)?;
+        Ok(Self { inner: VaultKind::Memory(inner) })
+    }
+
+    /// Open a filesystem-backed vault rooted at `path`.
+    ///
+    /// Creates the directory and metadata database if they don't exist.
+    /// Subsequent calls with the same path reopen the existing vault.
+    ///
+    /// Args:
+    ///     path (str): Directory path for vault storage.
+    ///     enable_compression (bool): Default ``True``.
+    #[classmethod]
+    #[pyo3(signature = (path, enable_compression=true))]
+    fn open(
+        _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
+        _py: Python<'_>,
+        path: String,
+        enable_compression: bool,
+    ) -> PyResult<Self> {
+        let config = StowkenConfig { enable_compression };
+        let db_path = format!("{}/metadata.db", path.trim_end_matches('/'));
+        let inner = runtime()
+            .block_on(async move {
+                let backend = FilesystemBackend::new(&path).await.map_err(|e| e.to_string())?;
+                Stowken::open(backend, config, &db_path)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(Self { inner: VaultKind::Filesystem(inner) })
     }
 
     /// Store a conversation dict (OpenAI-compatible format).
-    ///
-    /// Args:
-    ///     conversation (dict): Must include ``model`` (str) and ``messages`` (list).
-    ///         Optional keys: ``tokenizer``, ``application``, ``id``.
-    ///
-    /// Returns:
-    ///     StoreResult
-    fn store(&self, py: Python<'_>, conversation: &pyo3::Bound<'_, PyDict>) -> PyResult<StoreResult> {
+    fn store(
+        &self,
+        _py: Python<'_>,
+        conversation: &pyo3::Bound<'_, PyDict>,
+    ) -> PyResult<StoreResult> {
         let conv = parse_conversation(conversation)?;
-        let result = block(py, || {
-            rt()?.block_on(self.inner.store(conv)).map_err(py_err)
-        })?;
+        let result = match &self.inner {
+            VaultKind::Memory(v) => runtime().block_on(v.store(conv)).map_err(py_err)?,
+            VaultKind::Filesystem(v) => runtime().block_on(v.store(conv)).map_err(py_err)?,
+        };
         Ok(StoreResult {
             id: result.id,
             total_segments: result.total_segments,
@@ -242,11 +278,15 @@ impl PyStowken {
     /// Retrieve a conversation by ID.
     ///
     /// Returns:
-    ///     dict: ``id``, ``model``, ``tokenizer``, ``total_tokens``, ``segments``
+    ///     dict: ``id``, ``model``, ``tokenizer``, ``total_tokens``,
+    ///     and ``segments``. Each segment dict contains ``segment_type``,
+    ///     ``token_count``, ``hash``, and ``tokens`` (the actual `u32`
+    ///     token IDs as a Python list).
     fn retrieve(&self, py: Python<'_>, id: &str) -> PyResult<PyObject> {
-        let retrieved = block(py, || {
-            rt()?.block_on(self.inner.retrieve(id)).map_err(py_err)
-        })?;
+        let retrieved = match &self.inner {
+            VaultKind::Memory(v) => runtime().block_on(v.retrieve(id)).map_err(py_err)?,
+            VaultKind::Filesystem(v) => runtime().block_on(v.retrieve(id)).map_err(py_err)?,
+        };
 
         let dict = PyDict::new_bound(py);
         dict.set_item("id", &retrieved.manifest.id)?;
@@ -263,6 +303,7 @@ impl PyStowken {
             sd.set_item("segment_type", seg.segment_type.to_string())?;
             sd.set_item("token_count", seg.token_count)?;
             sd.set_item("hash", &seg.hash.0)?;
+            sd.set_item("tokens", &seg.tokens)?;
             segs_list.append(sd)?;
         }
         dict.set_item("segments", segs_list)?;
@@ -271,16 +312,19 @@ impl PyStowken {
     }
 
     /// Delete a conversation by ID.
-    fn delete(&self, py: Python<'_>, id: &str) -> PyResult<()> {
-        block(py, || rt()?.block_on(self.inner.delete(id)).map_err(py_err))
+    fn delete(&self, _py: Python<'_>, id: &str) -> PyResult<()> {
+        match &self.inner {
+            VaultKind::Memory(v) => runtime().block_on(v.delete(id)).map_err(py_err),
+            VaultKind::Filesystem(v) => runtime().block_on(v.delete(id)).map_err(py_err),
+        }
     }
 
     /// Return aggregate storage statistics.
-    ///
-    /// Returns:
-    ///     TokenUsageStats
-    fn stats(&self, py: Python<'_>) -> PyResult<TokenUsageStats> {
-        let s = block(py, || rt()?.block_on(self.inner.stats()).map_err(py_err))?;
+    fn stats(&self, _py: Python<'_>) -> PyResult<TokenUsageStats> {
+        let s = match &self.inner {
+            VaultKind::Memory(v) => runtime().block_on(v.stats()).map_err(py_err)?,
+            VaultKind::Filesystem(v) => runtime().block_on(v.stats()).map_err(py_err)?,
+        };
         Ok(TokenUsageStats {
             total_tokens: s.total_tokens,
             total_conversations: s.total_conversations,
@@ -296,19 +340,33 @@ impl PyStowken {
     /// Run garbage collection.
     ///
     /// Returns:
-    ///     int: number of zero-reference segments deleted
-    fn gc(&self, py: Python<'_>) -> PyResult<u64> {
-        block(py, || rt()?.block_on(self.inner.gc()).map_err(py_err))
+    ///     int: number of zero-reference segments deleted.
+    fn gc(&self, _py: Python<'_>) -> PyResult<u64> {
+        match &self.inner {
+            VaultKind::Memory(v) => runtime().block_on(v.gc()).map_err(py_err),
+            VaultKind::Filesystem(v) => runtime().block_on(v.gc()).map_err(py_err),
+        }
+    }
+
+    /// List segment hashes currently eligible for GC, without deleting.
+    fn gc_candidates(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let hashes = match &self.inner {
+            VaultKind::Memory(v) => runtime().block_on(v.gc_candidates()).map_err(py_err)?,
+            VaultKind::Filesystem(v) => runtime().block_on(v.gc_candidates()).map_err(py_err)?,
+        };
+        let list = PyList::empty_bound(py);
+        for h in hashes {
+            list.append(h.0)?;
+        }
+        Ok(list.into())
     }
 
     /// Return per-segment-type statistics.
-    ///
-    /// Returns:
-    ///     list[dict]: each dict has ``segment_type``, ``unique_count``,
-    ///     ``total_references``, ``dedup_ratio``, ``total_tokens``, ``compressed_bytes``
     fn segment_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let stats =
-            block(py, || rt()?.block_on(self.inner.segment_stats()).map_err(py_err))?;
+        let stats = match &self.inner {
+            VaultKind::Memory(v) => runtime().block_on(v.segment_stats()).map_err(py_err)?,
+            VaultKind::Filesystem(v) => runtime().block_on(v.segment_stats()).map_err(py_err)?,
+        };
         let list = PyList::empty_bound(py);
         for s in stats {
             let d = PyDict::new_bound(py);

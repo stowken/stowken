@@ -3,12 +3,11 @@
 //! Coordinates segmentation, dedup, compression, storage, and indexing.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::task;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 use crate::{
     compression::CompressionPipeline,
@@ -50,14 +49,10 @@ pub enum StowkenError {
 /// `B` is the storage backend (e.g., `MemoryBackend`, `FilesystemBackend`).
 pub struct Stowken<B: StorageBackend> {
     backend: Arc<B>,
-    config: StowkenConfig,
-    /// Hot-swappable compression pipeline (dictionary is applied without &mut self).
-    compressor: Arc<RwLock<CompressionPipeline>>,
+    compressor: CompressionPipeline,
     index: MetadataIndex,
     segmenter_config: SegmenterConfig,
     tokenizer: Option<Arc<dyn TokenizerAdapter>>,
-    /// Cumulative count of brand-new segments stored; drives auto-train trigger.
-    new_segment_count: Arc<AtomicU64>,
 }
 
 impl<B: StorageBackend + 'static> Stowken<B> {
@@ -67,39 +62,23 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         let compressor = CompressionPipeline::new(config.enable_compression, 3);
         Ok(Self {
             backend: Arc::new(backend),
-            config,
-            compressor: Arc::new(RwLock::new(compressor)),
+            compressor,
             index,
             segmenter_config: SegmenterConfig::default(),
             tokenizer: None,
-            new_segment_count: Arc::new(AtomicU64::new(0)),
         })
     }
 
     /// Open a vault, loading or creating a persistent metadata database at `db_path`.
-    ///
-    /// If `config.dictionary_path` points to an existing file it is loaded
-    /// automatically so that previously dictionary-compressed segments remain
-    /// decompressible.
     pub async fn open(backend: B, config: StowkenConfig, db_path: &str) -> Result<Self, StowkenError> {
         let index = MetadataIndex::open(db_path)?;
-        let mut pipeline = CompressionPipeline::new(config.enable_compression, 3);
-
-        if let Some(ref path) = config.dictionary_path {
-            if let Ok(dict_bytes) = std::fs::read(path) {
-                info!(path, bytes = dict_bytes.len(), "loaded zstd dictionary from disk");
-                pipeline = CompressionPipeline::with_dictionary(dict_bytes, config.enable_compression, 3);
-            }
-        }
-
+        let compressor = CompressionPipeline::new(config.enable_compression, 3);
         Ok(Self {
             backend: Arc::new(backend),
-            config,
-            compressor: Arc::new(RwLock::new(pipeline)),
+            compressor,
             index,
             segmenter_config: SegmenterConfig::default(),
             tokenizer: None,
-            new_segment_count: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -135,7 +114,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         let mut total_raw: u64 = 0;
 
         for (position, segment) in segments.iter().enumerate() {
-            let hash = self.make_hash(&segment.tokens);
+            let hash = exact::hash_segment(&segment.tokens);
 
             if self.backend.has_segment(&hash).await? {
                 self.backend.increment_ref(&hash).await?;
@@ -176,6 +155,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
 
         let total_tokens: u64 = segment_refs.iter().map(|s| s.token_count as u64).sum();
         let manifest = ConversationManifest {
+            schema_version: crate::types::MANIFEST_SCHEMA_VERSION,
             id: id.clone(),
             application: conversation.application.clone(),
             model: conversation.model.clone(),
@@ -188,7 +168,6 @@ impl<B: StorageBackend + 'static> Stowken<B> {
 
         self.backend.put_manifest(&manifest).await?;
 
-        // Single spawn_blocking: all segment ops + conversation manifest in one transaction.
         let index = self.index.clone();
         let manifest_clone = manifest.clone();
         task::spawn_blocking(move || index.store_conversation_batch(&index_ops, &manifest_clone))
@@ -203,18 +182,6 @@ impl<B: StorageBackend + 'static> Stowken<B> {
 
         let total_segments = new_segments + deduped_segments;
         info!(id, total_segments, new_segments, deduped_segments, "stored conversation");
-
-        // Auto-train: check threshold after updating the cumulative count.
-        if new_segments > 0 {
-            let before = self.new_segment_count.fetch_add(new_segments, Ordering::Relaxed);
-            if let Some(threshold) = self.config.auto_train_dictionary_after {
-                let threshold = threshold as u64;
-                // Trigger when the counter crosses a multiple of `threshold`.
-                if before / threshold != (before + new_segments) / threshold {
-                    self.spawn_background_train();
-                }
-            }
-        }
 
         Ok(StoreResult {
             id,
@@ -233,6 +200,14 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             StorageError::ConversationNotFound(_) => StowkenError::NotFound(id.to_owned()),
             other => StowkenError::Storage(other),
         })?;
+
+        if manifest.schema_version > crate::types::MANIFEST_SCHEMA_VERSION {
+            return Err(StowkenError::Internal(format!(
+                "manifest {id} schema version {} is newer than supported {}",
+                manifest.schema_version,
+                crate::types::MANIFEST_SCHEMA_VERSION
+            )));
+        }
 
         let mut retrieved_segments = Vec::with_capacity(manifest.segments.len());
         for seg_ref in &manifest.segments {
@@ -358,6 +333,20 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             .map_err(Into::into)
     }
 
+    /// Find segments referenced at least `min_refs` times — the high-traffic
+    /// dedup candidates worth examining for prompt refactoring.
+    pub async fn find_duplicates(
+        &self,
+        min_refs: u64,
+        limit: u64,
+    ) -> Result<Vec<crate::types::DuplicateSegment>, StowkenError> {
+        let index = self.index.clone();
+        task::spawn_blocking(move || index.find_duplicates(min_refs, limit))
+            .await
+            .map_err(|e| StowkenError::Internal(e.to_string()))?
+            .map_err(Into::into)
+    }
+
     // ── Export ────────────────────────────────────────────────────────────
 
     /// Export training data pairs (user/assistant turns) in the requested format.
@@ -380,92 +369,15 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         Ok(deleted)
     }
 
-    /// Train a zstd dictionary from a sample of stored segments and return
-    /// the raw dictionary bytes.  Does not apply the dictionary — call
-    /// `apply_dictionary` to activate it.
-    pub async fn train_dictionary(
-        &self,
-        _tokenizer: &str,
-        sample_count: usize,
-    ) -> Result<Vec<u8>, StowkenError> {
-        let query = AnalyticsQuery::default();
-        let ids = self.backend.list_conversations(&query, sample_count as u64, 0).await?;
-
-        let mut samples: Vec<Vec<u8>> = Vec::new();
-        for id in &ids {
-            if let Ok(conv) = self.retrieve(id).await {
-                for seg in conv.segments {
-                    let varint = crate::compression::varint::encode_tokens(&seg.tokens);
-                    samples.push(varint);
-                    if samples.len() >= sample_count {
-                        break;
-                    }
-                }
-            }
-            if samples.len() >= sample_count {
-                break;
-            }
-        }
-
-        if samples.len() < 10 {
-            return Err(StowkenError::Compression(
-                format!("not enough samples to train dictionary ({} < 10)", samples.len())
-            ));
-        }
-
-        crate::compression::dictionary::DictionaryCompressor::train_dictionary(&samples, 112_640)
-            .map_err(|e| StowkenError::Compression(e.to_string()))
-    }
-
-    /// Apply a pre-trained (or externally provided) zstd dictionary to the
-    /// compression pipeline.
-    ///
-    /// All segments stored *after* this call will be compressed with the
-    /// dictionary.  Previously stored segments are unaffected — zstd frames
-    /// carry a dictionary-ID header, so the decompressor uses the dictionary
-    /// only when it was present at compression time.
-    ///
-    /// If `config.dictionary_path` is set the dictionary is persisted to disk
-    /// so it survives across `open()` calls.
-    pub async fn apply_dictionary(&self, dict_bytes: Vec<u8>) -> Result<(), StowkenError> {
-        info!(bytes = dict_bytes.len(), "applying zstd dictionary");
-
-        if let Some(ref path) = self.config.dictionary_path {
-            tokio::fs::write(path, &dict_bytes).await
-                .map_err(|e| StowkenError::Compression(format!("failed to write dictionary: {e}")))?;
-            info!(path, "persisted zstd dictionary to disk");
-        }
-
-        let new_pipeline = CompressionPipeline::with_dictionary(
-            dict_bytes,
-            self.config.enable_compression,
-            3,
-        );
-        *self.compressor.write().unwrap() = new_pipeline;
-        Ok(())
-    }
-
-    /// Convenience: train a dictionary from stored data and immediately apply it.
-    ///
-    /// Returns the number of samples used.
-    pub async fn train_and_apply_dictionary(
-        &self,
-        tokenizer: &str,
-        sample_count: usize,
-    ) -> Result<usize, StowkenError> {
-        let dict = self.train_dictionary(tokenizer, sample_count).await?;
-        let n = sample_count;
-        self.apply_dictionary(dict).await?;
-        info!(n, "trained and applied zstd dictionary");
-        Ok(n)
+    /// List the segment hashes currently eligible for GC, without deleting.
+    pub async fn gc_candidates(&self) -> Result<Vec<SegmentHash>, StowkenError> {
+        Ok(self.backend.list_garbage().await?)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
     fn make_segmenter(&self, tokenizer_name: &str) -> Segmenter {
         let seg = Segmenter::new(self.segmenter_config.clone());
-        // Explicit adapter set by the caller takes priority; otherwise try the
-        // built-in tiktoken lookup for the conversation's declared tokenizer.
         if let Some(ref adapter) = self.tokenizer {
             seg.with_tokenizer(Arc::clone(adapter))
         } else if let Some(adapter) = crate::tokenizer::get_tokenizer(tokenizer_name) {
@@ -475,94 +387,16 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         }
     }
 
-    fn make_hash(&self, tokens: &[Token]) -> SegmentHash {
-        if let Some(tenant_id) = &self.config.tenant_id {
-            exact::hash_segment_tenant(tokens, tenant_id)
-        } else {
-            exact::hash_segment(tokens)
-        }
-    }
-
-    /// Spawn a background task that trains and applies a new dictionary.
-    /// Errors are logged but not propagated — store() must not fail due to
-    /// a background training hiccup.
-    fn spawn_background_train(&self) {
-        let backend = Arc::clone(&self.backend);
-        let compressor = Arc::clone(&self.compressor);
-        let sample_count = self.config.dictionary_sample_count;
-        let dict_path = self.config.dictionary_path.clone();
-        let enable = self.config.enable_compression;
-
-        tokio::spawn(async move {
-            // Collect varint-encoded samples from the backend directly —
-            // we decompress with the current pipeline then re-encode with varint.
-            let query = AnalyticsQuery::default();
-            let Ok(ids) = backend.list_conversations(&query, sample_count as u64, 0).await else {
-                warn!("auto-train: failed to list conversations");
-                return;
-            };
-
-            let current = compressor.read().unwrap().clone();
-            let mut samples: Vec<Vec<u8>> = Vec::new();
-
-            'outer: for id in &ids {
-                let Ok(manifest) = backend.get_manifest(id).await else { continue };
-                for seg_ref in &manifest.segments {
-                    let Ok(stored) = backend.get_segment(&seg_ref.hash).await else { continue };
-                    let Ok(tokens) = current.decompress(&stored.compressed_data) else { continue };
-                    samples.push(crate::compression::varint::encode_tokens(&tokens));
-                    if samples.len() >= sample_count { break 'outer; }
-                }
-            }
-
-            if samples.len() < 10 {
-                warn!(count = samples.len(), "auto-train: too few samples, skipping");
-                return;
-            }
-
-            let dict = match crate::compression::dictionary::DictionaryCompressor::train_dictionary(&samples, 112_640) {
-                Ok(d) => d,
-                Err(e) => { warn!("auto-train: dictionary training failed: {e}"); return; }
-            };
-
-            if let Some(ref path) = dict_path {
-                if let Err(e) = tokio::fs::write(path, &dict).await {
-                    warn!(path, "auto-train: failed to persist dictionary: {e}");
-                }
-            }
-
-            let new_pipeline = CompressionPipeline::with_dictionary(dict.clone(), enable, 3);
-            *compressor.write().unwrap() = new_pipeline;
-            info!(samples = samples.len(), dict_bytes = dict.len(), "auto-trained and applied zstd dictionary");
-        });
-    }
-
-    // ── Extension points for enterprise wrapper ───────────────────────────
-
-    /// Segment a conversation into typed token chunks (for enterprise callers).
-    pub fn segment_conversation(
-        &self,
-        conversation: &Conversation,
-    ) -> Result<Vec<crate::types::Segment>, StowkenError> {
-        let segmenter = self.make_segmenter(&conversation.tokenizer);
-        Ok(segmenter.segment(conversation)?)
-    }
-
-    /// Compute the content hash for a token slice (honours tenant_id if set).
-    pub fn hash_tokens(&self, tokens: &[Token]) -> SegmentHash {
-        self.make_hash(tokens)
-    }
-
     /// Compress a token sequence using the active pipeline.
     pub fn compress_tokens(&self, tokens: &[Token]) -> Result<Vec<u8>, StowkenError> {
-        self.compressor.read().unwrap()
+        self.compressor
             .compress(tokens)
             .map_err(|e| StowkenError::Compression(e.to_string()))
     }
 
     /// Decompress stored bytes back to a token sequence using the active pipeline.
     pub fn decompress_data(&self, data: &[u8]) -> Result<Vec<Token>, StowkenError> {
-        self.compressor.read().unwrap()
+        self.compressor
             .decompress(data)
             .map_err(|e| StowkenError::Compression(e.to_string()))
     }
@@ -575,159 +409,5 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     /// Read access to the metadata index.
     pub fn index(&self) -> &MetadataIndex {
         &self.index
-    }
-}
-
-// ── Dictionary tests ──────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod dictionary_tests {
-    use super::*;
-    use crate::{storage::MemoryBackend, types::{Conversation, Message, MessageContent}};
-
-    fn make_conv(id: &str, tokens: Vec<u32>) -> Conversation {
-        Conversation {
-            id: Some(id.to_owned()),
-            model: "gpt-4".to_owned(),
-            tokenizer: "cl100k_base".to_owned(),
-            application: None,
-            messages: vec![Message {
-                role: "system".to_owned(),
-                content: MessageContent::Tokens(tokens),
-                name: None,
-                tool_call_id: None,
-            }],
-            metadata: None,
-        }
-    }
-
-    async fn vault_with_data(n: usize) -> Stowken<MemoryBackend> {
-        let v = Stowken::new(MemoryBackend::new(), StowkenConfig::default()).await.unwrap();
-        for i in 0..n {
-            let tokens: Vec<u32> = (0u32..100).map(|t| (t + i as u32 * 7) % 50_000).collect();
-            v.store(make_conv(&format!("c{i}"), tokens)).await.unwrap();
-        }
-        v
-    }
-
-    #[tokio::test]
-    async fn train_dictionary_returns_bytes() {
-        let v = vault_with_data(20).await;
-        let dict = v.train_dictionary("cl100k_base", 15).await.unwrap();
-        assert!(!dict.is_empty(), "dictionary should not be empty");
-    }
-
-    #[tokio::test]
-    async fn apply_dictionary_roundtrip() {
-        let v = vault_with_data(20).await;
-        let dict = v.train_dictionary("cl100k_base", 15).await.unwrap();
-        v.apply_dictionary(dict).await.unwrap();
-
-        // Store a new conversation with the dictionary active.
-        let tokens: Vec<u32> = (0u32..100).collect();
-        v.store(make_conv("dict_conv", tokens.clone())).await.unwrap();
-
-        // Retrieve and verify lossless roundtrip.
-        let retrieved = v.retrieve("dict_conv").await.unwrap();
-        assert_eq!(retrieved.segments[0].tokens, tokens);
-    }
-
-    #[tokio::test]
-    async fn old_segments_still_decompressible_after_apply() {
-        let v = vault_with_data(20).await;
-
-        // Store before dictionary.
-        let pre_tokens: Vec<u32> = (0u32..50).collect();
-        v.store(make_conv("pre", pre_tokens.clone())).await.unwrap();
-
-        // Apply dictionary.
-        let dict = v.train_dictionary("cl100k_base", 15).await.unwrap();
-        v.apply_dictionary(dict).await.unwrap();
-
-        // Store after dictionary.
-        let post_tokens: Vec<u32> = (100u32..150).collect();
-        v.store(make_conv("post", post_tokens.clone())).await.unwrap();
-
-        // Both must decompress correctly.
-        let pre = v.retrieve("pre").await.unwrap();
-        assert_eq!(pre.segments[0].tokens, pre_tokens, "pre-dict segment corrupted");
-
-        let post = v.retrieve("post").await.unwrap();
-        assert_eq!(post.segments[0].tokens, post_tokens, "post-dict segment corrupted");
-    }
-
-    #[tokio::test]
-    async fn train_and_apply_convenience() {
-        let v = vault_with_data(20).await;
-        let n = v.train_and_apply_dictionary("cl100k_base", 15).await.unwrap();
-        assert!(n > 0);
-
-        // Roundtrip after apply.
-        let tokens: Vec<u32> = (500u32..600).collect();
-        v.store(make_conv("after", tokens.clone())).await.unwrap();
-        let r = v.retrieve("after").await.unwrap();
-        assert_eq!(r.segments[0].tokens, tokens);
-    }
-
-    #[tokio::test]
-    async fn train_fails_with_too_few_samples() {
-        let v = vault_with_data(2).await;
-        let result = v.train_dictionary("cl100k_base", 5).await;
-        assert!(result.is_err(), "should fail with too few samples");
-    }
-
-    #[tokio::test]
-    async fn dictionary_persisted_and_reloaded() {
-        // Use a temp file path for the dictionary.
-        let dir = tempfile::tempdir().unwrap();
-        let dict_path = dir.path().join("test.dict");
-        let dict_path_str = dict_path.to_str().unwrap().to_owned();
-
-        // Vault A: train and persist.
-        let config_a = StowkenConfig {
-            dictionary_path: Some(dict_path_str.clone()),
-            ..StowkenConfig::default()
-        };
-        let va = Stowken::new(MemoryBackend::new(), config_a).await.unwrap();
-        for i in 0..20usize {
-            let tokens: Vec<u32> = (0u32..100).map(|t| (t + i as u32 * 3) % 30_000).collect();
-            va.store(make_conv(&format!("c{i}"), tokens)).await.unwrap();
-        }
-        let dict = va.train_dictionary("cl100k_base", 15).await.unwrap();
-        va.apply_dictionary(dict).await.unwrap();
-
-        // Store a segment with the dictionary.
-        let tokens: Vec<u32> = (0u32..80).collect();
-        va.store(make_conv("dict_seg", tokens.clone())).await.unwrap();
-        // Retrieve with vault A (has dict in memory).
-        let r = va.retrieve("dict_seg").await.unwrap();
-        assert_eq!(r.segments[0].tokens, tokens);
-
-        assert!(dict_path.exists(), "dictionary should be on disk");
-    }
-
-    #[tokio::test]
-    async fn auto_train_triggers_after_threshold() {
-        let config = StowkenConfig {
-            auto_train_dictionary_after: Some(10),
-            dictionary_sample_count: 8,
-            ..StowkenConfig::default()
-        };
-        let v = Stowken::new(MemoryBackend::new(), config).await.unwrap();
-
-        // Store enough conversations to cross the threshold.
-        for i in 0..15usize {
-            let tokens: Vec<u32> = (0u32..100).map(|t| (t + i as u32 * 7) % 50_000).collect();
-            v.store(make_conv(&format!("c{i}"), tokens)).await.unwrap();
-        }
-
-        // Give the background task a moment to complete.
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-
-        // Verify the pipeline still works (auto-train shouldn't break anything).
-        let tokens: Vec<u32> = (0u32..50).collect();
-        v.store(make_conv("post_train", tokens.clone())).await.unwrap();
-        let r = v.retrieve("post_train").await.unwrap();
-        assert_eq!(r.segments[0].tokens, tokens);
     }
 }

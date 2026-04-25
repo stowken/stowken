@@ -1,16 +1,12 @@
 //! In-memory `StorageBackend` implementation for testing and ephemeral use cases.
 
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::types::{
-    AnalyticsQuery, ConversationManifest, SegmentHash, SegmentType, SegmentTypeStats,
-    StoredSegment, TokenUsageStats,
-};
+use crate::types::{AnalyticsQuery, ConversationManifest, SegmentHash, StoredSegment};
 
 use super::backend::{StorageBackend, StorageError, StorageResult};
 
@@ -61,15 +57,6 @@ impl StorageBackend for MemoryBackend {
     async fn has_segment(&self, hash: &SegmentHash) -> StorageResult<bool> {
         let state = self.state.read().await;
         Ok(state.segments.contains_key(&hash.0))
-    }
-
-    async fn has_segments(&self, hashes: &[SegmentHash]) -> StorageResult<Vec<SegmentHash>> {
-        let state = self.state.read().await;
-        Ok(hashes
-            .iter()
-            .filter(|h| state.segments.contains_key(&h.0))
-            .cloned()
-            .collect())
     }
 
     async fn increment_ref(&self, hash: &SegmentHash) -> StorageResult<()> {
@@ -161,115 +148,17 @@ impl StorageBackend for MemoryBackend {
         Ok(ids)
     }
 
-    // ── Analytics ─────────────────────────────────────────────────────────
+    // ── Maintenance ───────────────────────────────────────────────────────
 
-    async fn get_stats(&self) -> StorageResult<TokenUsageStats> {
+    async fn list_garbage(&self) -> StorageResult<Vec<SegmentHash>> {
         let state = self.state.read().await;
-        let total_conversations = state.manifests.len() as u64;
-        let unique_segments = state.segments.len() as u64;
-        let total_segments: u64 = state.segments.values().map(|s| s.ref_count).sum();
-        let total_tokens: u64 = state
-            .manifests
-            .values()
-            .map(|m| m.total_tokens)
-            .sum();
-        let storage_bytes: u64 = state.segments.values().map(|s| s.compressed_size as u64).sum();
-        let naive_bytes: u64 = state.segments.values().map(|s| s.raw_size as u64 * s.ref_count).sum();
-        let dedup_ratio = if total_segments == 0 {
-            0.0
-        } else {
-            1.0 - (unique_segments as f64 / total_segments as f64)
-        };
-        let raw_bytes: u64 = state.segments.values().map(|s| s.raw_size as u64).sum();
-        let compression_ratio = if raw_bytes == 0 {
-            1.0
-        } else {
-            storage_bytes as f64 / raw_bytes as f64
-        };
-        let savings_percentage = if naive_bytes == 0 {
-            0.0
-        } else {
-            (1.0 - (storage_bytes as f64 / naive_bytes as f64)) * 100.0
-        };
-        Ok(TokenUsageStats {
-            total_tokens,
-            total_conversations,
-            unique_segments,
-            total_segments,
-            dedup_ratio,
-            compression_ratio,
-            storage_bytes,
-            naive_bytes,
-            savings_percentage,
-        })
-    }
-
-    async fn get_segment_type_stats(&self) -> StorageResult<Vec<SegmentTypeStats>> {
-        let state = self.state.read().await;
-        let mut map: HashMap<String, (u64, u64, u64, u64)> = HashMap::new();
-        // key → (unique, total_refs, total_tokens, compressed_bytes)
-        for seg in state.segments.values() {
-            let key = seg.segment_type.to_string();
-            let e = map.entry(key).or_default();
-            e.0 += 1;
-            e.1 += seg.ref_count;
-            e.2 += seg.token_count as u64 * seg.ref_count;
-            e.3 += seg.compressed_size as u64;
-        }
-        let stats = map
-            .into_iter()
-            .map(|(k, (unique, refs, tokens, compressed))| {
-                let seg_type: SegmentType = k.parse().unwrap_or(SegmentType::UserTurn);
-                crate::types::SegmentTypeStats {
-                    segment_type: seg_type,
-                    unique_count: unique,
-                    total_references: refs,
-                    dedup_ratio: if refs == 0 { 0.0 } else { 1.0 - unique as f64 / refs as f64 },
-                    avg_token_count: if unique == 0 { 0.0 } else { tokens as f64 / refs as f64 },
-                    total_tokens: tokens,
-                    compressed_bytes: compressed,
-                }
-            })
-            .collect();
-        Ok(stats)
-    }
-
-    async fn query_analytics(
-        &self,
-        _query: &AnalyticsQuery,
-    ) -> StorageResult<Vec<HashMap<String, serde_json::Value>>> {
-        // For the memory backend a full analytics engine is not needed.
-        // Return an empty result; analytics are driven by MetadataIndex in vault.rs.
-        Ok(vec![])
-    }
-
-    async fn list_unique_system_prompts(&self) -> StorageResult<Vec<(SegmentHash, u32, u64)>> {
-        let state = self.state.read().await;
-        let mut prompts: Vec<(SegmentHash, u32, u64)> = state
+        Ok(state
             .segments
             .values()
-            .filter(|s| s.segment_type == SegmentType::SystemPrompt)
-            .map(|s| (s.hash.clone(), s.token_count, s.ref_count))
-            .collect();
-        prompts.sort_by_key(|p| Reverse(p.2));
-        Ok(prompts)
+            .filter(|s| s.ref_count == 0)
+            .map(|s| s.hash.clone())
+            .collect())
     }
-
-    async fn find_conversations_by_segment(
-        &self,
-        hash: &SegmentHash,
-    ) -> StorageResult<Vec<String>> {
-        let state = self.state.read().await;
-        let ids: Vec<String> = state
-            .manifests
-            .values()
-            .filter(|m| m.segments.iter().any(|s| &s.hash == hash))
-            .map(|m| m.id.clone())
-            .collect();
-        Ok(ids)
-    }
-
-    // ── Maintenance ───────────────────────────────────────────────────────
 
     async fn garbage_collect(&self) -> StorageResult<u64> {
         let mut state = self.state.write().await;
@@ -307,6 +196,7 @@ mod tests {
 
     fn make_manifest(id: &str, hash: &str) -> ConversationManifest {
         ConversationManifest {
+            schema_version: crate::types::MANIFEST_SCHEMA_VERSION,
             id: id.to_owned(),
             application: None,
             model: "gpt-4".to_owned(),
@@ -337,7 +227,7 @@ mod tests {
         let backend = MemoryBackend::new();
         let seg = make_segment("abc123", 1);
         backend.put_segment(&seg).await.unwrap();
-        backend.put_segment(&seg).await.unwrap(); // second put → ref_count = 2
+        backend.put_segment(&seg).await.unwrap();
         let fetched = backend.get_segment(&SegmentHash("abc123".to_owned())).await.unwrap();
         assert_eq!(fetched.ref_count, 2);
     }

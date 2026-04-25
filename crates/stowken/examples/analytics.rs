@@ -2,7 +2,7 @@
 
 use stowken::{
     storage::MemoryBackend,
-    types::{AnalyticsQuery, Conversation, Message, MessageContent, StowkenConfig},
+    types::{Conversation, Message, MessageContent, StowkenConfig},
     Stowken,
 };
 

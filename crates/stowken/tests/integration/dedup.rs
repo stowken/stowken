@@ -80,7 +80,7 @@ async fn same_conversation_twice_increments_refs() {
         metadata: None,
     };
 
-    let r1 = vault.store(conv.clone()).await.unwrap();
+    let _r1 = vault.store(conv.clone()).await.unwrap();
     let r2 = vault.store(conv).await.unwrap();
 
     // Second store should report 1 deduped segment, not a new one
@@ -117,46 +117,6 @@ async fn gc_removes_orphaned_segments_after_delete() {
 
     let deleted = vault.gc().await.unwrap();
     assert_eq!(deleted, 1, "GC should remove 1 orphaned segment");
-}
-
-#[tokio::test]
-async fn tenant_isolation_prevents_hash_sharing() {
-    let mut config_a = StowkenConfig::default();
-    config_a.tenant_id = Some("tenant-a".to_owned());
-    let mut config_b = StowkenConfig::default();
-    config_b.tenant_id = Some("tenant-b".to_owned());
-
-    let vault_a = Stowken::new(MemoryBackend::new(), config_a).await.unwrap();
-    let vault_b = Stowken::new(MemoryBackend::new(), config_b).await.unwrap();
-
-    let same_tokens = vec![1u32, 2, 3, 4, 5];
-    let conv_a = Conversation {
-        id: None,
-        application: None,
-        model: "gpt-4".to_owned(),
-        tokenizer: "cl100k".to_owned(),
-        messages: vec![Message {
-            role: "user".to_owned(),
-            content: MessageContent::Tokens(same_tokens.clone()),
-            name: None,
-            tool_call_id: None,
-        }],
-        metadata: None,
-    };
-    let conv_b = conv_a.clone();
-
-    let ra = vault_a.store(conv_a).await.unwrap();
-    let rb = vault_b.store(conv_b).await.unwrap();
-
-    let ret_a = vault_a.retrieve(&ra.id).await.unwrap();
-    let ret_b = vault_b.retrieve(&rb.id).await.unwrap();
-
-    // Tenant-scoped hashes must differ for the same tokens
-    assert_ne!(
-        ret_a.segments[0].hash,
-        ret_b.segments[0].hash,
-        "tenant-scoped hashes must be different for the same content"
-    );
 }
 
 #[tokio::test]

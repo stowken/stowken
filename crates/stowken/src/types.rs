@@ -74,9 +74,16 @@ pub struct SegmentRef {
     pub position: u32,
 }
 
+/// Current manifest schema version. Bump when fields are added or semantics change.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+
 /// Conversation manifest — the lightweight pointer structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationManifest {
+    /// Schema version for forward compatibility. Defaults to the current
+    /// constant when missing on read (older manifests predate this field).
+    #[serde(default = "default_manifest_schema_version")]
+    pub schema_version: u32,
     pub id: String,
     pub application: Option<String>,
     pub model: String,
@@ -85,6 +92,10 @@ pub struct ConversationManifest {
     pub segments: Vec<SegmentRef>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub metadata: Option<HashMap<String, serde_json::Value>>,
+}
+
+fn default_manifest_schema_version() -> u32 {
+    MANIFEST_SCHEMA_VERSION
 }
 
 /// Input format: a conversation as the user provides it.
@@ -150,37 +161,12 @@ pub struct StowkenConfig {
     /// Enable varint + zstd compression. Disable for benchmarking or backends
     /// that apply their own compression.
     pub enable_compression: bool,
-    /// Path where the trained zstd dictionary is persisted.
-    ///
-    /// On `open()`, if this file exists it is loaded automatically so that
-    /// segments compressed with the dictionary can be decompressed correctly.
-    /// After a successful auto-train the new dictionary is written here.
-    pub dictionary_path: Option<String>,
-    /// Automatically train (or retrain) a zstd dictionary after this many
-    /// *new* segments have been stored.  `None` disables auto-training.
-    ///
-    /// Training uses the most recent `sample_count` segments from the backend
-    /// and runs in a background task so `store()` is not blocked.
-    /// Recommended value: `500` (enough for a statistically useful dictionary).
-    pub auto_train_dictionary_after: Option<usize>,
-    /// Number of segments sampled when building the zstd dictionary.
-    /// Defaults to `200` when auto-training is enabled.
-    pub dictionary_sample_count: usize,
-    /// Tenant ID for multi-tenant hash isolation.
-    ///
-    /// When set, segment hashes are prefixed with the tenant ID so two tenants
-    /// with identical content do not share storage.
-    pub tenant_id: Option<String>,
 }
 
 impl Default for StowkenConfig {
     fn default() -> Self {
         Self {
             enable_compression: true,
-            dictionary_path: None,
-            auto_train_dictionary_after: None,
-            dictionary_sample_count: 200,
-            tenant_id: None,
         }
     }
 }
@@ -292,6 +278,20 @@ pub struct SystemPromptInfo {
     pub hash: SegmentHash,
     pub token_count: u32,
     pub ref_count: u64,
+}
+
+/// A heavily-referenced segment surfaced by the duplicate finder.
+///
+/// The `wasted_bytes` field reports how many bytes the duplicates would have
+/// cost if stored naively — i.e. what dedup is saving on this segment alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuplicateSegment {
+    pub hash: SegmentHash,
+    pub segment_type: SegmentType,
+    pub token_count: u32,
+    pub ref_count: u64,
+    /// `(ref_count - 1) * raw_size` — bytes saved vs. naive storage.
+    pub wasted_bytes: u64,
 }
 
 /// Trait for supplying a tokenizer to Stowken.

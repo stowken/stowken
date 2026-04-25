@@ -3,14 +3,9 @@
 //! Stowken handles compression, dedup, and segmentation.
 //! Backends only store and retrieve bytes + manifests.
 
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 
-use crate::types::{
-    AnalyticsQuery, ConversationManifest, SegmentHash, SegmentTypeStats, StoredSegment,
-    TokenUsageStats,
-};
+use crate::types::{AnalyticsQuery, ConversationManifest, SegmentHash, StoredSegment};
 
 /// Errors that any storage backend can produce.
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +29,9 @@ pub type StorageResult<T> = Result<T, StorageError>;
 /// All segment content is content-addressed by SHA-256 hash.
 /// Backends are responsible for ref-counting; Stowken is responsible for
 /// deciding when to increment or decrement refs.
+///
+/// Aggregate analytics (stats, system-prompt audits, query) live on
+/// `MetadataIndex`, not here. Backends are pure storage.
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     // ── Segment operations ────────────────────────────────────────────────
@@ -48,9 +46,6 @@ pub trait StorageBackend: Send + Sync {
 
     /// Check segment existence without fetching data.
     async fn has_segment(&self, hash: &SegmentHash) -> StorageResult<bool>;
-
-    /// Batch existence check. Returns the subset of `hashes` that already exist.
-    async fn has_segments(&self, hashes: &[SegmentHash]) -> StorageResult<Vec<SegmentHash>>;
 
     /// Increment the reference count of an existing segment.
     async fn increment_ref(&self, hash: &SegmentHash) -> StorageResult<()>;
@@ -83,32 +78,17 @@ pub trait StorageBackend: Send + Sync {
         offset: u64,
     ) -> StorageResult<Vec<String>>;
 
-    // ── Analytics ─────────────────────────────────────────────────────────
-
-    /// Get aggregate storage statistics.
-    async fn get_stats(&self) -> StorageResult<TokenUsageStats>;
-
-    /// Get per-segment-type statistics.
-    async fn get_segment_type_stats(&self) -> StorageResult<Vec<SegmentTypeStats>>;
-
-    /// Run a filtered analytics query.
-    async fn query_analytics(
-        &self,
-        query: &AnalyticsQuery,
-    ) -> StorageResult<Vec<HashMap<String, serde_json::Value>>>;
-
-    /// List unique system-prompt segments, ordered by `ref_count` descending.
-    ///
-    /// Returns `(hash, token_count, ref_count)` tuples.
-    async fn list_unique_system_prompts(&self) -> StorageResult<Vec<(SegmentHash, u32, u64)>>;
-
-    /// Return IDs of all conversations that reference a given segment.
-    async fn find_conversations_by_segment(
-        &self,
-        hash: &SegmentHash,
-    ) -> StorageResult<Vec<String>>;
-
     // ── Maintenance ───────────────────────────────────────────────────────
+
+    /// List the hashes of segments currently eligible for GC (`ref_count == 0`).
+    ///
+    /// Used by `gc --dry-run` to report what *would* be deleted. The default
+    /// implementation returns an empty list; backends are encouraged to
+    /// override it. Returning an empty list is acceptable but means dry-run
+    /// will report nothing on that backend.
+    async fn list_garbage(&self) -> StorageResult<Vec<SegmentHash>> {
+        Ok(Vec::new())
+    }
 
     /// Delete all segments with `ref_count == 0`.
     ///

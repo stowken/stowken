@@ -2,16 +2,17 @@
 
 Run with:
     cd crates/stowken-python
-    maturin develop          # build + install editable
+    maturin develop          # editable build + install into current venv
     pytest python/tests/     # run this file
+
+Or against an already-installed wheel:
+    pip install <path-to-wheel>
+    pytest python/tests/
 """
 
-import pytest
-import sys
-import os
+import tempfile
 
-# Allow running from the crate root after `maturin develop`.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import pytest
 
 import stowken
 
@@ -229,3 +230,62 @@ class TestTokenField:
         # total_tokens should match input count
         result = vault.retrieve("tok-1")
         assert result["total_tokens"] == len(sys_tokens) + len(user_tokens)
+
+    def test_retrieve_returns_full_tokens(self, vault):
+        """retrieve() must return the actual u32 token IDs, not just counts."""
+        sys_tokens = [9125, 25, 1472, 527, 264, 11190]
+        user_tokens = [3923, 374, 220, 17, 489, 220, 17, 30]
+        vault.store(make_token_conv("full-tok", sys_tokens, user_tokens))
+        result = vault.retrieve("full-tok")
+        sys_seg = next(s for s in result["segments"] if s["segment_type"] == "system_prompt")
+        user_seg = next(s for s in result["segments"] if s["segment_type"] == "user_turn")
+        assert sys_seg["tokens"] == sys_tokens
+        assert user_seg["tokens"] == user_tokens
+
+
+# ── Persistent vault ──────────────────────────────────────────────────────────
+
+class TestPersistentVault:
+    def test_filesystem_vault_persists_across_instances(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            tokens = list(range(50))
+
+            v1 = stowken.Stowken.open(data_dir)
+            v1.store(make_token_conv("persist-1", tokens, [1, 2, 3]))
+            del v1  # drop the first vault — second vault sees only on-disk state
+
+            v2 = stowken.Stowken.open(data_dir)
+            result = v2.retrieve("persist-1")
+            sys_seg = next(s for s in result["segments"] if s["segment_type"] == "system_prompt")
+            assert sys_seg["tokens"] == tokens
+
+    def test_filesystem_dedup_works_across_reopen(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            v1 = stowken.Stowken.open(data_dir)
+            v1.store(make_conv("a"))
+            del v1
+
+            v2 = stowken.Stowken.open(data_dir)
+            r = v2.store({**make_conv("b"), "id": "b"})
+            assert r.deduped_segments > 0, "dedup should still work after reopen"
+
+
+# ── GC candidates ─────────────────────────────────────────────────────────────
+
+class TestGCCandidates:
+    def test_gc_candidates_returns_list(self, vault):
+        candidates = vault.gc_candidates()
+        assert isinstance(candidates, list)
+
+    def test_gc_candidates_lists_orphans_without_deleting(self, vault):
+        vault.store(make_conv("orphan-1"))
+        vault.delete("orphan-1")
+        before = vault.gc_candidates()
+        assert len(before) > 0
+        # Calling gc_candidates does NOT delete — list should still be non-empty.
+        again = vault.gc_candidates()
+        assert len(again) == len(before)
+        # Now actually GC.
+        freed = vault.gc()
+        assert freed == len(before)
+        assert vault.gc_candidates() == []

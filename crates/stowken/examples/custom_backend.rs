@@ -13,7 +13,7 @@ use stowken::{
     storage::{StorageBackend, StorageError, StorageResult},
     types::{
         AnalyticsQuery, Conversation, ConversationManifest, Message, MessageContent,
-        SegmentHash, SegmentTypeStats, StoredSegment, TokenUsageStats, StowkenConfig,
+        SegmentHash, StoredSegment, StowkenConfig,
     },
     Stowken,
 };
@@ -45,11 +45,6 @@ impl StorageBackend for MyBackend {
 
     async fn has_segment(&self, hash: &SegmentHash) -> StorageResult<bool> {
         Ok(self.segments.read().await.contains_key(&hash.0))
-    }
-
-    async fn has_segments(&self, hashes: &[SegmentHash]) -> StorageResult<Vec<SegmentHash>> {
-        let map = self.segments.read().await;
-        Ok(hashes.iter().filter(|h| map.contains_key(&h.0)).cloned().collect())
     }
 
     async fn increment_ref(&self, hash: &SegmentHash) -> StorageResult<()> {
@@ -104,50 +99,6 @@ impl StorageBackend for MyBackend {
     ) -> StorageResult<Vec<String>> {
         let ids: Vec<String> = self.manifests.read().await.keys().cloned().collect();
         Ok(ids.into_iter().skip(offset as usize).take(limit as usize).collect())
-    }
-
-    async fn get_stats(&self) -> StorageResult<TokenUsageStats> {
-        let segs = self.segments.read().await;
-        let total_tokens: u64 = segs.values().map(|s| s.token_count as u64 * s.ref_count).sum();
-        let storage_bytes: u64 = segs.values().map(|s| s.compressed_size as u64).sum();
-        Ok(TokenUsageStats {
-            total_tokens,
-            total_conversations: self.manifests.read().await.len() as u64,
-            unique_segments: segs.len() as u64,
-            total_segments: segs.values().map(|s| s.ref_count).sum(),
-            dedup_ratio: 0.0,
-            compression_ratio: 1.0,
-            storage_bytes,
-            naive_bytes: storage_bytes,
-            savings_percentage: 0.0,
-        })
-    }
-
-    async fn get_segment_type_stats(&self) -> StorageResult<Vec<SegmentTypeStats>> {
-        Ok(vec![])
-    }
-
-    async fn query_analytics(
-        &self,
-        _query: &AnalyticsQuery,
-    ) -> StorageResult<Vec<HashMap<String, serde_json::Value>>> {
-        Ok(vec![])
-    }
-
-    async fn list_unique_system_prompts(&self) -> StorageResult<Vec<(SegmentHash, u32, u64)>> {
-        Ok(vec![])
-    }
-
-    async fn find_conversations_by_segment(
-        &self,
-        hash: &SegmentHash,
-    ) -> StorageResult<Vec<String>> {
-        let manifests = self.manifests.read().await;
-        Ok(manifests
-            .values()
-            .filter(|m| m.segments.iter().any(|s| &s.hash == hash))
-            .map(|m| m.id.clone())
-            .collect())
     }
 
     async fn garbage_collect(&self) -> StorageResult<u64> {

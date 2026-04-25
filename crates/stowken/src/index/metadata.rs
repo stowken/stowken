@@ -383,6 +383,51 @@ impl MetadataIndex {
         Ok(ids)
     }
 
+    /// Find segments referenced at least `min_refs` times, ordered by ref_count
+    /// descending. Each row reports `wasted_bytes = (ref_count - 1) * raw_size`,
+    /// which is the storage that dedup is saving on that segment alone.
+    pub fn find_duplicates(
+        &self,
+        min_refs: u64,
+        limit: u64,
+    ) -> MetadataResult<Vec<crate::types::DuplicateSegment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT hash, segment_type, token_count, ref_count, raw_size \
+             FROM segments_meta \
+             WHERE ref_count >= ?1 \
+             ORDER BY ref_count DESC \
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![min_refs as i64, limit as i64], |row| {
+                let hash: String = row.get(0)?;
+                let type_str: String = row.get(1)?;
+                let token_count: i64 = row.get(2)?;
+                let ref_count: i64 = row.get(3)?;
+                let raw_size: i64 = row.get(4)?;
+                Ok((hash, type_str, token_count, ref_count, raw_size))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (hash, type_str, token_count, ref_count, raw_size) in rows {
+            let segment_type = type_str
+                .parse()
+                .map_err(|e: String| MetadataError::Parse(e))?;
+            let ref_count = ref_count as u64;
+            let wasted = (ref_count.saturating_sub(1)) * (raw_size as u64);
+            out.push(crate::types::DuplicateSegment {
+                hash: SegmentHash(hash),
+                segment_type,
+                token_count: token_count as u32,
+                ref_count,
+                wasted_bytes: wasted,
+            });
+        }
+        Ok(out)
+    }
+
     /// List unique system prompts ordered by ref_count descending.
     pub fn list_unique_system_prompts(&self) -> MetadataResult<Vec<SystemPromptInfo>> {
         let conn = self.conn.lock().unwrap();
@@ -454,6 +499,7 @@ mod tests {
 
     fn make_manifest(id: &str) -> ConversationManifest {
         ConversationManifest {
+            schema_version: crate::types::MANIFEST_SCHEMA_VERSION,
             id: id.to_owned(),
             application: Some("myapp".to_owned()),
             model: "gpt-4".to_owned(),
