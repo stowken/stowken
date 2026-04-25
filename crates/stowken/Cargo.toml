@@ -1,0 +1,45 @@
+[package]
+name = "stowken"
+version = "0.1.0"
+edition = "2021"
+description = "Compressed storage and retrieval of LLM token sequences"
+license = "Apache-2.0"
+repository = "https://github.com/stowken/stowken"
+keywords = ["llm", "tokens", "compression", "storage", "deduplication"]
+categories = ["compression", "database", "data-structures"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zstd = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tiktoken-rs = { version = "0.11", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[features]
+default = ["tiktoken"]
+tiktoken = ["dep:tiktoken-rs"]
+
+[[bench]]
+name = "compression"
+harness = false
+
+[[bench]]
+name = "ingest"
+harness = false
+
+[[bench]]
+name = "retrieval"
+harness = false

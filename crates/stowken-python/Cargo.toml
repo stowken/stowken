@@ -1,0 +1,16 @@
+[package]
+name = "stowken-python"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for Stowken"
+
+[lib]
+name = "stowken"
+crate-type = ["cdylib"]
+
+[dependencies]
+stowken = { workspace = true }
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }

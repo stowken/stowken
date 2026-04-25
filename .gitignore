@@ -1,0 +1,41 @@
+# Rust
+/target/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editor
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Environment
+.env
+.env.*
+
+# Python (maturin/PyO3)
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.egg-info/
+dist/
+.venv/
+venv/
+.pytest_cache/
+**/.pytest_cache/
+
+# Node.js (napi-rs)
+node_modules/
+**/node_modules/
+*.node
+npm-debug.log*
+yarn-error.log*
+
+# Build artifacts
+*.dylib
+*.dll
+*.a

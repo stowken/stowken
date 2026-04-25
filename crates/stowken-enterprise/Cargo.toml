@@ -1,0 +1,54 @@
+[package]
+name = "stowken-enterprise"
+version = "0.1.0"
+edition = "2021"
+description = "Enterprise extensions for Stowken — cloud backends, compliance, advanced analytics"
+license = "LicenseRef-Stowken-Commercial"
+
+[dependencies]
+stowken = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zstd = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# License validation — Ed25519 JWT verification
+ed25519-dalek = { version = "2", features = ["serde"] }
+base64 = "0.22"
+
+# Encryption at rest
+aes-gcm = "0.10"
+rand = "0.8"
+
+# Cloud backends (optional per feature)
+aws-sdk-s3 = { version = "1", optional = true }
+aws-config = { version = "1", optional = true }
+google-cloud-storage = { version = "0.20", optional = true }
+azure_storage_blobs = { version = "0.20", optional = true }
+futures = { version = "0.3", optional = true }
+
+# Parquet export (optional)
+parquet = { version = "53", optional = true }
+arrow = { version = "53", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+[features]
+default = ["s3"]
+dev-license = []
+s3 = ["aws-sdk-s3", "aws-config"]
+gcs = ["google-cloud-storage"]
+azure = ["azure_storage_blobs", "futures"]
+export-parquet = ["parquet", "arrow"]
+all-backends = ["s3", "gcs", "azure"]
+full = ["all-backends", "export-parquet"]
