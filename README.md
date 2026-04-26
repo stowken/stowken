@@ -143,6 +143,23 @@ for seg in retrieved["segments"]:
 
 Pre-tokenized input is supported — pass `{"role": "user", "tokens": [...]}` to skip the built-in tiktoken pass.
 
+**Async API.** Every I/O method has an `_async` variant that returns an awaitable, safe to use inside an asyncio event loop (FastAPI handlers, async ingestion pipelines):
+
+```python
+import asyncio
+import stowken
+
+async def main():
+    vault = stowken.Stowken.open("/var/lib/stowken")
+    result = await vault.store_async({"model": "gpt-4", "messages": [...]})
+    conv = await vault.retrieve_async(result.id)
+    stats = await vault.stats_async()
+
+asyncio.run(main())
+```
+
+Sync and async share the same vault instance and the same Tokio runtime under the hood — you can mix them freely. Available pairs: `store/store_async`, `retrieve/retrieve_async`, `delete/delete_async`, `stats/stats_async`, `segment_stats/segment_stats_async`, `gc/gc_async`, `gc_candidates/gc_candidates_async`, `reindex/reindex_async`.
+
 ### CLI
 
 ```sh

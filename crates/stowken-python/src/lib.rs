@@ -3,14 +3,15 @@
 //! Build:  maturin develop   (editable install)
 //!         maturin build --release  (wheel)
 //!
-//! Usage:
-//!   import stowken
-//!   vault = stowken.Stowken()                       # in-memory
-//!   vault = stowken.Stowken.open("/var/lib/sk")     # filesystem-backed
-//!   result = vault.store({"model": "gpt-4", "messages": [...]})
-//!   conv   = vault.retrieve(result.id)              # includes tokens
+//! Each I/O method is exposed in two flavours:
+//!   `vault.foo(...)`        — blocking; runs the future on a shared runtime.
+//!   `vault.foo_async(...)`  — returns a Python awaitable; safe inside an
+//!                             event loop (FastAPI, asyncio workers, etc.).
+//!
+//! Both flavours share a single Tokio runtime, so mixing them in one process
+//! is fine.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -27,9 +28,9 @@ use sk::{
 
 // ── Shared runtime ───────────────────────────────────────────────────────────
 
-/// One Tokio runtime shared across every PyO3 call. Constructing a runtime
-/// per-call (the previous behaviour) made every store/retrieve dominate-cost
-/// even on local data.
+/// One Tokio runtime shared across every PyO3 call (sync and async). Calling
+/// `block_on` inside an async future would deadlock, so the sync methods
+/// only ever use this on a thread that doesn't have an active runtime.
 fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| {
@@ -167,53 +168,212 @@ fn parse_conversation(dict: &pyo3::Bound<'_, PyDict>) -> PyResult<Conversation> 
     Ok(Conversation { id, model, tokenizer, application, metadata: None, messages })
 }
 
+// ── Result-shaping helpers (used by both sync and async paths) ───────────────
+
+fn shape_store_result(r: sk::types::StoreResult) -> StoreResult {
+    StoreResult {
+        id: r.id,
+        total_segments: r.total_segments,
+        new_segments: r.new_segments,
+        deduped_segments: r.deduped_segments,
+        bytes_saved: r.bytes_saved,
+        compression_ratio: r.compression_ratio,
+    }
+}
+
+fn shape_token_stats(s: sk::types::TokenUsageStats) -> TokenUsageStats {
+    TokenUsageStats {
+        total_tokens: s.total_tokens,
+        total_conversations: s.total_conversations,
+        unique_segments: s.unique_segments,
+        total_segments: s.total_segments,
+        dedup_ratio: s.dedup_ratio,
+        compression_ratio: s.compression_ratio,
+        storage_bytes: s.storage_bytes,
+        savings_percentage: s.savings_percentage,
+    }
+}
+
+fn build_retrieve_dict(
+    py: Python<'_>,
+    retrieved: &sk::types::RetrievedConversation,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("id", &retrieved.manifest.id)?;
+    dict.set_item("model", &retrieved.manifest.model)?;
+    dict.set_item("tokenizer", &retrieved.manifest.tokenizer)?;
+    if let Some(app) = &retrieved.manifest.application {
+        dict.set_item("application", app)?;
+    }
+    dict.set_item("total_tokens", retrieved.manifest.total_tokens)?;
+
+    let segs_list = PyList::empty_bound(py);
+    for seg in &retrieved.segments {
+        let sd = PyDict::new_bound(py);
+        sd.set_item("segment_type", seg.segment_type.to_string())?;
+        sd.set_item("token_count", seg.token_count)?;
+        sd.set_item("hash", &seg.hash.0)?;
+        sd.set_item("tokens", &seg.tokens)?;
+        segs_list.append(sd)?;
+    }
+    dict.set_item("segments", segs_list)?;
+    Ok(dict.into())
+}
+
+fn build_segment_stats_list(
+    py: Python<'_>,
+    stats: &[sk::types::SegmentTypeStats],
+) -> PyResult<PyObject> {
+    let list = PyList::empty_bound(py);
+    for s in stats {
+        let d = PyDict::new_bound(py);
+        d.set_item("segment_type", s.segment_type.to_string())?;
+        d.set_item("unique_count", s.unique_count)?;
+        d.set_item("total_references", s.total_references)?;
+        d.set_item("dedup_ratio", s.dedup_ratio)?;
+        d.set_item("total_tokens", s.total_tokens)?;
+        d.set_item("compressed_bytes", s.compressed_bytes)?;
+        list.append(d)?;
+    }
+    Ok(list.into())
+}
+
+fn build_reindex_dict(
+    py: Python<'_>,
+    report: &sk::types::ReindexStats,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("conversations_indexed", report.conversations_indexed)?;
+    dict.set_item("unique_segments_indexed", report.unique_segments_indexed)?;
+    dict.set_item("segments_missing", report.segments_missing)?;
+    Ok(dict.into())
+}
+
+fn build_hash_list(py: Python<'_>, hashes: &[sk::types::SegmentHash]) -> PyResult<PyObject> {
+    let list = PyList::empty_bound(py);
+    for h in hashes {
+        list.append(&h.0)?;
+    }
+    Ok(list.into())
+}
+
 // ── Backend variants ─────────────────────────────────────────────────────────
 
 /// Wraps either an in-memory or filesystem-backed `Stowken`.
-///
-/// Held inside an `Arc` so we can run the inner future on the shared runtime
-/// without lifetime juggling.
 enum VaultKind {
     Memory(Stowken<MemoryBackend>),
     Filesystem(Stowken<FilesystemBackend>),
+}
+
+// ── Per-method dispatch helpers ──────────────────────────────────────────────
+//
+// Each helper takes a reference to VaultKind and runs the inner `Stowken`
+// method asynchronously, returning the raw Rust result. The sync wrappers
+// use `runtime().block_on(...)` and the async wrappers feed the future to
+// `pyo3_async_runtimes::tokio::future_into_py`.
+
+async fn vault_store(
+    inner: &VaultKind,
+    conv: Conversation,
+) -> Result<sk::types::StoreResult, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.store(conv).await,
+        VaultKind::Filesystem(v) => v.store(conv).await,
+    }
+}
+
+async fn vault_retrieve(
+    inner: &VaultKind,
+    id: &str,
+) -> Result<sk::types::RetrievedConversation, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.retrieve(id).await,
+        VaultKind::Filesystem(v) => v.retrieve(id).await,
+    }
+}
+
+async fn vault_delete(inner: &VaultKind, id: &str) -> Result<(), sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.delete(id).await,
+        VaultKind::Filesystem(v) => v.delete(id).await,
+    }
+}
+
+async fn vault_stats(
+    inner: &VaultKind,
+) -> Result<sk::types::TokenUsageStats, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.stats().await,
+        VaultKind::Filesystem(v) => v.stats().await,
+    }
+}
+
+async fn vault_gc(inner: &VaultKind) -> Result<u64, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.gc().await,
+        VaultKind::Filesystem(v) => v.gc().await,
+    }
+}
+
+async fn vault_gc_candidates(
+    inner: &VaultKind,
+) -> Result<Vec<sk::types::SegmentHash>, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.gc_candidates().await,
+        VaultKind::Filesystem(v) => v.gc_candidates().await,
+    }
+}
+
+async fn vault_segment_stats(
+    inner: &VaultKind,
+) -> Result<Vec<sk::types::SegmentTypeStats>, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.segment_stats().await,
+        VaultKind::Filesystem(v) => v.segment_stats().await,
+    }
+}
+
+async fn vault_reindex(
+    inner: &VaultKind,
+) -> Result<sk::types::ReindexStats, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.reindex().await,
+        VaultKind::Filesystem(v) => v.reindex().await,
+    }
 }
 
 // ── Main Python class ─────────────────────────────────────────────────────────
 
 /// Compressed, deduplicated storage for LLM token sequences.
 ///
-/// Default constructor opens an ephemeral in-memory vault. For persistence
-/// use :meth:`open` with a directory path.
+/// Each I/O method is exposed in two flavours:
+///
+///   ``vault.foo(...)``        sync; safe outside any event loop.
+///   ``vault.foo_async(...)``  returns an awaitable; safe inside asyncio
+///                             event loops (FastAPI, async workers).
+///
+/// The two share a single Tokio runtime under the hood.
 ///
 /// Example::
 ///
-///     import stowken
-///
-///     # Ephemeral
-///     vault = stowken.Stowken()
-///
-///     # Persistent
+///     # Sync
 ///     vault = stowken.Stowken.open("/var/lib/stowken")
+///     vault.store({...})
 ///
-///     vault.store({
-///         "model": "gpt-4",
-///         "messages": [
-///             {"role": "system",    "content": "You are helpful."},
-///             {"role": "user",      "content": "Hello!"},
-///             {"role": "assistant", "content": "Hi there!"},
-///         ],
-///     })
+///     # Async
+///     async def ingest():
+///         vault = stowken.Stowken.open("/var/lib/stowken")
+///         await vault.store_async({...})
 #[pyclass(name = "Stowken")]
 pub struct PyStowken {
-    inner: VaultKind,
+    /// Arc so that async futures can hold a reference to the vault across
+    /// await points without lifetime gymnastics.
+    inner: Arc<VaultKind>,
 }
 
 #[pymethods]
 impl PyStowken {
     /// Create a new in-memory vault.
-    ///
-    /// Args:
-    ///     enable_compression (bool): Enable zstd compression. Default ``True``.
     #[new]
     #[pyo3(signature = (enable_compression=true))]
     fn new(_py: Python<'_>, enable_compression: bool) -> PyResult<Self> {
@@ -222,17 +382,10 @@ impl PyStowken {
         let inner = runtime()
             .block_on(Stowken::new(backend, config))
             .map_err(py_err)?;
-        Ok(Self { inner: VaultKind::Memory(inner) })
+        Ok(Self { inner: Arc::new(VaultKind::Memory(inner)) })
     }
 
     /// Open a filesystem-backed vault rooted at `path`.
-    ///
-    /// Creates the directory and metadata database if they don't exist.
-    /// Subsequent calls with the same path reopen the existing vault.
-    ///
-    /// Args:
-    ///     path (str): Directory path for vault storage.
-    ///     enable_compression (bool): Default ``True``.
     #[classmethod]
     #[pyo3(signature = (path, enable_compression=true))]
     fn open(
@@ -251,153 +404,153 @@ impl PyStowken {
                     .map_err(|e| e.to_string())
             })
             .map_err(PyRuntimeError::new_err)?;
-        Ok(Self { inner: VaultKind::Filesystem(inner) })
+        Ok(Self { inner: Arc::new(VaultKind::Filesystem(inner)) })
     }
 
-    /// Store a conversation dict (OpenAI-compatible format).
+    // ── store ────────────────────────────────────────────────────────────────
+
     fn store(
         &self,
         _py: Python<'_>,
         conversation: &pyo3::Bound<'_, PyDict>,
     ) -> PyResult<StoreResult> {
         let conv = parse_conversation(conversation)?;
-        let result = match &self.inner {
-            VaultKind::Memory(v) => runtime().block_on(v.store(conv)).map_err(py_err)?,
-            VaultKind::Filesystem(v) => runtime().block_on(v.store(conv)).map_err(py_err)?,
-        };
-        Ok(StoreResult {
-            id: result.id,
-            total_segments: result.total_segments,
-            new_segments: result.new_segments,
-            deduped_segments: result.deduped_segments,
-            bytes_saved: result.bytes_saved,
-            compression_ratio: result.compression_ratio,
+        let result = runtime()
+            .block_on(vault_store(&self.inner, conv))
+            .map_err(py_err)?;
+        Ok(shape_store_result(result))
+    }
+
+    fn store_async<'py>(
+        &self,
+        py: Python<'py>,
+        conversation: &pyo3::Bound<'_, PyDict>,
+    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        // Eagerly convert the PyDict into a Conversation while we still hold
+        // the GIL — the dict reference can't cross await points.
+        let conv = parse_conversation(conversation)?;
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = vault_store(&inner, conv).await.map_err(py_err)?;
+            Ok(shape_store_result(result))
         })
     }
 
-    /// Retrieve a conversation by ID.
-    ///
-    /// Returns:
-    ///     dict: ``id``, ``model``, ``tokenizer``, ``total_tokens``,
-    ///     and ``segments``. Each segment dict contains ``segment_type``,
-    ///     ``token_count``, ``hash``, and ``tokens`` (the actual `u32`
-    ///     token IDs as a Python list).
+    // ── retrieve ─────────────────────────────────────────────────────────────
+
     fn retrieve(&self, py: Python<'_>, id: &str) -> PyResult<PyObject> {
-        let retrieved = match &self.inner {
-            VaultKind::Memory(v) => runtime().block_on(v.retrieve(id)).map_err(py_err)?,
-            VaultKind::Filesystem(v) => runtime().block_on(v.retrieve(id)).map_err(py_err)?,
-        };
-
-        let dict = PyDict::new_bound(py);
-        dict.set_item("id", &retrieved.manifest.id)?;
-        dict.set_item("model", &retrieved.manifest.model)?;
-        dict.set_item("tokenizer", &retrieved.manifest.tokenizer)?;
-        if let Some(app) = &retrieved.manifest.application {
-            dict.set_item("application", app)?;
-        }
-        dict.set_item("total_tokens", retrieved.manifest.total_tokens)?;
-
-        let segs_list = PyList::empty_bound(py);
-        for seg in &retrieved.segments {
-            let sd = PyDict::new_bound(py);
-            sd.set_item("segment_type", seg.segment_type.to_string())?;
-            sd.set_item("token_count", seg.token_count)?;
-            sd.set_item("hash", &seg.hash.0)?;
-            sd.set_item("tokens", &seg.tokens)?;
-            segs_list.append(sd)?;
-        }
-        dict.set_item("segments", segs_list)?;
-
-        Ok(dict.into())
+        let retrieved = runtime()
+            .block_on(vault_retrieve(&self.inner, id))
+            .map_err(py_err)?;
+        build_retrieve_dict(py, &retrieved)
     }
 
-    /// Delete a conversation by ID.
-    fn delete(&self, _py: Python<'_>, id: &str) -> PyResult<()> {
-        match &self.inner {
-            VaultKind::Memory(v) => runtime().block_on(v.delete(id)).map_err(py_err),
-            VaultKind::Filesystem(v) => runtime().block_on(v.delete(id)).map_err(py_err),
-        }
-    }
-
-    /// Return aggregate storage statistics.
-    fn stats(&self, _py: Python<'_>) -> PyResult<TokenUsageStats> {
-        let s = match &self.inner {
-            VaultKind::Memory(v) => runtime().block_on(v.stats()).map_err(py_err)?,
-            VaultKind::Filesystem(v) => runtime().block_on(v.stats()).map_err(py_err)?,
-        };
-        Ok(TokenUsageStats {
-            total_tokens: s.total_tokens,
-            total_conversations: s.total_conversations,
-            unique_segments: s.unique_segments,
-            total_segments: s.total_segments,
-            dedup_ratio: s.dedup_ratio,
-            compression_ratio: s.compression_ratio,
-            storage_bytes: s.storage_bytes,
-            savings_percentage: s.savings_percentage,
+    fn retrieve_async<'py>(
+        &self,
+        py: Python<'py>,
+        id: String,
+    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let retrieved = vault_retrieve(&inner, &id).await.map_err(py_err)?;
+            Python::with_gil(|py| build_retrieve_dict(py, &retrieved))
         })
     }
 
-    /// Run garbage collection.
-    ///
-    /// Returns:
-    ///     int: number of zero-reference segments deleted.
+    // ── delete ───────────────────────────────────────────────────────────────
+
+    fn delete(&self, _py: Python<'_>, id: &str) -> PyResult<()> {
+        runtime().block_on(vault_delete(&self.inner, id)).map_err(py_err)
+    }
+
+    fn delete_async<'py>(
+        &self,
+        py: Python<'py>,
+        id: String,
+    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            vault_delete(&inner, &id).await.map_err(py_err)?;
+            Ok(())
+        })
+    }
+
+    // ── stats ────────────────────────────────────────────────────────────────
+
+    fn stats(&self, _py: Python<'_>) -> PyResult<TokenUsageStats> {
+        let s = runtime().block_on(vault_stats(&self.inner)).map_err(py_err)?;
+        Ok(shape_token_stats(s))
+    }
+
+    fn stats_async<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let s = vault_stats(&inner).await.map_err(py_err)?;
+            Ok(shape_token_stats(s))
+        })
+    }
+
+    // ── gc / gc_candidates ───────────────────────────────────────────────────
+
     fn gc(&self, _py: Python<'_>) -> PyResult<u64> {
-        match &self.inner {
-            VaultKind::Memory(v) => runtime().block_on(v.gc()).map_err(py_err),
-            VaultKind::Filesystem(v) => runtime().block_on(v.gc()).map_err(py_err),
-        }
+        runtime().block_on(vault_gc(&self.inner)).map_err(py_err)
     }
 
-    /// Rebuild the SQLite metadata index from on-disk manifests.
-    ///
-    /// Useful after restoring a vault from a backup that didn't include the
-    /// index, or if you suspect drift. Returns a dict with
-    /// ``conversations_indexed``, ``unique_segments_indexed``, and
-    /// ``segments_missing``.
-    fn reindex(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let report = match &self.inner {
-            VaultKind::Memory(v) => runtime().block_on(v.reindex()).map_err(py_err)?,
-            VaultKind::Filesystem(v) => runtime().block_on(v.reindex()).map_err(py_err)?,
-        };
-        let dict = PyDict::new_bound(py);
-        dict.set_item("conversations_indexed", report.conversations_indexed)?;
-        dict.set_item("unique_segments_indexed", report.unique_segments_indexed)?;
-        dict.set_item("segments_missing", report.segments_missing)?;
-        Ok(dict.into())
+    fn gc_async<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            vault_gc(&inner).await.map_err(py_err)
+        })
     }
 
-    /// List segment hashes currently eligible for GC, without deleting.
     fn gc_candidates(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let hashes = match &self.inner {
-            VaultKind::Memory(v) => runtime().block_on(v.gc_candidates()).map_err(py_err)?,
-            VaultKind::Filesystem(v) => runtime().block_on(v.gc_candidates()).map_err(py_err)?,
-        };
-        let list = PyList::empty_bound(py);
-        for h in hashes {
-            list.append(h.0)?;
-        }
-        Ok(list.into())
+        let hashes = runtime()
+            .block_on(vault_gc_candidates(&self.inner))
+            .map_err(py_err)?;
+        build_hash_list(py, &hashes)
     }
 
-    /// Return per-segment-type statistics.
-    fn segment_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let stats = match &self.inner {
-            VaultKind::Memory(v) => runtime().block_on(v.segment_stats()).map_err(py_err)?,
-            VaultKind::Filesystem(v) => runtime().block_on(v.segment_stats()).map_err(py_err)?,
-        };
-        let list = PyList::empty_bound(py);
-        for s in stats {
-            let d = PyDict::new_bound(py);
-            d.set_item("segment_type", s.segment_type.to_string())?;
-            d.set_item("unique_count", s.unique_count)?;
-            d.set_item("total_references", s.total_references)?;
-            d.set_item("dedup_ratio", s.dedup_ratio)?;
-            d.set_item("total_tokens", s.total_tokens)?;
-            d.set_item("compressed_bytes", s.compressed_bytes)?;
-            list.append(d)?;
-        }
-        Ok(list.into())
+    fn gc_candidates_async<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let hashes = vault_gc_candidates(&inner).await.map_err(py_err)?;
+            Python::with_gil(|py| build_hash_list(py, &hashes))
+        })
     }
+
+    // ── segment_stats ────────────────────────────────────────────────────────
+
+    fn segment_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let stats = runtime()
+            .block_on(vault_segment_stats(&self.inner))
+            .map_err(py_err)?;
+        build_segment_stats_list(py, &stats)
+    }
+
+    fn segment_stats_async<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let stats = vault_segment_stats(&inner).await.map_err(py_err)?;
+            Python::with_gil(|py| build_segment_stats_list(py, &stats))
+        })
+    }
+
+    // ── reindex ──────────────────────────────────────────────────────────────
+
+    fn reindex(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let report = runtime().block_on(vault_reindex(&self.inner)).map_err(py_err)?;
+        build_reindex_dict(py, &report)
+    }
+
+    fn reindex_async<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let report = vault_reindex(&inner).await.map_err(py_err)?;
+            Python::with_gil(|py| build_reindex_dict(py, &report))
+        })
+    }
+
+    // ── repr ─────────────────────────────────────────────────────────────────
 
     fn __repr__(&self, py: Python<'_>) -> String {
         match self.stats(py) {

@@ -919,7 +919,7 @@ async fn cmd_bench(
         compressed: String,
     }
     let mut sorted = seg_stats.clone();
-    sorted.sort_by(|a, b| b.total_references.cmp(&a.total_references));
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.total_references));
     let rows: Vec<Row> = sorted
         .iter()
         .map(|s| Row {
