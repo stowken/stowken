@@ -280,6 +280,17 @@ pub struct SystemPromptInfo {
     pub ref_count: u64,
 }
 
+/// Result of a reindex pass.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReindexStats {
+    pub conversations_indexed: u64,
+    /// Distinct segment hashes whose metadata was reindexed.
+    pub unique_segments_indexed: u64,
+    /// Segment references found in manifests whose backend bytes were missing.
+    /// Indicates corruption — these refs are skipped, not surfaced as errors.
+    pub segments_missing: u64,
+}
+
 /// A heavily-referenced segment surfaced by the duplicate finder.
 ///
 /// The `wasted_bytes` field reports how many bytes the duplicates would have

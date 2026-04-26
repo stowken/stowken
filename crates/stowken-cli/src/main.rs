@@ -135,6 +135,13 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Rebuild the SQLite metadata index from on-disk manifests.
+    ///
+    /// Use after a corrupted or deleted metadata.db, after restoring a vault
+    /// from a backup that didn't include the index, or to reconcile drift.
+    /// Does not touch the segment files or backend ref-counts.
+    Reindex,
+
     /// Audit unique system prompts by reference count (find prompt drift).
     AuditSystemPrompts {
         /// Show only prompts with at least this many references.
@@ -261,6 +268,9 @@ async fn main() -> Result<()> {
         }
         Command::Gc { dry_run } => {
             cmd_gc(&data_dir, config, dry_run).await?;
+        }
+        Command::Reindex => {
+            cmd_reindex(&data_dir, config, cli.json).await?;
         }
         Command::AuditSystemPrompts { min_refs, limit } => {
             cmd_audit_system_prompts(&data_dir, config, min_refs, limit, cli.json).await?;
@@ -734,6 +744,38 @@ async fn cmd_find_duplicates(
             dups.len(),
             format_bytes(total_saved)
         );
+    }
+    Ok(())
+}
+
+async fn cmd_reindex(data_dir: &PathBuf, config: StowkenConfig, json: bool) -> Result<()> {
+    let vault = open_vault(data_dir, config).await?;
+    let started = std::time::Instant::now();
+    let stats = vault.reindex().await.context("running reindex")?;
+    let elapsed = started.elapsed();
+
+    if json {
+        let out = serde_json::json!({
+            "conversations_indexed":   stats.conversations_indexed,
+            "unique_segments_indexed": stats.unique_segments_indexed,
+            "segments_missing":        stats.segments_missing,
+            "elapsed_ms":              elapsed.as_millis(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!(
+            "Reindex complete in {}ms: {} conversation(s), {} unique segment(s)",
+            elapsed.as_millis(),
+            stats.conversations_indexed,
+            stats.unique_segments_indexed
+        );
+        if stats.segments_missing > 0 {
+            eprintln!(
+                "warning: {} segment reference(s) had no backing data — likely corruption. \
+                 Reindex completed; consider running `gc` to clean up dangling refs.",
+                stats.segments_missing
+            );
+        }
     }
     Ok(())
 }

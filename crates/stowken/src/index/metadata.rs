@@ -237,6 +237,16 @@ impl MetadataIndex {
         Ok(())
     }
 
+    /// Wipe every row from every index table. Used by reindex; manifests on
+    /// disk remain the source of truth and are replayed afterwards.
+    pub fn clear(&self) -> MetadataResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM segment_refs", [])?;
+        conn.execute("DELETE FROM conversations", [])?;
+        conn.execute("DELETE FROM segments_meta", [])?;
+        Ok(())
+    }
+
     // ── Analytics ─────────────────────────────────────────────────────────
 
     /// Aggregate storage statistics.

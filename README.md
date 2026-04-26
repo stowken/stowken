@@ -170,6 +170,9 @@ stowken export --format jsonl --output training.jsonl
 # Benchmark on your own data (read-only — does not touch your vault)
 stowken bench /path/to/conversations.jsonl
 stowken --json bench ./conv-dir/ --max 1000
+
+# Rebuild the SQLite index from on-disk manifests (after backup restore, etc.)
+stowken reindex
 ```
 
 ---

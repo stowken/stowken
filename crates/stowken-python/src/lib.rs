@@ -348,6 +348,24 @@ impl PyStowken {
         }
     }
 
+    /// Rebuild the SQLite metadata index from on-disk manifests.
+    ///
+    /// Useful after restoring a vault from a backup that didn't include the
+    /// index, or if you suspect drift. Returns a dict with
+    /// ``conversations_indexed``, ``unique_segments_indexed``, and
+    /// ``segments_missing``.
+    fn reindex(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let report = match &self.inner {
+            VaultKind::Memory(v) => runtime().block_on(v.reindex()).map_err(py_err)?,
+            VaultKind::Filesystem(v) => runtime().block_on(v.reindex()).map_err(py_err)?,
+        };
+        let dict = PyDict::new_bound(py);
+        dict.set_item("conversations_indexed", report.conversations_indexed)?;
+        dict.set_item("unique_segments_indexed", report.unique_segments_indexed)?;
+        dict.set_item("segments_missing", report.segments_missing)?;
+        Ok(dict.into())
+    }
+
     /// List segment hashes currently eligible for GC, without deleting.
     fn gc_candidates(&self, py: Python<'_>) -> PyResult<PyObject> {
         let hashes = match &self.inner {

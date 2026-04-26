@@ -10,6 +10,7 @@ Or against an already-installed wheel:
     pytest python/tests/
 """
 
+import os
 import tempfile
 
 import pytest
@@ -268,6 +269,41 @@ class TestPersistentVault:
             v2 = stowken.Stowken.open(data_dir)
             r = v2.store({**make_conv("b"), "id": "b"})
             assert r.deduped_segments > 0, "dedup should still work after reopen"
+
+
+# ── Reindex ────────────────────────────────────────────────────────────────────
+
+class TestReindex:
+    def test_reindex_after_db_deletion_restores_stats(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            v = stowken.Stowken.open(data_dir)
+            for i in range(3):
+                v.store(make_token_conv(f"reidx-{i}", list(range(50)), [i, i + 1, i + 2]))
+            stats_before = v.stats()
+            del v
+
+            # Wipe the index. Manifests + segment files survive.
+            os.remove(os.path.join(data_dir, "metadata.db"))
+
+            v2 = stowken.Stowken.open(data_dir)
+            assert v2.stats().total_conversations == 0, "fresh DB should be empty"
+
+            report = v2.reindex()
+            assert report["conversations_indexed"] == 3
+            assert report["segments_missing"] == 0
+
+            stats_after = v2.stats()
+            assert stats_after.total_conversations == stats_before.total_conversations
+            assert stats_after.unique_segments == stats_before.unique_segments
+            assert stats_after.total_segments == stats_before.total_segments
+
+    def test_reindex_on_empty_vault(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            v = stowken.Stowken.open(data_dir)
+            report = v.reindex()
+            assert report["conversations_indexed"] == 0
+            assert report["unique_segments_indexed"] == 0
+            assert report["segments_missing"] == 0
 
 
 # ── GC candidates ─────────────────────────────────────────────────────────────

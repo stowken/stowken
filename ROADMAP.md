@@ -17,7 +17,7 @@ Everything currently in the repo: segmentation, exact dedup, varint+zstd, frame 
 **Theme:** prove the v0.1 thesis on real production data; close obvious correctness gaps before adding new features.
 
 - [x] **Real-world benchmark on public datasets.** *Shipped: `stowken bench <input-dir>` + `scripts/fetch_openassistant.py`. Headline number on OpenAssistant English (~3.5K conversations, 1.3M tokens): 54.2% saved, all from zstd, ~0% from dedup (no shared prompts in crowd-sourced data). Synthetic shared-prompt benchmark still hits 99.3%. README leads with the spectrum framing.*
-- [ ] **`stowken reindex`.** Rebuild the SQLite metadata index from manifest files on disk. Closes the recovery loop: today, losing `metadata.db` means losing all analytics. Manifests are the source of truth; the index should always be reconstructable.
+- [x] **`stowken reindex`.** *Shipped: rebuilds SQLite from on-disk manifests by replaying through the same batch path `store()` uses. Idempotent. Verified end-to-end (delete metadata.db → reindex → identical stats). Exposed via CLI and Python.*
 - [ ] **Async Python API.** `await vault.store(...)` via `pyo3-asyncio`. Removes per-call blocking overhead for callers running an event loop (FastAPI services, async ingestion pipelines). Backwards-compatible: keep the sync API too.
 
 **Definition of done:** real-world benchmark numbers in README; `stowken reindex` rebuilds a working index from a deleted DB; async Python passes the existing test suite plus an async-specific test file.

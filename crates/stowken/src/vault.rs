@@ -385,6 +385,98 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         Ok(self.backend.list_garbage().await?)
     }
 
+    /// Rebuild the SQLite metadata index from scratch by walking every
+    /// manifest in the backend. Manifests are the source of truth; the
+    /// index is a derived cache.
+    ///
+    /// Use this after a corrupted or deleted `metadata.db`, after restoring
+    /// a vault from a backup that didn't include the index, or to reconcile
+    /// the index when you suspect drift.
+    ///
+    /// Does not touch backend ref-counts. Reindex makes the SQL state match
+    /// what the manifests actually reference; running `gc` afterwards will
+    /// clean up any orphaned segments in the backend whose ref-counts
+    /// drifted independently.
+    pub async fn reindex(&self) -> Result<crate::types::ReindexStats, StowkenError> {
+        use std::collections::HashSet;
+
+        // Wipe the existing index in one transaction.
+        let index = self.index.clone();
+        task::spawn_blocking(move || index.clear())
+            .await
+            .map_err(|e| StowkenError::Internal(e.to_string()))??;
+
+        // Replay every manifest through the same batch path that store() uses.
+        let query = AnalyticsQuery::default();
+        let ids = self
+            .backend
+            .list_conversations(&query, u64::MAX, 0)
+            .await?;
+
+        let mut seen: HashSet<SegmentHash> = HashSet::new();
+        let mut conversations_indexed = 0u64;
+        let mut unique_segments_indexed = 0u64;
+        let mut segments_missing = 0u64;
+
+        for id in &ids {
+            let manifest = match self.backend.get_manifest(id).await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let mut index_ops: Vec<BatchSegmentOp> =
+                Vec::with_capacity(manifest.segments.len());
+
+            for seg_ref in &manifest.segments {
+                if seen.insert(seg_ref.hash.clone()) {
+                    // First time seeing this hash this run — read its meta
+                    // from the backend so the segments_meta row gets the
+                    // correct compressed_size, raw_size, etc.
+                    match self.backend.get_segment(&seg_ref.hash).await {
+                        Ok(stored) => {
+                            // Force ref_count=1 in the BatchSegmentOp::Upsert
+                            // payload; subsequent IncrementRef ops will bump
+                            // it as we encounter further references.
+                            let mut s = stored;
+                            s.ref_count = 1;
+                            index_ops.push(BatchSegmentOp::Upsert(s));
+                            unique_segments_indexed += 1;
+                        }
+                        Err(_) => {
+                            segments_missing += 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    index_ops.push(BatchSegmentOp::IncrementRef(seg_ref.hash.clone()));
+                }
+            }
+
+            let index = self.index.clone();
+            let manifest_clone = manifest.clone();
+            task::spawn_blocking(move || {
+                index.store_conversation_batch(&index_ops, &manifest_clone)
+            })
+            .await
+            .map_err(|e| StowkenError::Internal(e.to_string()))??;
+
+            conversations_indexed += 1;
+        }
+
+        info!(
+            conversations = conversations_indexed,
+            segments = unique_segments_indexed,
+            missing = segments_missing,
+            "reindexed metadata from manifests"
+        );
+
+        Ok(crate::types::ReindexStats {
+            conversations_indexed,
+            unique_segments_indexed,
+            segments_missing,
+        })
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────
 
     fn make_segmenter(&self, tokenizer_name: &str) -> Segmenter {

@@ -9,11 +9,14 @@ For planned future work see [ROADMAP.md](ROADMAP.md). Items move from the roadma
 - **`stowken bench <input-dir>`** — read-only benchmark on a directory of `.json` (one conversation per file) or `.jsonl` (one per line) inputs. Reports the three-stage savings breakdown (naive → dedup → zstd) plus per-segment-type detail. Doesn't touch the configured data directory. Both human-readable tables and `--json` output.
 - **`scripts/fetch_openassistant.py`** — converts the HuggingFace `OpenAssistant/oasst1` dataset to Stowken JSONL by walking the highest-rank path through each message tree.
 - **`MetadataIndex::dedup_only_bytes`** and **`Stowken::dedup_only_bytes`** — exposes the "after dedup, before compression" size needed to separate dedup savings from zstd savings.
+- **`stowken reindex`** + `Stowken::reindex` + Python `vault.reindex()` — rebuild the SQLite metadata index from on-disk manifests. Closes the recovery loop: deleting `metadata.db` or restoring from a backup that didn't include it no longer means losing all analytics. Idempotent. Reports `(conversations_indexed, unique_segments_indexed, segments_missing)`. Replays manifests through the same batch path that `store()` uses so the resulting index is byte-identical to one built incrementally.
+- **`MetadataIndex::clear`** — wipe every index table in one transaction. Used by reindex.
+- **`ReindexStats`** type.
 - **README headline numbers** replaced with measured benchmarks: 54.2% on full English OpenAssistant (zstd-dominated, no shared prompts) and 99.3% on the synthetic shared-prompt corpus (dedup-dominated). Spectrum framing instead of a single marketing number.
 
 ### Tests
 
-- 60 core + 23 integration + **12** CLI (was 10, +2 for `bench`) + 28 Python = **123 green**.
+- 60 core + **25** integration (was 23, +2 reindex) + **13** CLI (was 10, +2 bench, +1 reindex) + **30** Python (was 28, +2 reindex) = **129 green**.
 
 ## 0.1.0 — Unreleased
 

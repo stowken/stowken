@@ -236,6 +236,54 @@ fn store_from_file() {
 }
 
 #[test]
+fn reindex_restores_stats_after_db_deletion() {
+    let dir = temp_dir();
+
+    // Seed two conversations sharing a system prompt.
+    for id in ["reidx-a", "reidx-b"] {
+        let conv = serde_json::json!({
+            "id": id,
+            "model": "gpt-4",
+            "tokenizer": "cl100k_base",
+            "messages": [
+                {"role": "system",    "content": "Shared reindex prompt."},
+                {"role": "user",      "content": format!("Question for {id}")},
+                {"role": "assistant", "content": format!("Answer for {id}")}
+            ]
+        })
+        .to_string();
+        let out = run_stdin(dir.path(), &["store", "-"], &conv);
+        assert!(out.status.success(), "seed store failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let stats_before = run(dir.path(), &["--json", "stats"]);
+    assert!(stats_before.status.success());
+    let before: serde_json::Value = serde_json::from_slice(&stats_before.stdout).unwrap();
+
+    // Nuke the index. Manifests + segment files survive.
+    std::fs::remove_file(dir.path().join("metadata.db")).unwrap();
+
+    // Stats should be empty now.
+    let stats_empty = run(dir.path(), &["--json", "stats"]);
+    let empty: serde_json::Value = serde_json::from_slice(&stats_empty.stdout).unwrap();
+    assert_eq!(empty["total_conversations"].as_u64(), Some(0));
+
+    // Reindex.
+    let reidx = run(dir.path(), &["--json", "reindex"]);
+    assert!(reidx.status.success(), "reindex failed: {}", String::from_utf8_lossy(&reidx.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&reidx.stdout).unwrap();
+    assert_eq!(report["conversations_indexed"].as_u64(), Some(2));
+
+    // Stats should now match the original.
+    let stats_after = run(dir.path(), &["--json", "stats"]);
+    let after: serde_json::Value = serde_json::from_slice(&stats_after.stdout).unwrap();
+    assert_eq!(after["total_conversations"], before["total_conversations"]);
+    assert_eq!(after["unique_segments"], before["unique_segments"]);
+    assert_eq!(after["total_segments"], before["total_segments"]);
+    assert_eq!(after["total_tokens"], before["total_tokens"]);
+}
+
+#[test]
 fn bench_runs_on_jsonl_directory() {
     let dir = temp_dir();
     let bench_dir = tempfile::tempdir().unwrap();
