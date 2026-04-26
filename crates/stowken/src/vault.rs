@@ -333,6 +333,17 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             .map_err(Into::into)
     }
 
+    /// Bytes a corpus would occupy if stored as one raw copy per unique
+    /// segment (no compression). Used to separate dedup savings from zstd
+    /// savings in benchmarks.
+    pub async fn dedup_only_bytes(&self) -> Result<u64, StowkenError> {
+        let index = self.index.clone();
+        task::spawn_blocking(move || index.dedup_only_bytes())
+            .await
+            .map_err(|e| StowkenError::Internal(e.to_string()))?
+            .map_err(Into::into)
+    }
+
     /// Find segments referenced at least `min_refs` times — the high-traffic
     /// dedup candidates worth examining for prompt refactoring.
     pub async fn find_duplicates(

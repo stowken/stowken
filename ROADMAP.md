@@ -16,7 +16,7 @@ Everything currently in the repo: segmentation, exact dedup, varint+zstd, frame 
 
 **Theme:** prove the v0.1 thesis on real production data; close obvious correctness gaps before adding new features.
 
-- [ ] **Real-world benchmark on public datasets.** Adds `stowken bench <input-dir>` CLI subcommand. Replaces the synthetic 99.3% headline number with measured savings on at least one of: OpenAssistant Conversations (CC-BY-SA, ~600K msgs), LMSys-Chat-1M (1M real ChatGPT conversations across many models). Output reports per-segment-type breakdown so readers can predict their own savings from their traffic shape. Publishes results in README. *(In progress — this session.)*
+- [x] **Real-world benchmark on public datasets.** *Shipped: `stowken bench <input-dir>` + `scripts/fetch_openassistant.py`. Headline number on OpenAssistant English (~3.5K conversations, 1.3M tokens): 54.2% saved, all from zstd, ~0% from dedup (no shared prompts in crowd-sourced data). Synthetic shared-prompt benchmark still hits 99.3%. README leads with the spectrum framing.*
 - [ ] **`stowken reindex`.** Rebuild the SQLite metadata index from manifest files on disk. Closes the recovery loop: today, losing `metadata.db` means losing all analytics. Manifests are the source of truth; the index should always be reconstructable.
 - [ ] **Async Python API.** `await vault.store(...)` via `pyo3-asyncio`. Removes per-call blocking overhead for callers running an event loop (FastAPI services, async ingestion pipelines). Backwards-compatible: keep the sync API too.
 

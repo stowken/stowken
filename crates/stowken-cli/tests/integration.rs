@@ -236,6 +236,75 @@ fn store_from_file() {
 }
 
 #[test]
+fn bench_runs_on_jsonl_directory() {
+    let dir = temp_dir();
+    let bench_dir = tempfile::tempdir().unwrap();
+
+    // Two conversations sharing a system prompt — exercises the dedup path.
+    let jsonl_path = bench_dir.path().join("corpus.jsonl");
+    let mut file = std::fs::File::create(&jsonl_path).unwrap();
+    for id in ["bench-a", "bench-b"] {
+        let conv = serde_json::json!({
+            "id": id,
+            "model": "gpt-4",
+            "tokenizer": "cl100k_base",
+            "messages": [
+                {"role": "system", "content": "Shared system prompt for benchmarks."},
+                {"role": "user", "content": format!("Question {id}")},
+                {"role": "assistant", "content": format!("Answer for {id}")}
+            ]
+        });
+        writeln!(file, "{}", conv).unwrap();
+    }
+    drop(file);
+
+    let out = run(
+        dir.path(),
+        &["--json", "bench", bench_dir.path().to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "bench failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("bench --json should emit valid JSON");
+
+    assert_eq!(result["ingested"], 2, "expected 2 conversations ingested");
+    assert_eq!(result["failures"], 0, "expected 0 failures");
+
+    // Shared system prompt → at least one segment with refs > unique.
+    assert!(
+        result["dedup_ratio"].as_f64().unwrap() > 0.0,
+        "expected dedup ratio > 0 with a shared system prompt"
+    );
+
+    // The three storage layers are present and ordered correctly.
+    let naive = result["naive_bytes"].as_u64().unwrap();
+    let dedup = result["dedup_only_bytes"].as_u64().unwrap();
+    let storage = result["storage_bytes"].as_u64().unwrap();
+    assert!(dedup < naive, "dedup ({dedup}) should be smaller than naive ({naive})");
+    // storage may be larger than dedup on tiny corpora due to zstd frame
+    // overhead — that's expected and the report shows it honestly. Only
+    // sanity-check that storage is positive and not absurd.
+    assert!(storage > 0 && storage < naive * 2);
+}
+
+#[test]
+fn bench_errors_on_empty_directory() {
+    let dir = temp_dir();
+    let empty = tempfile::tempdir().unwrap();
+    let out = run(dir.path(), &["bench", empty.path().to_str().unwrap()]);
+    assert!(!out.status.success(), "bench should fail on empty directory");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no conversations found"),
+        "expected 'no conversations found' error, got: {stderr}"
+    );
+}
+
+#[test]
 fn export_jsonl_format() {
     let dir = temp_dir();
     // Store two conversations so export has something to emit.

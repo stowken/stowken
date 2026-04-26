@@ -2,6 +2,19 @@
 
 For planned future work see [ROADMAP.md](ROADMAP.md). Items move from the roadmap to a version section in this file when they ship.
 
+## 0.2.0 — Unreleased *(in progress)*
+
+### Added
+
+- **`stowken bench <input-dir>`** — read-only benchmark on a directory of `.json` (one conversation per file) or `.jsonl` (one per line) inputs. Reports the three-stage savings breakdown (naive → dedup → zstd) plus per-segment-type detail. Doesn't touch the configured data directory. Both human-readable tables and `--json` output.
+- **`scripts/fetch_openassistant.py`** — converts the HuggingFace `OpenAssistant/oasst1` dataset to Stowken JSONL by walking the highest-rank path through each message tree.
+- **`MetadataIndex::dedup_only_bytes`** and **`Stowken::dedup_only_bytes`** — exposes the "after dedup, before compression" size needed to separate dedup savings from zstd savings.
+- **README headline numbers** replaced with measured benchmarks: 54.2% on full English OpenAssistant (zstd-dominated, no shared prompts) and 99.3% on the synthetic shared-prompt corpus (dedup-dominated). Spectrum framing instead of a single marketing number.
+
+### Tests
+
+- 60 core + 23 integration + **12** CLI (was 10, +2 for `bench`) + 28 Python = **123 green**.
+
 ## 0.1.0 — Unreleased
 
 First focused release. The project was previously a 5-crate workspace with a wide enterprise feature surface (cloud backends, near-dedup via MinHash LSH, AES-256-GCM encryption, multi-tenant isolation, license validation, compliance modules, replication / distributed-lock abstractions, parquet export). This release drops everything that wasn't truly working and focuses on a clean local-vault product.

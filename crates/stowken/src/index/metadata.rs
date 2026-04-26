@@ -383,6 +383,22 @@ impl MetadataIndex {
         Ok(ids)
     }
 
+    /// Sum of `raw_size` across unique segments — i.e., storage if every
+    /// unique segment were stored uncompressed but exactly once.
+    ///
+    /// Used by benchmarks to separate "savings from dedup" from "savings from
+    /// compression" in the three-stage breakdown:
+    ///   naive_bytes (refs × raw)  →  dedup_only_bytes (uniques × raw)  →  storage_bytes (uniques × compressed)
+    pub fn dedup_only_bytes(&self) -> MetadataResult<u64> {
+        let conn = self.conn.lock().unwrap();
+        let bytes: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(raw_size), 0) FROM segments_meta",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(bytes as u64)
+    }
+
     /// Find segments referenced at least `min_refs` times, ordered by ref_count
     /// descending. Each row reports `wasted_bytes = (ref_count - 1) * raw_size`,
     /// which is the storage that dedup is saving on that segment alone.

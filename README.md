@@ -4,14 +4,32 @@
 
 Stowken stores LLM conversations as content-addressed token segments. Identical system prompts and contexts are stored once across the corpus; everything else is varint+zstd compressed. A SQLite index sits on top so you can audit what's actually flowing through your LLM in production.
 
-On a realistic workload of 500 conversations sharing 5 system prompt templates, Stowken stores **101,087 tokens in 2.6 KB** — 99.3% smaller than naive `u32`-per-token storage. Most of that win comes from deduplication; zstd does another ~2× on the unique segments.
+## How much does it save?
 
-```
-394.9 KB (naive)  →  5.7 KB (after dedup)  →  2.6 KB (after zstd)
-                     98.6% from dedup        +0.7% from zstd
+It depends on how much your traffic repeats. To make this concrete, here are two real measurements from `stowken bench` — one on crowd-sourced data with no repeating prompts (the worst case), one on a simulated production chatbot with a shared system prompt (the best case):
+
+| Workload | Conversations | Tokens | Naive | Stowken | Saved | Dedup | zstd |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **OpenAssistant** (English, full) | 3,482 | 1.30M | 5.0 MB | 2.3 MB | **54.2%** | ~0% | 54% |
+| **Production chatbot** (5 shared prompts × 500 convs) | 500 | 101K | 395 KB | 2.6 KB | **99.3%** | 98.6% | +0.7% |
+
+Real production usage will land between these depending on:
+- How much your system prompts and RAG contexts are reused (dedup wins here)
+- The token distribution of your unique content (zstd wins ~50% on natural language)
+
+You can run the same benchmark on your own data:
+
+```sh
+stowken bench /path/to/your-conversations.jsonl
 ```
 
-Numbers vary with how much your real traffic repeats. zstd alone (no dedup) gets ~41–54% on natural-language token streams.
+It outputs the same three-stage breakdown (`naive → dedup → zstd`) plus a per-segment-type table so you can see where the savings come from. To reproduce the OpenAssistant number above:
+
+```sh
+pip install datasets
+python scripts/fetch_openassistant.py --output oasst.jsonl
+stowken bench oasst.jsonl
+```
 
 ---
 
@@ -148,6 +166,10 @@ stowken gc
 
 # Export training pairs
 stowken export --format jsonl --output training.jsonl
+
+# Benchmark on your own data (read-only — does not touch your vault)
+stowken bench /path/to/conversations.jsonl
+stowken --json bench ./conv-dir/ --max 1000
 ```
 
 ---

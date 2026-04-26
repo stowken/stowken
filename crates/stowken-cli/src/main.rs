@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use tabled::{Table, Tabled};
 
 use stowken::{
-    storage::FilesystemBackend,
+    storage::{FilesystemBackend, MemoryBackend},
     types::{
         AnalyticsQuery, Conversation, ExportConfig, ExportFormat, Message, MessageContent,
         StowkenConfig,
@@ -169,6 +169,22 @@ enum Command {
         limit: u64,
     },
 
+    /// Benchmark Stowken on a directory of conversations.
+    ///
+    /// Ingests every `*.json` (one conversation per file) and `*.jsonl` (one
+    /// per line) under INPUT into a fresh in-memory vault, then reports the
+    /// three-stage savings breakdown plus per-segment-type detail.
+    ///
+    /// Does not touch the configured data directory — bench is read-only
+    /// w.r.t. your real vault.
+    Bench {
+        /// Directory or single file to ingest.
+        input: PathBuf,
+        /// Cap on conversations ingested. Default: no cap.
+        #[arg(long)]
+        max: Option<u64>,
+    },
+
     /// Print the resolved data directory and exit.
     DataDir,
 }
@@ -254,6 +270,9 @@ async fn main() -> Result<()> {
         }
         Command::FindDuplicates { threshold, limit } => {
             cmd_find_duplicates(&data_dir, config, threshold, limit, cli.json).await?;
+        }
+        Command::Bench { input, max } => {
+            cmd_bench(config, input, max, cli.json).await?;
         }
     }
 
@@ -717,6 +736,235 @@ async fn cmd_find_duplicates(
         );
     }
     Ok(())
+}
+
+// ── Benchmark ─────────────────────────────────────────────────────────────────
+
+async fn cmd_bench(
+    config: StowkenConfig,
+    input: PathBuf,
+    max: Option<u64>,
+    json: bool,
+) -> Result<()> {
+    let conversations = collect_conversations(&input, max)?;
+    if conversations.is_empty() {
+        anyhow::bail!("no conversations found under {}", input.display());
+    }
+
+    let vault = Stowken::new(MemoryBackend::new(), config)
+        .await
+        .context("opening in-memory bench vault")?;
+
+    let started = std::time::Instant::now();
+    let mut ingested = 0u64;
+    let mut failures = 0u64;
+    for conv in conversations {
+        match vault.store(conv).await {
+            Ok(_) => ingested += 1,
+            Err(_) => failures += 1,
+        }
+    }
+    let elapsed = started.elapsed();
+
+    let stats = vault.stats().await.context("fetching stats")?;
+    let dedup_only_bytes = vault
+        .dedup_only_bytes()
+        .await
+        .context("fetching dedup-only bytes")?;
+    let seg_stats = vault.segment_stats().await.context("fetching segment stats")?;
+
+    if json {
+        let out = serde_json::json!({
+            "source":            input.display().to_string(),
+            "ingested":          ingested,
+            "failures":          failures,
+            "elapsed_ms":        elapsed.as_millis(),
+            "naive_bytes":       stats.naive_bytes,
+            "dedup_only_bytes":  dedup_only_bytes,
+            "storage_bytes":     stats.storage_bytes,
+            "total_tokens":      stats.total_tokens,
+            "total_segments":    stats.total_segments,
+            "unique_segments":   stats.unique_segments,
+            "dedup_ratio":       stats.dedup_ratio,
+            "compression_ratio": stats.compression_ratio,
+            "savings_pct":       stats.savings_percentage,
+            "per_segment_type":  seg_stats.iter().map(|s| serde_json::json!({
+                "type":             s.segment_type.to_string(),
+                "unique_count":     s.unique_count,
+                "total_references": s.total_references,
+                "dedup_ratio":      s.dedup_ratio,
+                "total_tokens":     s.total_tokens,
+                "compressed_bytes": s.compressed_bytes,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!("Stowken Benchmark");
+    println!("{}", "=".repeat(60));
+    println!("Source        : {}", input.display());
+    println!();
+
+    println!("Ingest");
+    println!("{}", "-".repeat(60));
+    let per_conv_us = if ingested > 0 {
+        elapsed.as_micros() / ingested as u128
+    } else {
+        0
+    };
+    let toks_per_sec = if elapsed.as_secs_f64() > 0.0 {
+        (stats.total_tokens as f64 / elapsed.as_secs_f64()) as u64
+    } else {
+        0
+    };
+    println!(
+        "  Conversations : {}  ({} failed)",
+        ingested, failures
+    );
+    println!("  Tokens        : {}", stats.total_tokens);
+    println!(
+        "  Time          : {}ms  ({}µs/conv, {} tok/s)",
+        elapsed.as_millis(),
+        per_conv_us,
+        toks_per_sec
+    );
+    println!();
+
+    println!("Storage layers");
+    println!("{}", "-".repeat(60));
+    let dedup_save_pct = pct_saved(stats.naive_bytes, dedup_only_bytes);
+    let zstd_save_pct = pct_saved(dedup_only_bytes, stats.storage_bytes);
+    let total_save_pct = pct_saved(stats.naive_bytes, stats.storage_bytes);
+    println!(
+        "  Naive (u32)   : {:>10}",
+        format_bytes(stats.naive_bytes)
+    );
+    println!(
+        "  After dedup   : {:>10}   {:>5.1}% saved by dedup alone",
+        format_bytes(dedup_only_bytes),
+        dedup_save_pct
+    );
+    println!(
+        "  After zstd    : {:>10}   {:>5.1}% saved on top of dedup",
+        format_bytes(stats.storage_bytes),
+        zstd_save_pct
+    );
+    println!();
+    println!(
+        "  Combined      : {:.1}% smaller than naive  ({} \u{2192} {})",
+        total_save_pct,
+        format_bytes(stats.naive_bytes),
+        format_bytes(stats.storage_bytes),
+    );
+    println!();
+
+    println!("Per-segment-type breakdown");
+    println!("{}", "-".repeat(60));
+    #[derive(Tabled)]
+    struct Row {
+        #[tabled(rename = "Type")]
+        seg_type: String,
+        #[tabled(rename = "Unique")]
+        unique: u64,
+        #[tabled(rename = "Refs")]
+        refs: u64,
+        #[tabled(rename = "Dedup%")]
+        dedup_pct: String,
+        #[tabled(rename = "Tokens")]
+        tokens: u64,
+        #[tabled(rename = "Compressed")]
+        compressed: String,
+    }
+    let mut sorted = seg_stats.clone();
+    sorted.sort_by(|a, b| b.total_references.cmp(&a.total_references));
+    let rows: Vec<Row> = sorted
+        .iter()
+        .map(|s| Row {
+            seg_type: s.segment_type.to_string(),
+            unique: s.unique_count,
+            refs: s.total_references,
+            dedup_pct: format!("{:.1}%", s.dedup_ratio * 100.0),
+            tokens: s.total_tokens,
+            compressed: format_bytes(s.compressed_bytes),
+        })
+        .collect();
+    println!("{}", Table::new(rows));
+    Ok(())
+}
+
+fn pct_saved(before: u64, after: u64) -> f64 {
+    if before == 0 {
+        0.0
+    } else {
+        (1.0 - (after as f64 / before as f64)) * 100.0
+    }
+}
+
+fn collect_conversations(input: &PathBuf, max: Option<u64>) -> Result<Vec<Conversation>> {
+    let mut out = Vec::new();
+    let limit = max.unwrap_or(u64::MAX);
+
+    let metadata = std::fs::metadata(input)
+        .with_context(|| format!("stat {}", input.display()))?;
+
+    let mut paths: Vec<PathBuf> = if metadata.is_file() {
+        vec![input.clone()]
+    } else if metadata.is_dir() {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(input)
+            .with_context(|| format!("read_dir {}", input.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.is_file()
+                    && p.extension()
+                        .and_then(|x| x.to_str())
+                        .map(|x| x == "json" || x == "jsonl")
+                        .unwrap_or(false)
+            })
+            .collect();
+        // Stable, deterministic input order so two runs over the same dir
+        // produce the same dedup statistics.
+        v.sort();
+        v
+    } else {
+        anyhow::bail!("{} is neither a file nor a directory", input.display());
+    };
+    paths.retain(|p| p.is_file());
+
+    for path in paths {
+        if (out.len() as u64) >= limit {
+            break;
+        }
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let is_jsonl = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x == "jsonl")
+            .unwrap_or(false);
+
+        if is_jsonl {
+            for (lineno, line) in raw.lines().enumerate() {
+                if (out.len() as u64) >= limit {
+                    break;
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let conv = parse_conversation_json(trimmed).with_context(|| {
+                    format!("{} line {}", path.display(), lineno + 1)
+                })?;
+                out.push(conv);
+            }
+        } else {
+            let conv = parse_conversation_json(&raw)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            out.push(conv);
+        }
+    }
+
+    Ok(out)
 }
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
