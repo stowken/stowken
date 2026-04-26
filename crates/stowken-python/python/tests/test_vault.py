@@ -306,6 +306,108 @@ class TestReindex:
             assert report["segments_missing"] == 0
 
 
+# ── Dictionaries ──────────────────────────────────────────────────────────────
+
+class TestDictionaries:
+    def _seed(self, vault, n: int = 30):
+        """Train-friendly seed: distinct content per conversation."""
+        for i in range(n):
+            sys_tokens = [(t * 13 + i * 7) % 50_000 for t in range(100)]
+            user_tokens = [(t * 5 + i * 3) % 50_000 for t in range(30)]
+            vault.store(make_token_conv(f"dict-seed-{i}", sys_tokens, user_tokens))
+
+    def test_empty_vault_has_no_dicts(self):
+        v = stowken.Stowken()
+        assert v.list_dictionaries() == []
+
+    def test_train_without_activate_registers_inactive(self):
+        v = stowken.Stowken()
+        self._seed(v)
+        info = v.train_dictionary(samples=20)
+        assert info["is_active"] is False
+        assert info["sample_count"] == 20
+        assert info["size_bytes"] > 0
+        listed = v.list_dictionaries()
+        assert len(listed) == 1
+        assert listed[0]["id"] == info["id"]
+        assert listed[0]["is_active"] is False
+
+    def test_train_with_activate_flips_active(self):
+        v = stowken.Stowken()
+        self._seed(v)
+        info = v.train_dictionary(samples=20, activate=True)
+        assert info["is_active"] is True
+        listed = v.list_dictionaries()
+        active_ids = [d["id"] for d in listed if d["is_active"]]
+        assert active_ids == [info["id"]]
+
+    def test_activate_unknown_dict_raises(self):
+        v = stowken.Stowken()
+        with pytest.raises(Exception):
+            v.activate_dictionary(99999)
+
+    def test_too_few_samples_raises(self):
+        v = stowken.Stowken()
+        # Only one tiny conversation — far below min training samples.
+        v.store(make_token_conv("solo", [1, 2, 3], [4, 5]))
+        with pytest.raises(Exception) as excinfo:
+            v.train_dictionary(samples=50)
+        assert "not enough" in str(excinfo.value).lower()
+
+    def test_rotation_preserves_old_frames(self):
+        """The v0.1 data-loss bug: confirm old dict frames remain readable
+        after a new dictionary is activated."""
+        v = stowken.Stowken()
+        self._seed(v, n=30)
+
+        # Train and activate dict A.
+        info_a = v.train_dictionary(samples=20, activate=True)
+
+        # Store conv X under dict A.
+        x_tokens = list(range(120))
+        v.store(make_token_conv("X", x_tokens, [1, 2, 3]))
+
+        # Seed more, train + activate dict B.
+        for i in range(100, 130):
+            sys_tokens = [(t * 17 + i * 11) % 50_000 for t in range(100)]
+            v.store(make_token_conv(f"more-{i}", sys_tokens, [i]))
+        info_b = v.train_dictionary(samples=20, activate=True)
+        assert info_a["id"] != info_b["id"]
+
+        # Store conv Y under dict B.
+        y_tokens = list(range(5000, 5120))
+        v.store(make_token_conv("Y", y_tokens, [4, 5, 6]))
+
+        # Both retrievals must work.
+        x = v.retrieve("X")
+        y = v.retrieve("Y")
+        x_sys = next(s for s in x["segments"] if s["segment_type"] == "system_prompt")
+        y_sys = next(s for s in y["segments"] if s["segment_type"] == "system_prompt")
+        assert x_sys["tokens"] == x_tokens, "old dict frame lost!"
+        assert y_sys["tokens"] == y_tokens
+
+    def test_dict_persistence_across_reopen(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            v = stowken.Stowken.open(data_dir)
+            self._seed(v, n=30)
+            info = v.train_dictionary(samples=20, activate=True)
+            persisted_id = info["id"]
+            persisted_tokens = list(range(7000, 7150))
+            v.store(make_token_conv("persist", persisted_tokens, [99]))
+            del v
+
+            v2 = stowken.Stowken.open(data_dir)
+            dicts = v2.list_dictionaries()
+            assert len(dicts) == 1
+            assert dicts[0]["id"] == persisted_id
+            assert dicts[0]["is_active"] is True
+
+            # The dict-compressed frame must round-trip.
+            r = v2.retrieve("persist")
+            sys_seg = next(s for s in r["segments"] if s["segment_type"] == "system_prompt")
+            assert sys_seg["tokens"] == persisted_tokens
+
+
 # ── GC candidates ─────────────────────────────────────────────────────────────
 
 class TestGCCandidates:

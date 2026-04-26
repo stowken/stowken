@@ -167,6 +167,39 @@ async def test_reindex_async():
         assert after.unique_segments == before.unique_segments
 
 
+# ── Dictionaries via async ─────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_train_dictionary_async():
+    v = stowken.Stowken()
+    # Seed 30 conversations so training has enough samples.
+    for i in range(30):
+        sys_tokens = [(t * 13 + i * 7) % 50_000 for t in range(100)]
+        await v.store_async(make_token_conv(f"seed-{i}", sys_tokens, [i]))
+
+    info = await v.train_dictionary_async(samples=20, activate=True)
+    assert info["is_active"] is True
+    assert info["sample_count"] == 20
+
+    listed = await v.list_dictionaries_async()
+    assert len(listed) == 1
+    assert listed[0]["id"] == info["id"]
+
+
+@pytest.mark.asyncio
+async def test_activate_dictionary_async():
+    v = stowken.Stowken()
+    for i in range(30):
+        sys_tokens = [(t * 11 + i * 5) % 50_000 for t in range(100)]
+        await v.store_async(make_token_conv(f"seed-{i}", sys_tokens, [i]))
+
+    info = await v.train_dictionary_async(samples=20)  # not activated
+    assert info["is_active"] is False
+    await v.activate_dictionary_async(info["id"])
+    listed = await v.list_dictionaries_async()
+    assert listed[0]["is_active"] is True
+
+
 # ── Mixing sync and async on the same vault ───────────────────────────────────
 
 @pytest.mark.asyncio

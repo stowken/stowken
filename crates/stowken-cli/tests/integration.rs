@@ -236,6 +236,103 @@ fn store_from_file() {
 }
 
 #[test]
+fn dict_train_list_and_activate_round_trip() {
+    let dir = temp_dir();
+
+    // Seed enough segments to train a dictionary.
+    for i in 0..40u32 {
+        let conv = serde_json::json!({
+            "id": format!("dict-seed-{i}"),
+            "model": "gpt-4",
+            "tokenizer": "cl100k_base",
+            "messages": [
+                {
+                    "role": "system",
+                    "tokens": (0..100u32).map(|t| (t * 13 + i * 7) % 50_000).collect::<Vec<_>>(),
+                },
+                {
+                    "role": "user",
+                    "tokens": (0..30u32).map(|t| (t * 5 + i * 3) % 50_000).collect::<Vec<_>>(),
+                },
+            ]
+        })
+        .to_string();
+        let out = run_stdin(dir.path(), &["store", "-"], &conv);
+        assert!(out.status.success(), "seed store failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    // Empty list to start.
+    let list_out = run(dir.path(), &["--json", "dict", "list"]);
+    assert!(list_out.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&list_out.stdout).unwrap();
+    assert_eq!(list.as_array().map(|v| v.len()), Some(0));
+
+    // Train + activate in one shot.
+    let train_out = run(dir.path(), &["--json", "dict", "train", "--samples", "20", "--activate"]);
+    assert!(train_out.status.success(), "train failed: {}", String::from_utf8_lossy(&train_out.stderr));
+    let info: serde_json::Value = serde_json::from_slice(&train_out.stdout).unwrap();
+    let id = info["id"].as_u64().expect("id should be u64");
+    assert!(info["is_active"].as_bool().unwrap());
+
+    // List should show one active dict.
+    let list2: serde_json::Value =
+        serde_json::from_slice(&run(dir.path(), &["--json", "dict", "list"]).stdout).unwrap();
+    let arr = list2.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"].as_u64(), Some(id));
+    assert!(arr[0]["is_active"].as_bool().unwrap());
+
+    // Train a second dict (without --activate) and confirm the first stays active.
+    // (Need to seed more data first or sampling will overlap.)
+    for i in 100..140u32 {
+        let conv = serde_json::json!({
+            "id": format!("dict-seed-{i}"),
+            "model": "gpt-4",
+            "tokenizer": "cl100k_base",
+            "messages": [
+                {
+                    "role": "system",
+                    "tokens": (0..100u32).map(|t| (t * 17 + i * 11) % 50_000).collect::<Vec<_>>(),
+                },
+                {
+                    "role": "user",
+                    "tokens": (0..30u32).map(|t| (t * 7 + i * 5) % 50_000).collect::<Vec<_>>(),
+                },
+            ]
+        })
+        .to_string();
+        run_stdin(dir.path(), &["store", "-"], &conv);
+    }
+
+    let train2 = run(dir.path(), &["--json", "dict", "train", "--samples", "20"]);
+    assert!(train2.status.success());
+    let info2: serde_json::Value = serde_json::from_slice(&train2.stdout).unwrap();
+    let id2 = info2["id"].as_u64().unwrap();
+    assert_ne!(id, id2, "different training corpora should produce different ids");
+    assert!(!info2["is_active"].as_bool().unwrap(), "second dict trained without --activate");
+
+    // Now activate the second one.
+    let act_out = run(dir.path(), &["dict", "activate", &id2.to_string()]);
+    assert!(act_out.status.success(), "activate failed: {}", String::from_utf8_lossy(&act_out.stderr));
+
+    // Verify activation flipped.
+    let list3: serde_json::Value =
+        serde_json::from_slice(&run(dir.path(), &["--json", "dict", "list"]).stdout).unwrap();
+    let arr3 = list3.as_array().unwrap();
+    assert_eq!(arr3.len(), 2);
+    let active_ids: Vec<u64> = arr3
+        .iter()
+        .filter(|d| d["is_active"].as_bool().unwrap())
+        .map(|d| d["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(active_ids, vec![id2], "exactly one dict active, must be id2");
+
+    // Pre-dict retrievals still work after activations + rotations.
+    let r = run(dir.path(), &["--json", "retrieve", "dict-seed-0"]);
+    assert!(r.status.success(), "pre-dict retrieve failed: {}", String::from_utf8_lossy(&r.stderr));
+}
+
+#[test]
 fn reindex_restores_stats_after_db_deletion() {
     let dir = temp_dir();
 

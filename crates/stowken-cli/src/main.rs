@@ -47,6 +47,26 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum DictAction {
+    /// Train a new dictionary from existing segments. Without --activate the
+    /// dict is registered but not used for new compressions.
+    Train {
+        /// Number of segments to sample for training.
+        #[arg(long, default_value_t = 200)]
+        samples: usize,
+        /// Activate the dictionary immediately after training.
+        #[arg(long)]
+        activate: bool,
+    },
+    /// List all known dictionaries.
+    List,
+    /// Mark `id` as the dictionary new compressions will use.
+    Activate {
+        id: u32,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Store a conversation from a JSON file or stdin.
     Store {
@@ -141,6 +161,16 @@ enum Command {
     /// from a backup that didn't include the index, or to reconcile drift.
     /// Does not touch the segment files or backend ref-counts.
     Reindex,
+
+    /// Manage zstd compression dictionaries.
+    ///
+    /// Dictionaries are trained from existing segments and can give
+    /// 5–15 percentage points of additional compression on unique-per-call
+    /// content. Multiple dictionaries coexist; rotation is non-destructive.
+    Dict {
+        #[command(subcommand)]
+        action: DictAction,
+    },
 
     /// Audit unique system prompts by reference count (find prompt drift).
     AuditSystemPrompts {
@@ -271,6 +301,9 @@ async fn main() -> Result<()> {
         }
         Command::Reindex => {
             cmd_reindex(&data_dir, config, cli.json).await?;
+        }
+        Command::Dict { action } => {
+            cmd_dict(&data_dir, config, action, cli.json).await?;
         }
         Command::AuditSystemPrompts { min_refs, limit } => {
             cmd_audit_system_prompts(&data_dir, config, min_refs, limit, cli.json).await?;
@@ -775,6 +808,92 @@ async fn cmd_reindex(data_dir: &PathBuf, config: StowkenConfig, json: bool) -> R
                  Reindex completed; consider running `gc` to clean up dangling refs.",
                 stats.segments_missing
             );
+        }
+    }
+    Ok(())
+}
+
+// ── Dictionaries ──────────────────────────────────────────────────────────────
+
+async fn cmd_dict(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    action: DictAction,
+    json: bool,
+) -> Result<()> {
+    let vault = open_vault(data_dir, config).await?;
+    match action {
+        DictAction::Train { samples, activate } => {
+            let info = if activate {
+                vault.train_and_activate_dictionary(samples).await
+            } else {
+                vault.train_dictionary(samples).await
+            }
+            .context("training dictionary")?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&info)?);
+            } else {
+                println!(
+                    "Trained dictionary id={} ({} bytes, sampled {} segments){}",
+                    info.id,
+                    info.size_bytes,
+                    info.sample_count,
+                    if info.is_active { " — active" } else { "" }
+                );
+                if !info.is_active {
+                    println!(
+                        "Run `stowken dict activate {}` to use it for new compressions.",
+                        info.id
+                    );
+                }
+            }
+        }
+        DictAction::List => {
+            let dicts = vault.list_dictionaries();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&dicts)?);
+            } else if dicts.is_empty() {
+                println!("No dictionaries trained for this vault.");
+            } else {
+                #[derive(Tabled)]
+                struct Row {
+                    #[tabled(rename = "Active")]
+                    active: &'static str,
+                    #[tabled(rename = "ID")]
+                    id: u32,
+                    #[tabled(rename = "Size")]
+                    size: String,
+                    #[tabled(rename = "Samples")]
+                    samples: u32,
+                    #[tabled(rename = "Created")]
+                    created: String,
+                }
+                let rows: Vec<Row> = dicts
+                    .iter()
+                    .map(|d| Row {
+                        active: if d.is_active { "*" } else { " " },
+                        id: d.id,
+                        size: format_bytes(d.size_bytes),
+                        samples: d.sample_count,
+                        created: d.created_at.format("%Y-%m-%d %H:%M").to_string(),
+                    })
+                    .collect();
+                println!("{}", Table::new(rows));
+                println!("(* = currently writing new frames)");
+            }
+        }
+        DictAction::Activate { id } => {
+            vault
+                .activate_dictionary(id)
+                .await
+                .with_context(|| format!("activating dict {id}"))?;
+            if json {
+                println!("{}", serde_json::json!({ "activated": id }));
+            } else {
+                println!("Dictionary {id} is now active for new compressions.");
+                println!("Old frames keep their original dict — rotation is non-destructive.");
+            }
         }
     }
     Ok(())

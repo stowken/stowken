@@ -342,6 +342,68 @@ async fn vault_reindex(
     }
 }
 
+async fn vault_train_dict(
+    inner: &VaultKind,
+    samples: usize,
+) -> Result<sk::dict_registry::DictInfo, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.train_dictionary(samples).await,
+        VaultKind::Filesystem(v) => v.train_dictionary(samples).await,
+    }
+}
+
+async fn vault_train_and_activate_dict(
+    inner: &VaultKind,
+    samples: usize,
+) -> Result<sk::dict_registry::DictInfo, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.train_and_activate_dictionary(samples).await,
+        VaultKind::Filesystem(v) => v.train_and_activate_dictionary(samples).await,
+    }
+}
+
+async fn vault_activate_dict(
+    inner: &VaultKind,
+    dict_id: u32,
+) -> Result<(), sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.activate_dictionary(dict_id).await,
+        VaultKind::Filesystem(v) => v.activate_dictionary(dict_id).await,
+    }
+}
+
+fn vault_list_dicts(inner: &VaultKind) -> Vec<sk::dict_registry::DictInfo> {
+    match inner {
+        VaultKind::Memory(v) => v.list_dictionaries(),
+        VaultKind::Filesystem(v) => v.list_dictionaries(),
+    }
+}
+
+fn build_dict_info_dict(
+    py: Python<'_>,
+    info: &sk::dict_registry::DictInfo,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("id", info.id)?;
+    dict.set_item("created_at", info.created_at.to_rfc3339())?;
+    dict.set_item("sample_count", info.sample_count)?;
+    dict.set_item("size_bytes", info.size_bytes)?;
+    dict.set_item("is_active", info.is_active)?;
+    Ok(dict.into())
+}
+
+fn build_dict_info_list(
+    py: Python<'_>,
+    infos: &[sk::dict_registry::DictInfo],
+) -> PyResult<PyObject> {
+    let list = PyList::empty_bound(py);
+    for info in infos {
+        let d = build_dict_info_dict(py, info)?;
+        list.append(d)?;
+    }
+    Ok(list.into())
+}
+
 // ── Main Python class ─────────────────────────────────────────────────────────
 
 /// Compressed, deduplicated storage for LLM token sequences.
@@ -547,6 +609,84 @@ impl PyStowken {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let report = vault_reindex(&inner).await.map_err(py_err)?;
             Python::with_gil(|py| build_reindex_dict(py, &report))
+        })
+    }
+
+    // ── dictionaries ─────────────────────────────────────────────────────────
+
+    /// Train a new zstd dictionary from `samples` segments. Returns a dict
+    /// describing the new dictionary. Does NOT activate — pass
+    /// ``activate=True`` or call ``activate_dictionary`` separately.
+    #[pyo3(signature = (samples=200, *, activate=false))]
+    fn train_dictionary(
+        &self,
+        py: Python<'_>,
+        samples: usize,
+        activate: bool,
+    ) -> PyResult<PyObject> {
+        let info = if activate {
+            runtime()
+                .block_on(vault_train_and_activate_dict(&self.inner, samples))
+                .map_err(py_err)?
+        } else {
+            runtime()
+                .block_on(vault_train_dict(&self.inner, samples))
+                .map_err(py_err)?
+        };
+        build_dict_info_dict(py, &info)
+    }
+
+    #[pyo3(signature = (samples=200, *, activate=false))]
+    fn train_dictionary_async<'py>(
+        &self,
+        py: Python<'py>,
+        samples: usize,
+        activate: bool,
+    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let info = if activate {
+                vault_train_and_activate_dict(&inner, samples).await.map_err(py_err)?
+            } else {
+                vault_train_dict(&inner, samples).await.map_err(py_err)?
+            };
+            Python::with_gil(|py| build_dict_info_dict(py, &info))
+        })
+    }
+
+    /// Mark `dict_id` as the dictionary new compressions will use. Old
+    /// frames keep their original dict — rotation is non-destructive.
+    fn activate_dictionary(&self, _py: Python<'_>, dict_id: u32) -> PyResult<()> {
+        runtime()
+            .block_on(vault_activate_dict(&self.inner, dict_id))
+            .map_err(py_err)
+    }
+
+    fn activate_dictionary_async<'py>(
+        &self,
+        py: Python<'py>,
+        dict_id: u32,
+    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            vault_activate_dict(&inner, dict_id).await.map_err(py_err)?;
+            Ok(())
+        })
+    }
+
+    /// List all known dictionaries, sorted by creation time. Each entry is
+    /// a dict with ``id``, ``created_at``, ``sample_count``, ``size_bytes``,
+    /// and ``is_active``.
+    fn list_dictionaries(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let infos = vault_list_dicts(&self.inner);
+        build_dict_info_list(py, &infos)
+    }
+
+    fn list_dictionaries_async<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let infos = vault_list_dicts(&inner);
+            Python::with_gil(|py| build_dict_info_list(py, &infos))
         })
     }
 

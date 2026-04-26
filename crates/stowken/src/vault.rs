@@ -12,6 +12,7 @@ use tracing::{debug, info, instrument};
 use crate::{
     compression::CompressionPipeline,
     dedup::exact,
+    dict_registry::{DictError, DictId, DictInfo, DictRegistry},
     index::metadata::{BatchSegmentOp, MetadataError, MetadataIndex},
     segmenter::{Segmenter, SegmenterConfig, SegmenterError},
     storage::backend::{StorageBackend, StorageError},
@@ -36,6 +37,10 @@ pub enum StowkenError {
     Segmentation(#[from] SegmenterError),
     #[error("compression error: {0}")]
     Compression(String),
+    #[error("dictionary error: {0}")]
+    Dict(#[from] DictError),
+    #[error("not enough segments to train a dictionary ({0} < {1} required)")]
+    InsufficientTrainingSamples(usize, usize),
     #[error("export error: {0}")]
     Export(String),
     #[error("conversation not found: {0}")]
@@ -51,32 +56,50 @@ pub struct Stowken<B: StorageBackend> {
     backend: Arc<B>,
     compressor: CompressionPipeline,
     index: MetadataIndex,
+    /// Registry of zstd compression dictionaries. In-memory for `Stowken::new`;
+    /// filesystem-backed (under `<dirname(db_path)>/dictionaries/`) for `Stowken::open`.
+    dict_registry: Arc<DictRegistry>,
     segmenter_config: SegmenterConfig,
     tokenizer: Option<Arc<dyn TokenizerAdapter>>,
 }
 
 impl<B: StorageBackend + 'static> Stowken<B> {
-    /// Create a new vault with an in-memory metadata index.
+    /// Create a new vault with an in-memory metadata index and an in-memory
+    /// dictionary registry. Dictionaries trained on this vault are NOT
+    /// persisted — use `open` for that.
     pub async fn new(backend: B, config: StowkenConfig) -> Result<Self, StowkenError> {
         let index = MetadataIndex::open_in_memory()?;
-        let compressor = CompressionPipeline::new(config.enable_compression, 3);
+        let dict_registry = Arc::new(DictRegistry::in_memory());
+        let compressor = CompressionPipeline::new(config.enable_compression, 3)
+            .with_registry(Arc::clone(&dict_registry));
         Ok(Self {
             backend: Arc::new(backend),
             compressor,
             index,
+            dict_registry,
             segmenter_config: SegmenterConfig::default(),
             tokenizer: None,
         })
     }
 
-    /// Open a vault, loading or creating a persistent metadata database at `db_path`.
+    /// Open a vault with a persistent metadata database at `db_path`. The
+    /// dictionary registry is rooted at `<dirname(db_path)>/dictionaries/`.
     pub async fn open(backend: B, config: StowkenConfig, db_path: &str) -> Result<Self, StowkenError> {
         let index = MetadataIndex::open(db_path)?;
-        let compressor = CompressionPipeline::new(config.enable_compression, 3);
+
+        let dict_root = std::path::Path::new(db_path)
+            .parent()
+            .map(|p| p.join("dictionaries"))
+            .unwrap_or_else(|| std::path::PathBuf::from("dictionaries"));
+        let dict_registry = Arc::new(DictRegistry::open(&dict_root)?);
+
+        let compressor = CompressionPipeline::new(config.enable_compression, 3)
+            .with_registry(Arc::clone(&dict_registry));
         Ok(Self {
             backend: Arc::new(backend),
             compressor,
             index,
+            dict_registry,
             segmenter_config: SegmenterConfig::default(),
             tokenizer: None,
         })
@@ -383,6 +406,109 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     /// List the segment hashes currently eligible for GC, without deleting.
     pub async fn gc_candidates(&self) -> Result<Vec<SegmentHash>, StowkenError> {
         Ok(self.backend.list_garbage().await?)
+    }
+
+    // ── Dictionary management ──────────────────────────────────────────────
+
+    /// Minimum samples required to train a dictionary. The zstd builder
+    /// itself wants at least a handful; below this we'd produce a dict that
+    /// generalises poorly and isn't worth the frame overhead.
+    pub const MIN_TRAINING_SAMPLES: usize = 10;
+
+    /// Train a new zstd dictionary from `sample_count` segments pulled from
+    /// the backend (most-recent conversations first), register it, and return
+    /// the new dict's metadata. The dict is NOT activated — call
+    /// `activate_dictionary` to have new compressions use it.
+    ///
+    /// Use `train_and_activate_dictionary` for the common case.
+    pub async fn train_dictionary(&self, sample_count: usize) -> Result<DictInfo, StowkenError> {
+        let samples = self.collect_training_samples(sample_count).await?;
+        if samples.len() < Self::MIN_TRAINING_SAMPLES {
+            return Err(StowkenError::InsufficientTrainingSamples(
+                samples.len(),
+                Self::MIN_TRAINING_SAMPLES,
+            ));
+        }
+
+        // 110 KiB is the zstd-recommended dict size for token-shaped data.
+        let dict_bytes = task::spawn_blocking(move || {
+            let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
+            zstd::dict::from_samples(&refs, 112_640)
+        })
+        .await
+        .map_err(|e| StowkenError::Internal(e.to_string()))?
+        .map_err(|e| StowkenError::Compression(format!("dict training: {e}")))?;
+
+        let actual_samples = sample_count as u32;
+        let info = self.dict_registry.register(dict_bytes, actual_samples)?;
+        info!(dict_id = info.id, samples = actual_samples, "trained dictionary");
+        Ok(info)
+    }
+
+    /// Activate `dict_id` so new compressions use it. Old frames remain
+    /// readable as long as their dictionary stays in the registry.
+    pub async fn activate_dictionary(&self, dict_id: DictId) -> Result<(), StowkenError> {
+        self.dict_registry.activate(dict_id)?;
+        info!(dict_id, "activated dictionary");
+        Ok(())
+    }
+
+    /// Convenience: train a dictionary and immediately activate it.
+    pub async fn train_and_activate_dictionary(
+        &self,
+        sample_count: usize,
+    ) -> Result<DictInfo, StowkenError> {
+        let info = self.train_dictionary(sample_count).await?;
+        self.activate_dictionary(info.id).await?;
+        Ok(DictInfo { is_active: true, ..info })
+    }
+
+    /// All known dictionaries, sorted by creation time. Each entry's
+    /// `is_active` flag indicates which is the writer.
+    pub fn list_dictionaries(&self) -> Vec<DictInfo> {
+        self.dict_registry.list()
+    }
+
+    /// Read access to the dictionary registry — exposed for advanced use
+    /// (e.g. the CLI inspector). Most callers should use the methods above.
+    pub fn dict_registry(&self) -> &Arc<DictRegistry> {
+        &self.dict_registry
+    }
+
+    /// Pull at most `count` varint-encoded segment payloads from the backend
+    /// for use as dictionary training samples. We decompress each segment
+    /// and re-encode just the varint stream — the zstd dict-builder works
+    /// best on the data that will *actually* be compressed in production,
+    /// which is the varint output (not the zstd output, not the raw tokens).
+    async fn collect_training_samples(&self, count: usize) -> Result<Vec<Vec<u8>>, StowkenError> {
+        let query = AnalyticsQuery::default();
+        let ids = self.backend.list_conversations(&query, count as u64, 0).await?;
+
+        let mut samples: Vec<Vec<u8>> = Vec::with_capacity(count);
+        for id in &ids {
+            if samples.len() >= count {
+                break;
+            }
+            let manifest = match self.backend.get_manifest(id).await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            for seg_ref in &manifest.segments {
+                if samples.len() >= count {
+                    break;
+                }
+                let stored = match self.backend.get_segment(&seg_ref.hash).await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let tokens = match self.decompress_data(&stored.compressed_data) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                samples.push(crate::compression::varint::encode_tokens(&tokens));
+            }
+        }
+        Ok(samples)
     }
 
     /// Rebuild the SQLite metadata index from scratch by walking every

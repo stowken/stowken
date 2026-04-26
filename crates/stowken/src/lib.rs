@@ -63,6 +63,7 @@
 
 pub mod compression;
 pub mod dedup;
+pub mod dict_registry;
 pub mod export;
 pub mod index;
 pub mod segmenter;

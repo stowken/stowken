@@ -24,19 +24,16 @@ Everything currently in the repo: segmentation, exact dedup, varint+zstd, frame 
 
 ---
 
-## v0.3 — Cross-segment compression
+## v0.3 — Cross-segment compression *(complete)*
 
 **Theme:** bring back zstd dictionaries with the rotation bug fixed at the format layer.
 
-- [ ] **Frame-versioned dictionaries.** New frame byte `0x03 = varint + zstd + dict(id)`. The dict ID is encoded in the frame (4 bytes from `zstd::dict::DictId`). Multiple dictionaries coexist at runtime; the decompressor selects by ID. Rotation is safe because old frames carry their own ID and resolve to the right dict.
-- [ ] **`vault.train_dictionary()` returns a versioned dict bytes blob.** Dictionaries are stored alongside `metadata.db` in a dict registry (path + ID-keyed lookup).
-- [ ] **`vault.apply_dictionary(id)`** makes a registered dict the active writer. Old frames stay readable forever (their ID resolves through the registry).
-- [ ] **Bounded in-memory dictionary cache.** LRU keyed by ID; cold dictionaries faulted in from disk on demand.
-- [ ] **Optional auto-train policy** that periodically trains a new dict from recent segments and adds it to the registry. Old dicts kept; never silently replaced.
+- [x] **Frame-versioned dictionaries.** *Shipped: new frame byte `0x03 = varint + zstd + dict(id)`. The 4-byte LE dict ID directly follows the version tag. Multiple dictionaries coexist at runtime; the decompressor selects by ID. Rotation safety is now a property of the frame format — pinned by `segments_compressed_with_old_dict_remain_readable_after_rotation`.*
+- [x] **`vault.train_dictionary()` + `activate_dictionary()` + `list_dictionaries()`.** *Shipped via `Stowken`, the CLI (`stowken dict {train,list,activate}`), and Python (sync + `_async`). Dicts persist under `<vault-root>/dictionaries/{id}.zstd` plus `{id}.json` info sidecars and an `active` marker.*
+- [x] **DictRegistry caches bytes per ID.** *Shipped: lazy load on first decompress, in-memory cache via `Arc<RwLock<HashMap<DictId, Arc<Vec<u8>>>>>`. LRU eviction deferred — typical vaults have few enough dicts that unbounded growth isn't a concern; revisit if pressure becomes real.*
+- [ ] **Optional auto-train policy** that periodically trains a new dict from recent segments and adds it to the registry. Old dicts kept; never silently replaced. *Deferred to v0.3.x — manual `dict train --activate` is fine for a first release; auto-train policy is mostly orchestration.*
 
-**Value:** typical +5–15 percentage points compression for unique-per-call content where dedup gets nothing. Most useful for domain-specific corpora (medical, code, legal) where token frequency distributions differ substantially from general text.
-
-**Why this position:** smallest of the three deferred features, clearest mechanism (frame versioning is already in v0.1). Sets a pattern (versioned codecs + registry) that v0.4 and v0.5 reuse.
+**Value (measured):** modest on OpenAssistant where dedup contributes ~0% and base zstd already gets 54%. Larger gains expected on domain-specific corpora (medical, code, legal) where token frequency distributions differ substantially from general text — to be benchmarked in v0.3.x or v0.4 with a domain corpus.
 
 ---
 

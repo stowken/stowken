@@ -190,6 +190,11 @@ stowken --json bench ./conv-dir/ --max 1000
 
 # Rebuild the SQLite index from on-disk manifests (after backup restore, etc.)
 stowken reindex
+
+# Dictionary management (zstd with a trained dictionary)
+stowken dict train --samples 200 --activate     # train + use for new frames
+stowken dict list                                # show all registered dicts
+stowken dict activate 1234567890                 # rotate to a specific dict
 ```
 
 ---
@@ -272,12 +277,28 @@ vault-root/
 
 The first byte of every compressed segment identifies the codec:
 
-| Byte | Codec               |
-|------|---------------------|
-| 0x01 | varint only        |
-| 0x02 | varint + zstd      |
+| Byte | Codec                      | Body                                            |
+|------|----------------------------|-------------------------------------------------|
+| 0x01 | varint only                | varint(tokens)                                  |
+| 0x02 | varint + zstd              | zstd(varint(tokens))                            |
+| 0x03 | varint + zstd with dict    | dict_id(u32 LE) ‖ zstd(varint(tokens), dict)    |
 
-Future codecs (dictionary-tagged zstd, bit-packed encodings) get new bytes; existing data stays readable. The manifest carries a `schema_version` field with the same forward-compatibility guarantee.
+For 0x03 frames, the 4-byte little-endian zstd dictionary ID directly follows the version byte. The decompressor looks the ID up in the per-vault dictionary registry; multiple dictionaries coexist so rotation is non-destructive — old frames stay readable as long as their dict file is in the registry.
+
+The manifest carries a `schema_version` field with the same forward-compatibility guarantee. Future codecs get new bytes; existing data stays readable indefinitely.
+
+### Dictionary registry
+
+Filesystem-backed vaults persist trained dictionaries under `<vault-root>/dictionaries/`:
+
+```
+dictionaries/
+├── 1234567890.zstd     # raw bytes (filename matches dict_id)
+├── 1234567890.json     # info: created_at, sample_count, size
+└── active              # one line: "1234567890"
+```
+
+In-memory vaults (`stowken.Stowken()` with no path) hold the registry in RAM only.
 
 ---
 

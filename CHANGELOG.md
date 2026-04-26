@@ -2,6 +2,33 @@
 
 For planned future work see [ROADMAP.md](ROADMAP.md). Items move from the roadmap to a version section in this file when they ship.
 
+## 0.3.0 — Unreleased *(in progress)*
+
+### Added — frame-versioned zstd dictionaries
+
+The first of the three deferred-with-intent features from v0.1 returns, this time with the rotation safety bug fixed at the format layer. Multiple dictionaries coexist; each compressed frame names the dict it was written with; rotation is non-destructive.
+
+- **New frame format `0x03`** = varint + zstd-with-dictionary. Body: `dict_id (u32 LE) || zstd(varint(tokens), dict)`. Dispatches per-frame at decompression so old frames stay readable as long as their dict is in the registry.
+- **`DictRegistry`** — per-vault registry for zstd compression dictionaries. Filesystem-backed vaults persist under `<vault-root>/dictionaries/{id}.zstd` plus a `{id}.json` info sidecar and an `active` marker file. Memory-backed vaults keep the registry in RAM only.
+- **`Stowken::train_dictionary`**, **`activate_dictionary`**, **`train_and_activate_dictionary`**, **`list_dictionaries`**. Training pulls samples from the most recent conversations and runs `zstd::dict::from_samples` on a blocking thread.
+- **`stowken dict train [--samples N] [--activate]`**, **`stowken dict list`**, **`stowken dict activate <id>`**. Each supports `--json` for scripting.
+- **Python:** `vault.train_dictionary(samples=200, activate=False)`, `activate_dictionary(id)`, `list_dictionaries()` plus `_async` variants for all three.
+- **`DictInfo`** type with `id`, `created_at`, `sample_count`, `size_bytes`, `is_active`.
+- **`StowkenError::Dict`** and **`InsufficientTrainingSamples`** error variants.
+
+### How the v0.1 data-loss bug is fixed
+
+In v0.1 the active dictionary was held by-value in the compression pipeline; applying a new dictionary replaced the old one in memory and any frame compressed against the previous dict became unreadable on the next `retrieve()` call.
+
+In v0.3 the compression pipeline holds an `Arc<DictRegistry>`. New compressions write the active dict's ID into the frame; decompression reads the ID and looks up the right dict in the registry. Activating a new dictionary is purely additive — old dictionaries stay registered and continue to serve their frames. Rotation safety is now a property of the frame format, not of the runtime configuration.
+
+The integration test `segments_compressed_with_old_dict_remain_readable_after_rotation` pins this contract: train dict A → store conv X → train dict B → activate B → store conv Y → confirm both X and Y round-trip exactly. v0.1 lost X here; v0.3 doesn't.
+
+### Tests
+
+- 71 core (was 60, +11 dict registry + dict frame) + **30** integration (was 25, +5 rotation safety) + **14** CLI (was 13, +1 dict round-trip) + **49** Python (was 40, +7 sync dict + +2 async dict) = **165 green** (was 139, +26).
+- Clippy clean across the workspace.
+
 ## 0.2.0 — Unreleased *(in progress)*
 
 ### Added
