@@ -8,14 +8,26 @@ Stowken stores LLM conversations as content-addressed token segments. Identical 
 
 It depends on how much your traffic repeats. To make this concrete, here are two real measurements from `stowken bench` — one on crowd-sourced data with no repeating prompts (the worst case), one on a simulated production chatbot with a shared system prompt (the best case):
 
-| Workload | Conversations | Tokens | Naive | Stowken | Saved | Dedup | zstd |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **OpenAssistant** (English, full) | 3,482 | 1.30M | 5.0 MB | 2.3 MB | **54.2%** | ~0% | 54% |
-| **Production chatbot** (5 shared prompts × 500 convs) | 500 | 101K | 395 KB | 2.6 KB | **99.3%** | 98.6% | +0.7% |
+| Workload | Conversations | Tokens | Incoming | Stowken | Saved |
+|---|---:|---:|---:|---:|---:|
+| **OpenAssistant** (English, full — unique content) | 3,482 | 1.30M | 5.0 MB | 2.3 MB | **54.2%** (zstd only) |
+| **Production chatbot** (5 shared prompts × 500 convs) | 500 | 101K | 395 KB | 2.6 KB | **99.3%** (dedup-dominated) |
+| **Drift workload, near-dedup off** (1000 convs, 1K-token system prompts with interpolated names + RAG) | 1,000 | 3.12M | 11.9 MB | 4.9 MB | 58.8% |
+| **Drift workload, `--near-dedup 0.85`** (same corpus) | 1,000 | 3.12M | 11.9 MB | 3.5 MB | **71.0%** (+12 pp) |
 
-Real production usage will land between these depending on:
-- How much your system prompts and RAG contexts are reused (dedup wins here)
+Real production usage lands somewhere along this spectrum depending on:
+- How much your system prompts and RAG contexts are reused **byte-for-byte** (exact dedup wins here)
+- How much they drift across calls — interpolated names, slight RAG context variations (`--near-dedup` wins here, but only if your segments are large enough that the 33-byte delta header is small relative to the per-variant savings)
 - The token distribution of your unique content (zstd wins ~50% on natural language)
+- Whether you can tolerate the ingest cost of near-dedup (50–60× slower than the baseline path on synthetic drift corpora)
+
+`--near-dedup` is off by default for a reason: on workloads with no actual drift (like crowd-sourced data), it adds cost without finding anything. Reproduce both drift bench numbers above with:
+
+```sh
+python scripts/synth_drift_corpus.py -o drift.jsonl -n 1000 --system-tokens 1000 --rag-tokens 2000
+stowken bench drift.jsonl                    # baseline
+stowken --near-dedup 0.85 bench drift.jsonl  # near-dedup on
+```
 
 You can run the same benchmark on your own data:
 

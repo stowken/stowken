@@ -1091,17 +1091,27 @@ async fn cmd_bench(
     );
     println!();
 
+    // Two reference points:
+    //   * incoming_bytes = what the user actually sent in (constant per
+    //     corpus regardless of near-dedup, dict, etc.) — the right
+    //     baseline for "how much did Stowken save vs sending raw u32 to
+    //     disk".
+    //   * naive_bytes (from index) = SUM(raw_size × ref_count) which
+    //     includes near-dedup's canonical cross-refs. Useful for showing
+    //     dedup effectiveness across the reference graph.
+    let incoming_bytes = stats.total_tokens * 4;
+
     println!("Storage layers");
     println!("{}", "-".repeat(60));
     let dedup_save_pct = pct_saved(stats.naive_bytes, dedup_only_bytes);
     let zstd_save_pct = pct_saved(dedup_only_bytes, stats.storage_bytes);
-    let total_save_pct = pct_saved(stats.naive_bytes, stats.storage_bytes);
+    let total_save_pct = pct_saved(incoming_bytes, stats.storage_bytes);
     println!(
-        "  Naive (u32)   : {:>10}",
-        format_bytes(stats.naive_bytes)
+        "  Incoming (u32): {:>10}   (ingested tokens \u{00d7} 4)",
+        format_bytes(incoming_bytes)
     );
     println!(
-        "  After dedup   : {:>10}   {:>5.1}% saved by dedup alone",
+        "  After dedup   : {:>10}   {:>5.1}% saved by dedup alone (refs \u{00d7} raw \u{2192} unique \u{00d7} raw)",
         format_bytes(dedup_only_bytes),
         dedup_save_pct
     );
@@ -1112,9 +1122,9 @@ async fn cmd_bench(
     );
     println!();
     println!(
-        "  Combined      : {:.1}% smaller than naive  ({} \u{2192} {})",
+        "  Combined      : {:.1}% smaller than incoming  ({} \u{2192} {})",
         total_save_pct,
-        format_bytes(stats.naive_bytes),
+        format_bytes(incoming_bytes),
         format_bytes(stats.storage_bytes),
     );
     println!();

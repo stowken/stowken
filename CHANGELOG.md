@@ -38,6 +38,26 @@ Pinned by:
 - 84 core (was 71, +13 near_dedup primitives) + **37** integration (was 30, +7 near-dedup) + **14** CLI (unchanged) + **55** Python (was 49, +4 sync near-dup, +2 async near-dup) = **191 green** (was 165, +26).
 - Clippy clean across the workspace.
 
+### Measured impact
+
+Bench results across three corpora make the workload-dependence visible:
+
+| Corpus | Without `--near-dedup` | With `--near-dedup 0.85` | Verdict |
+|---|---:|---:|---|
+| OpenAssistant English (3,482 convs, unique content) | 54.2% | 54.2% (no detectable drift) | Don't enable — 5× ingest cost, zero gain. |
+| Synthetic small-segment drift (1,000 convs, 100t system + 200t RAG) | 57.1% | 57.1% net (delta header ~ savings) | Marginal — 54× ingest cost for ~5% storage win. |
+| Synthetic large-segment drift (1,000 convs, 1000t system + 2000t RAG) | 58.8% | **71.0%** | Worth it — 60× ingest cost for ~30% storage reduction. |
+
+Near-dedup pays off when segments are large (delta header is small relative), drift is small (few token changes per segment), and ingest latency tolerates an LSH probe per segment. It's off by default; turn it on per workload after measuring.
+
+### Bench output cleanup
+
+The bench command's storage-layer report now distinguishes "Incoming (u32)" — what the user actually sent in, the apples-to-apples baseline regardless of whether near-dedup inflates the reference graph — from the dedup/zstd savings. Previously the headline used `naive_bytes` from the metadata index, which double-counted near-dedup's canonical cross-refs and made before/after comparisons confusing.
+
+### Synthetic drift fixture
+
+`scripts/synth_drift_corpus.py` generates production-shaped corpora with configurable segment sizes (`--system-tokens`, `--rag-tokens`) and a fixed-seed PRNG so bench numbers are reproducible.
+
 ## 0.3.0 — Unreleased *(in progress)*
 
 ### Added — frame-versioned zstd dictionaries
