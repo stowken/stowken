@@ -195,6 +195,10 @@ stowken reindex
 stowken dict train --samples 200 --activate     # train + use for new frames
 stowken dict list                                # show all registered dicts
 stowken dict activate 1234567890                 # rotate to a specific dict
+
+# Near-duplicate detection (off by default)
+stowken --near-dedup 0.85 store conv.json        # ingest with near-dedup ON
+stowken find-near-duplicates --threshold 0.85    # surface drift clusters
 ```
 
 ---
@@ -277,13 +281,16 @@ vault-root/
 
 The first byte of every compressed segment identifies the codec:
 
-| Byte | Codec                      | Body                                            |
-|------|----------------------------|-------------------------------------------------|
-| 0x01 | varint only                | varint(tokens)                                  |
-| 0x02 | varint + zstd              | zstd(varint(tokens))                            |
-| 0x03 | varint + zstd with dict    | dict_id(u32 LE) ‖ zstd(varint(tokens), dict)    |
+| Byte | Codec                          | Body                                                |
+|------|--------------------------------|-----------------------------------------------------|
+| 0x01 | varint only                    | varint(tokens)                                      |
+| 0x02 | varint + zstd                  | zstd(varint(tokens))                                |
+| 0x03 | varint + zstd with dict        | dict_id(u32 LE) ‖ zstd(varint(tokens), dict)        |
+| 0x04 | delta against canonical        | canonical_hash(32 bytes) ‖ streaming delta ops      |
 
 For 0x03 frames, the 4-byte little-endian zstd dictionary ID directly follows the version byte. The decompressor looks the ID up in the per-vault dictionary registry; multiple dictionaries coexist so rotation is non-destructive — old frames stay readable as long as their dict file is in the registry.
+
+For 0x04 frames, the variant is stored as a streaming delta against another segment (the *canonical*). Decompression fetches the canonical from the backend and applies the delta. Used by near-duplicate detection — variants can be 80–95% smaller than the full token stream.
 
 The manifest carries a `schema_version` field with the same forward-compatibility guarantee. Future codecs get new bytes; existing data stays readable indefinitely.
 

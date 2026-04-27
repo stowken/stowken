@@ -161,12 +161,21 @@ pub struct StowkenConfig {
     /// Enable varint + zstd compression. Disable for benchmarking or backends
     /// that apply their own compression.
     pub enable_compression: bool,
+    /// Jaccard similarity threshold for storing a segment as a delta against
+    /// a near-duplicate canonical. `None` disables near-dedup entirely
+    /// (default). `Some(0.85)` is a conservative starting value.
+    ///
+    /// Lower values catch more variants but raise false-positive risk; very
+    /// low values can produce inflated delta sizes and worse storage. Stick
+    /// to the 0.80–0.95 range.
+    pub near_dedup_threshold: Option<f64>,
 }
 
 impl Default for StowkenConfig {
     fn default() -> Self {
         Self {
             enable_compression: true,
+            near_dedup_threshold: None,
         }
     }
 }
@@ -289,6 +298,26 @@ pub struct ReindexStats {
     /// Segment references found in manifests whose backend bytes were missing.
     /// Indicates corruption — these refs are skipped, not surfaced as errors.
     pub segments_missing: u64,
+}
+
+/// One canonical-and-its-near-duplicates cluster surfaced by
+/// `find_near_duplicates`. The canonical has the highest reference count
+/// in the cluster; variants are ordered by similarity descending.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NearDuplicateCluster {
+    pub canonical: SegmentHash,
+    pub canonical_token_count: u32,
+    pub canonical_ref_count: u64,
+    pub variants: Vec<NearDuplicateVariant>,
+}
+
+/// One near-duplicate of a canonical segment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NearDuplicateVariant {
+    pub hash: SegmentHash,
+    pub similarity: f64,
+    pub token_count: u32,
+    pub ref_count: u64,
 }
 
 /// A heavily-referenced segment surfaced by the duplicate finder.

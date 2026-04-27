@@ -200,6 +200,40 @@ async def test_activate_dictionary_async():
     assert listed[0]["is_active"] is True
 
 
+# ── Near-dedup via async ───────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_near_dedup_async_round_trip():
+    v = stowken.Stowken(near_dedup=0.80)
+    canonical = list(range(200))
+    await v.store_async(make_token_conv("canon", canonical, [1, 2, 3]))
+
+    variant = canonical.copy()
+    variant[10] = 99_999
+    variant[100] = 88_888
+    await v.store_async(make_token_conv("variant", variant, [4, 5, 6]))
+
+    r = await v.retrieve_async("variant")
+    sys = next(s for s in r["segments"] if s["segment_type"] == "system_prompt")
+    assert sys["tokens"] == variant
+
+    size = await v.near_dedup_index_size_async()
+    assert size >= 2  # canonical's system + user; variant's user
+
+@pytest.mark.asyncio
+async def test_find_near_duplicates_async():
+    v = stowken.Stowken(near_dedup=0.80)
+    canonical = list(range(200))
+    for i in range(6):
+        await v.store_async(make_token_conv(f"canon-{i}", canonical, [i + 100]))
+    variant = canonical.copy()
+    variant[20] = 99_999
+    await v.store_async(make_token_conv("variant", variant, [200]))
+
+    clusters = await v.find_near_duplicates_async(threshold=0.80, min_refs=5)
+    assert len(clusters) >= 1
+
+
 # ── Mixing sync and async on the same vault ───────────────────────────────────
 
 @pytest.mark.asyncio

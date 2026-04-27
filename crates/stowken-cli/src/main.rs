@@ -38,6 +38,12 @@ struct Cli {
     #[arg(long, global = true)]
     no_compression: bool,
 
+    /// Enable near-duplicate detection at this Jaccard threshold (typical:
+    /// 0.85). When set, segments that are 0x04-stored as deltas against
+    /// existing similar segments. Off by default.
+    #[arg(long, global = true)]
+    near_dedup: Option<f64>,
+
     /// Output as JSON (where applicable).
     #[arg(long, short = 'j', global = true)]
     json: bool,
@@ -206,6 +212,24 @@ enum Command {
         limit: u64,
     },
 
+    /// Surface clusters of segments that are *almost* identical — prompt
+    /// drift detection. Requires the LSH index to have been populated by
+    /// running with `--near-dedup <threshold>` during ingest, or by
+    /// running `stowken reindex` after enabling near-dedup.
+    FindNearDuplicates {
+        /// Jaccard similarity threshold to declare a near-duplicate.
+        /// Conservative defaults; lower for more aggressive matching.
+        #[arg(long, default_value_t = 0.85)]
+        threshold: f64,
+        /// Minimum ref count for a segment to be considered as a canonical
+        /// for clustering. Higher = surface only the high-traffic clusters.
+        #[arg(long, default_value_t = 5)]
+        min_refs: u64,
+        /// Maximum clusters to print.
+        #[arg(long, default_value_t = 25)]
+        limit: u64,
+    },
+
     /// Benchmark Stowken on a directory of conversations.
     ///
     /// Ingests every `*.json` (one conversation per file) and `*.jsonl` (one
@@ -235,6 +259,7 @@ async fn main() -> Result<()> {
     let data_dir = resolve_data_dir(cli.data_dir)?;
     let config = StowkenConfig {
         enable_compression: !cli.no_compression,
+        near_dedup_threshold: cli.near_dedup,
     };
 
     match cli.command {
@@ -313,6 +338,9 @@ async fn main() -> Result<()> {
         }
         Command::FindDuplicates { threshold, limit } => {
             cmd_find_duplicates(&data_dir, config, threshold, limit, cli.json).await?;
+        }
+        Command::FindNearDuplicates { threshold, min_refs, limit } => {
+            cmd_find_near_duplicates(&data_dir, config, threshold, min_refs, limit, cli.json).await?;
         }
         Command::Bench { input, max } => {
             cmd_bench(config, input, max, cli.json).await?;
@@ -810,6 +838,77 @@ async fn cmd_reindex(data_dir: &PathBuf, config: StowkenConfig, json: bool) -> R
             );
         }
     }
+    Ok(())
+}
+
+async fn cmd_find_near_duplicates(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    threshold: f64,
+    min_refs: u64,
+    limit: u64,
+    json: bool,
+) -> Result<()> {
+    let vault = open_vault(data_dir, config).await?;
+    let clusters = vault
+        .find_near_duplicates(threshold, min_refs, limit)
+        .await
+        .context("finding near-duplicates")?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&clusters)?);
+        return Ok(());
+    }
+
+    if clusters.is_empty() {
+        println!(
+            "No near-duplicate clusters found (threshold {:.2}, min_refs {}).",
+            threshold, min_refs
+        );
+        println!("Tip: ensure near-dedup was enabled during ingest with `--near-dedup <threshold>` \
+                  or run `stowken reindex` to populate the LSH index.");
+        return Ok(());
+    }
+
+    for (i, cluster) in clusters.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!(
+            "Cluster {}: canonical {}… ({} tokens, {} refs)",
+            i + 1,
+            &cluster.canonical.0[..16],
+            cluster.canonical_token_count,
+            cluster.canonical_ref_count,
+        );
+        #[derive(Tabled)]
+        struct Row {
+            #[tabled(rename = "Sim")]
+            similarity: String,
+            #[tabled(rename = "Tokens")]
+            tokens: u32,
+            #[tabled(rename = "Refs")]
+            refs: u64,
+            #[tabled(rename = "Hash")]
+            hash: String,
+        }
+        let rows: Vec<Row> = cluster
+            .variants
+            .iter()
+            .map(|v| Row {
+                similarity: format!("{:.0}%", v.similarity * 100.0),
+                tokens: v.token_count,
+                refs: v.ref_count,
+                hash: format!("{}…", &v.hash.0[..16]),
+            })
+            .collect();
+        println!("{}", Table::new(rows));
+    }
+    println!(
+        "\n{} cluster(s) shown. Variants with high similarity but distinct hashes \
+         often indicate prompt drift (interpolated values, formatting changes).",
+        clusters.len()
+    );
     Ok(())
 }
 

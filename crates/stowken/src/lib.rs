@@ -66,6 +66,7 @@ pub mod dedup;
 pub mod dict_registry;
 pub mod export;
 pub mod index;
+pub mod near_dedup;
 pub mod segmenter;
 pub mod storage;
 pub mod tokenizer;

@@ -244,7 +244,122 @@ impl MetadataIndex {
         conn.execute("DELETE FROM segment_refs", [])?;
         conn.execute("DELETE FROM conversations", [])?;
         conn.execute("DELETE FROM segments_meta", [])?;
+        conn.execute("DELETE FROM near_dedup_signatures", [])?;
+        conn.execute("DELETE FROM near_dedup_bands", [])?;
         Ok(())
+    }
+
+    // ── Near-dedup LSH index ──────────────────────────────────────────────
+
+    /// Insert a signature + its 16 band hashes for one segment. Idempotent
+    /// via INSERT OR REPLACE on the signature row + INSERT OR IGNORE on the
+    /// band rows so reindex can be safely repeated.
+    pub fn upsert_near_dedup_entry(
+        &self,
+        hash: &SegmentHash,
+        signature_bytes: &[u8],
+        band_hashes: &[u64],
+    ) -> MetadataResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("BEGIN", [])?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO near_dedup_signatures (segment_hash, signature) \
+             VALUES (?1, ?2)",
+            params![hash.0, signature_bytes],
+        )?;
+
+        // Always replace bands for this segment so band_hashes stays
+        // consistent with the signature even if the caller re-computes.
+        conn.execute(
+            "DELETE FROM near_dedup_bands WHERE segment_hash = ?1",
+            params![hash.0],
+        )?;
+        for (band_index, band_hash) in band_hashes.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO near_dedup_bands (band_index, band_hash, segment_hash) \
+                 VALUES (?1, ?2, ?3)",
+                params![band_index as i64, *band_hash as i64, hash.0],
+            )?;
+        }
+
+        conn.execute("COMMIT", [])?;
+        Ok(())
+    }
+
+    /// Look up candidate segment hashes that share at least one LSH band
+    /// with the supplied band hashes. Returns deduplicated hashes.
+    pub fn find_near_dedup_candidates(
+        &self,
+        band_hashes: &[u64],
+    ) -> MetadataResult<Vec<SegmentHash>> {
+        let conn = self.conn.lock().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+
+        // Build the OR clause manually since rusqlite doesn't bind arrays
+        // cleanly without the "array" feature; this is a small fixed-size
+        // query (16 bands by default).
+        for (band_index, band_hash) in band_hashes.iter().enumerate() {
+            let mut stmt = conn.prepare(
+                "SELECT segment_hash FROM near_dedup_bands \
+                 WHERE band_index = ?1 AND band_hash = ?2",
+            )?;
+            let rows = stmt.query_map(
+                params![band_index as i64, *band_hash as i64],
+                |row| row.get::<_, String>(0),
+            )?;
+            for row in rows {
+                let hash_str = row?;
+                if seen.insert(hash_str.clone()) {
+                    out.push(SegmentHash(hash_str));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read a stored signature (1024 bytes) by segment hash.
+    pub fn get_near_dedup_signature(
+        &self,
+        hash: &SegmentHash,
+    ) -> MetadataResult<Option<Vec<u8>>> {
+        let conn = self.conn.lock().unwrap();
+        let row: Result<Vec<u8>, _> = conn.query_row(
+            "SELECT signature FROM near_dedup_signatures WHERE segment_hash = ?1",
+            params![hash.0],
+            |row| row.get(0),
+        );
+        match row {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Remove all near-dedup state for a segment (used during GC).
+    pub fn remove_near_dedup_entry(&self, hash: &SegmentHash) -> MetadataResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM near_dedup_signatures WHERE segment_hash = ?1",
+            params![hash.0],
+        )?;
+        conn.execute(
+            "DELETE FROM near_dedup_bands WHERE segment_hash = ?1",
+            params![hash.0],
+        )?;
+        Ok(())
+    }
+
+    /// Number of segments tracked in the near-dedup index.
+    pub fn near_dedup_size(&self) -> MetadataResult<u64> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM near_dedup_signatures",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n as u64)
     }
 
     // ── Analytics ─────────────────────────────────────────────────────────
@@ -515,6 +630,27 @@ CREATE TABLE IF NOT EXISTS segments_meta (
 );
 CREATE INDEX IF NOT EXISTS idx_segmeta_type ON segments_meta(segment_type);
 CREATE INDEX IF NOT EXISTS idx_segmeta_refs ON segments_meta(ref_count);
+
+-- Persistent MinHash signature per segment (1024 bytes). Used to compute
+-- Jaccard similarity for candidates surfaced by the LSH band index.
+CREATE TABLE IF NOT EXISTS near_dedup_signatures (
+    segment_hash TEXT PRIMARY KEY,
+    signature    BLOB NOT NULL
+);
+
+-- LSH band hashes: one row per (segment, band). Lookup by (band_index,
+-- band_hash) returns candidate segment hashes; full Jaccard verification
+-- happens in app code against the signatures table.
+CREATE TABLE IF NOT EXISTS near_dedup_bands (
+    band_index   INTEGER NOT NULL,
+    band_hash    INTEGER NOT NULL,
+    segment_hash TEXT NOT NULL,
+    PRIMARY KEY (band_index, band_hash, segment_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_neardup_bands_lookup
+    ON near_dedup_bands(band_index, band_hash);
+CREATE INDEX IF NOT EXISTS idx_neardup_bands_segment
+    ON near_dedup_bands(segment_hash);
 ";
 
 #[cfg(test)]

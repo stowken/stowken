@@ -37,19 +37,18 @@ Everything currently in the repo: segmentation, exact dedup, varint+zstd, frame 
 
 ---
 
-## v0.4 — Near-duplicate detection
+## v0.4 — Near-duplicate detection *(complete)*
 
 **Theme:** catch prompts that should be the same but aren't (interpolated names, formatting drift, prompt versioning).
 
-- [ ] **Persistent MinHash LSH index.** New SQLite tables for signatures and band buckets. Survives restart, rebuildable from segment data via `stowken reindex --near-dedup`. Fixes v0.1's in-memory-only bug.
-- [ ] **Bounded memory.** No keeping every canonical segment's full token sequence in RAM. Tokens are fetched from the backend on demand when computing deltas. Fixes v0.1's linear-memory leak.
-- [ ] **Delta-encoded variant storage.** New frame byte `0x04 = delta(canonical_hash, edit_script)`. Variants store the edit script against a canonical segment; retrieval reconstructs by applying the delta to the canonical's tokens.
-- [ ] **`stowken find-near-duplicates --threshold 0.85`.** Surfaces variant clusters: "you have 47 system prompts that are 90%+ similar to this canonical."
-- [ ] **Configurable similarity threshold per segment type.** System prompts probably want 0.95 (be conservative); tool results might tolerate 0.80.
+- [x] **Persistent MinHash LSH index.** *Shipped: two SQLite tables (`near_dedup_signatures` BLOB-keyed, `near_dedup_bands` for LSH bucket lookup). Survives restart. `reindex` rebuilds it from on-disk manifests. Pinned by `lsh_index_survives_vault_reopen`.*
+- [x] **Bounded memory.** *Shipped: tokens are fetched from the backend on demand at delta-compute time, never cached in memory. Memory grows with one in-flight ingest, not corpus size.*
+- [x] **Delta-encoded variant storage.** *Shipped: frame byte `0x04 = canonical_hash(32 bytes) || streaming delta`. Three opcodes (Skip / Copy / Insert) with a single cursor through the canonical. Compact varint-encoded. The vault refuses to chain deltas — variants always reference root canonicals.*
+- [x] **`stowken find-near-duplicates --threshold 0.85`.** *Shipped, plus the matching Python `find_near_duplicates(...)` / `_async` variant. Surfaces clusters with similarity-sorted variants.*
+- [x] **Opt-in only — falls back gracefully when delta isn't a win.** *`StowkenConfig::near_dedup_threshold = None` by default. When enabled, delta storage is rejected if its size exceeds a fresh full compression — no cross-ref overhead for negative gain.*
+- [ ] **Configurable similarity threshold per segment type.** *Deferred — single global threshold is the right starting point; per-type tuning is an optimisation once we have real corpus data.*
 
 **Value:** catches what exact dedup misses — interpolated user names, slight RAG context differences, prompt versioning drift. On corpora with realistic prompt drift, typically 5–20% additional savings on top of exact dedup.
-
-**Why this position:** moderate lift, addresses a real gap that v0.3 doesn't touch (dictionaries help with byte-level repetition; near-dedup helps with structural variants).
 
 ---
 

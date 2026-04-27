@@ -342,6 +342,52 @@ async fn vault_reindex(
     }
 }
 
+async fn vault_find_near_duplicates(
+    inner: &VaultKind,
+    threshold: f64,
+    min_refs: u64,
+    limit: u64,
+) -> Result<Vec<sk::types::NearDuplicateCluster>, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.find_near_duplicates(threshold, min_refs, limit).await,
+        VaultKind::Filesystem(v) => v.find_near_duplicates(threshold, min_refs, limit).await,
+    }
+}
+
+async fn vault_near_dedup_index_size(
+    inner: &VaultKind,
+) -> Result<u64, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.near_dedup_index_size().await,
+        VaultKind::Filesystem(v) => v.near_dedup_index_size().await,
+    }
+}
+
+fn build_near_dup_clusters(
+    py: Python<'_>,
+    clusters: &[sk::types::NearDuplicateCluster],
+) -> PyResult<PyObject> {
+    let list = PyList::empty_bound(py);
+    for cluster in clusters {
+        let d = PyDict::new_bound(py);
+        d.set_item("canonical", &cluster.canonical.0)?;
+        d.set_item("canonical_token_count", cluster.canonical_token_count)?;
+        d.set_item("canonical_ref_count", cluster.canonical_ref_count)?;
+        let variants = PyList::empty_bound(py);
+        for v in &cluster.variants {
+            let vd = PyDict::new_bound(py);
+            vd.set_item("hash", &v.hash.0)?;
+            vd.set_item("similarity", v.similarity)?;
+            vd.set_item("token_count", v.token_count)?;
+            vd.set_item("ref_count", v.ref_count)?;
+            variants.append(vd)?;
+        }
+        d.set_item("variants", variants)?;
+        list.append(d)?;
+    }
+    Ok(list.into())
+}
+
 async fn vault_train_dict(
     inner: &VaultKind,
     samples: usize,
@@ -436,10 +482,19 @@ pub struct PyStowken {
 #[pymethods]
 impl PyStowken {
     /// Create a new in-memory vault.
+    ///
+    /// Args:
+    ///     enable_compression: zstd on/off. Default ``True``.
+    ///     near_dedup: Jaccard threshold for storing variants as deltas
+    ///         against near-duplicates. ``None`` (default) disables; a
+    ///         typical conservative value is ``0.85``.
     #[new]
-    #[pyo3(signature = (enable_compression=true))]
-    fn new(_py: Python<'_>, enable_compression: bool) -> PyResult<Self> {
-        let config = StowkenConfig { enable_compression };
+    #[pyo3(signature = (enable_compression=true, *, near_dedup=None))]
+    fn new(_py: Python<'_>, enable_compression: bool, near_dedup: Option<f64>) -> PyResult<Self> {
+        let config = StowkenConfig {
+            enable_compression,
+            near_dedup_threshold: near_dedup,
+        };
         let backend = MemoryBackend::new();
         let inner = runtime()
             .block_on(Stowken::new(backend, config))
@@ -449,14 +504,18 @@ impl PyStowken {
 
     /// Open a filesystem-backed vault rooted at `path`.
     #[classmethod]
-    #[pyo3(signature = (path, enable_compression=true))]
+    #[pyo3(signature = (path, enable_compression=true, *, near_dedup=None))]
     fn open(
         _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
         _py: Python<'_>,
         path: String,
         enable_compression: bool,
+        near_dedup: Option<f64>,
     ) -> PyResult<Self> {
-        let config = StowkenConfig { enable_compression };
+        let config = StowkenConfig {
+            enable_compression,
+            near_dedup_threshold: near_dedup,
+        };
         let db_path = format!("{}/metadata.db", path.trim_end_matches('/'));
         let inner = runtime()
             .block_on(async move {
@@ -609,6 +668,62 @@ impl PyStowken {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let report = vault_reindex(&inner).await.map_err(py_err)?;
             Python::with_gil(|py| build_reindex_dict(py, &report))
+        })
+    }
+
+    // ── near-duplicates ──────────────────────────────────────────────────────
+
+    /// Find clusters of segments that are *almost* identical. Returns a
+    /// list of dicts; each cluster has ``canonical`` (hash),
+    /// ``canonical_token_count``, ``canonical_ref_count``, and a
+    /// ``variants`` list of ``{hash, similarity, token_count, ref_count}``.
+    #[pyo3(signature = (threshold=0.85, min_refs=5, limit=25))]
+    fn find_near_duplicates(
+        &self,
+        py: Python<'_>,
+        threshold: f64,
+        min_refs: u64,
+        limit: u64,
+    ) -> PyResult<PyObject> {
+        let clusters = runtime()
+            .block_on(vault_find_near_duplicates(&self.inner, threshold, min_refs, limit))
+            .map_err(py_err)?;
+        build_near_dup_clusters(py, &clusters)
+    }
+
+    #[pyo3(signature = (threshold=0.85, min_refs=5, limit=25))]
+    fn find_near_duplicates_async<'py>(
+        &self,
+        py: Python<'py>,
+        threshold: f64,
+        min_refs: u64,
+        limit: u64,
+    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let clusters =
+                vault_find_near_duplicates(&inner, threshold, min_refs, limit)
+                    .await
+                    .map_err(py_err)?;
+            Python::with_gil(|py| build_near_dup_clusters(py, &clusters))
+        })
+    }
+
+    /// Number of segments tracked in the LSH (near-dedup) index. Useful
+    /// for sanity-checking after `reindex` or before `find_near_duplicates`.
+    fn near_dedup_index_size(&self, _py: Python<'_>) -> PyResult<u64> {
+        runtime()
+            .block_on(vault_near_dedup_index_size(&self.inner))
+            .map_err(py_err)
+    }
+
+    fn near_dedup_index_size_async<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            vault_near_dedup_index_size(&inner).await.map_err(py_err)
         })
     }
 

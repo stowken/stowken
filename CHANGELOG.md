@@ -2,6 +2,42 @@
 
 For planned future work see [ROADMAP.md](ROADMAP.md). Items move from the roadmap to a version section in this file when they ship.
 
+## 0.4.0 — Unreleased *(in progress)*
+
+### Added — persistent MinHash near-duplicate detection
+
+The second of the three deferred-with-intent features from v0.1 returns. The v0.1 implementation kept the LSH index in a process-local `HashMap` (lost on every restart) and cached the full token sequence of every canonical (linear memory growth). v0.4 fixes both: the index lives in SQLite, and tokens are fetched from the backend on demand when computing deltas.
+
+- **New frame format `0x04`** = `canonical_hash (32 raw bytes) || streaming delta`. The streaming delta uses a single cursor through the canonical with three opcodes: `Skip(n)`, `Copy(n)`, `Insert([tokens])`. Compact varint-encoded.
+- **`crate::near_dedup` module**: `MinHashSignature` (128 × u64, with byte-roundtrip for SQLite BLOB storage), `band_hash` for LSH bucketing, `compute_delta` / `apply_delta` / `encode_delta` / `decode_delta` for the streaming delta format.
+- **Two new SQLite tables** in `metadata.db`:
+  - `near_dedup_signatures(segment_hash PRIMARY KEY, signature BLOB)` — 1024-byte MinHash per segment.
+  - `near_dedup_bands(band_index, band_hash, segment_hash)` — LSH bucket index, primary keyed for idempotent inserts.
+- **`StowkenConfig::near_dedup_threshold: Option<f64>`** — opt-in. `None` (default) disables; `Some(0.85)` is conservative.
+- **`Stowken::find_near_duplicates`** + **`near_dedup_index_size`** — read-only analytics over the LSH index.
+- **`stowken find-near-duplicates [--threshold] [--min-refs] [--limit]`** — surfaces drift clusters in human or `--json` form.
+- **Global `--near-dedup <threshold>` CLI flag** so `store` invocations can opt in without rebuilding.
+- **Python:** `Stowken(near_dedup=0.85)` and `Stowken.open(path, near_dedup=0.85)` constructors; `find_near_duplicates(...)` and `near_dedup_index_size()` plus `_async` variants.
+- **`reindex` now rebuilds the LSH index too** by walking each non-delta segment, decompressing, recomputing signature + bands, and upserting. Delta segments (0x04) are skipped — they aren't canonicals and shouldn't seed the LSH.
+- **`CompressionPipeline::compress_delta` / `frame_canonical_hash`** for use by the vault layer.
+- **`CanonicalResolver` trait** in compression — pluggable callback for resolving canonical tokens during 0x04 decompression. The vault uses an async path that fetches from the backend; the sync `decompress` returns `NoCanonicalResolver` for 0x04 frames since resolving requires I/O.
+
+### Why the v0.1 in-memory bug is structurally fixed
+
+In v0.1 the `NearDedupIndex` was a process-local struct. After a restart, the `HashMap<SegmentHash, MinHashSignature>` was empty, so newly-arriving variants of pre-restart canonicals would be stored as full segments — silent regression in compression. The `tokens: HashMap<SegmentHash, Vec<Token>>` cache also grew unboundedly with corpus size.
+
+In v0.4 the LSH state is two SQLite tables. Restart is a no-op. The `tokens` cache is gone entirely — when computing a delta, the canonical is fetched from the backend on demand and dropped after the delta is built. Memory grows with the working set of one in-flight ingest, not with corpus size.
+
+Pinned by:
+- `lsh_index_survives_vault_reopen` — store canonical, drop vault, reopen, store near-variant, confirm it goes through the delta path.
+- `reindex_rebuilds_lsh_after_db_deletion` — wipe `metadata.db`, reindex, confirm subsequent near-variants are detected.
+- `delta_only_used_when_actually_smaller` — for tiny segments where the 33-byte delta header exceeds a fresh full compression, fall back to full storage rather than paying cross-ref overhead for negative gain.
+
+### Tests
+
+- 84 core (was 71, +13 near_dedup primitives) + **37** integration (was 30, +7 near-dedup) + **14** CLI (unchanged) + **55** Python (was 49, +4 sync near-dup, +2 async near-dup) = **191 green** (was 165, +26).
+- Clippy clean across the workspace.
+
 ## 0.3.0 — Unreleased *(in progress)*
 
 ### Added — frame-versioned zstd dictionaries

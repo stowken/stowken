@@ -408,6 +408,59 @@ class TestDictionaries:
             assert sys_seg["tokens"] == persisted_tokens
 
 
+# ── Near-duplicate detection ──────────────────────────────────────────────────
+
+class TestNearDedup:
+    def test_disabled_by_default(self):
+        v = stowken.Stowken()
+        # Empty vault, no near-dedup configured.
+        assert v.near_dedup_index_size() == 0
+        v.store(make_token_conv("a", list(range(50)), [1]))
+        # LSH index stays empty when feature is disabled.
+        assert v.near_dedup_index_size() == 0
+
+    def test_variant_round_trips_with_near_dedup_enabled(self):
+        v = stowken.Stowken(near_dedup=0.80)
+        canonical = list(range(200))
+        v.store(make_token_conv("canon", canonical, [1, 2, 3]))
+
+        variant = canonical.copy()
+        variant[10] = 99_999
+        variant[150] = 88_888
+        v.store(make_token_conv("variant", variant, [4, 5, 6]))
+
+        # Variant must reconstruct to its original tokens via delta apply.
+        r = v.retrieve("variant")
+        sys = next(s for s in r["segments"] if s["segment_type"] == "system_prompt")
+        assert sys["tokens"] == variant
+
+    def test_lsh_index_grows_per_canonical(self):
+        v = stowken.Stowken(near_dedup=0.80)
+        # 3 conversations × 2 segments each = 6 LSH entries (none deduped
+        # because the segments are all distinct).
+        for i in range(3):
+            v.store(make_token_conv(f"c{i}", [i, i + 1, i + 2], [i + 10, i + 11]))
+        assert v.near_dedup_index_size() == 6
+
+    def test_find_near_duplicates_via_python(self):
+        v = stowken.Stowken(near_dedup=0.80)
+        canonical = list(range(200))
+        # Make canonical heavily-referenced so it shows up as a cluster.
+        for i in range(6):
+            v.store(make_token_conv(f"canon-{i}", canonical, [i + 100]))
+        # Add a near-variant.
+        variant = canonical.copy()
+        variant[20] = 99_999
+        v.store(make_token_conv("variant", variant, [200]))
+
+        clusters = v.find_near_duplicates(threshold=0.80, min_refs=5)
+        assert len(clusters) >= 1
+        c = clusters[0]
+        assert "canonical" in c
+        assert c["canonical_ref_count"] >= 5
+        assert isinstance(c["variants"], list)
+
+
 # ── GC candidates ─────────────────────────────────────────────────────────────
 
 class TestGCCandidates:
