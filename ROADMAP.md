@@ -52,22 +52,20 @@ Everything currently in the repo: segmentation, exact dedup, varint+zstd, frame 
 
 ---
 
-## v0.5 — Token-level shared-substring dedup
+## v0.5 — Token-level shared-substring dedup *(complete in v0.5.0; compaction deferred)*
 
 **Theme:** extract savings from sub-segment repetition. The most ambitious of the three.
 
-- [ ] **Suffix array (or FM-index) over hot segments.** Periodic background job identifies long common substrings shared across otherwise-distinct segments. E.g., "as a large language model trained by OpenAI" appearing across 50,000 unrelated assistant turns.
-- [ ] **Promotion policy.** A substring earns its own blob when `(occurrences × substring_size) > (occurrences × reference_overhead + substring_size)`. Tunable threshold; default conservative.
-- [ ] **Reference-by-substring frame format.** New frame byte `0x05`; segments can interleave inline tokens with `(substring_id, position)` references. Storage format must be append-only friendly.
-- [ ] **Substring registry.** New SQLite table for promoted substrings, indexed by ID. Hot substrings cached in memory.
-- [ ] **Backwards-compatible retrieval.** Frames written before substring promotion stay readable forever. Newly-stored segments can reference substrings; previously-stored segments are not retroactively rewritten (would require a separate compaction pass).
-- [ ] **Optional compaction job.** `stowken compact` rewrites old segments to use the substring registry. Opt-in because it temporarily doubles storage.
+- [x] **Discovery via rolling-hash window counting.** *Shipped in v0.5.0: every `MIN_LENGTH`-token window across a sample of segments is hashed; windows clearing the distinct-segment threshold are promoted. Simpler than a full suffix-array; v0.5.x can extend with variable-length matching.*
+- [x] **Promotion policy via cost-model fallback.** *Shipped: substring frame is accepted only if its byte length beats a fresh full compression of the same tokens. Strict opt-in win — never net regression.*
+- [x] **Reference-by-substring frame format.** *Shipped: new frame byte `0x05` with `Inline(tokens)` and `Ref(substring_id)` ops, varint-encoded.*
+- [x] **Substring registry.** *Shipped under `<vault-root>/substrings/{blobs.dat, index.json}`. Packed-file storage (one concatenated blob, not a file per substring) so a 3,000-substring registry costs ~600 KB instead of ~24 MB. In-memory cache populated eagerly at open.*
+- [x] **Backwards-compatible retrieval.** *Shipped: frames written before substring promotion stay readable forever. The vault's substring-aware compress only runs at write time.*
+- [ ] **Optional compaction job.** *Deferred to v0.5.x. Largest correctness surface (atomic rewrites + ref-count migration + partial-failure recovery) — gets its own focused milestone.*
+- [ ] **Substring GC.** *Deferred to v0.5.x. Once a substring's last referencing segment is GC'd, its blob should be reclaimable. Needs ref-count tracking on substring usage.*
+- [ ] **Variable-length substring extension.** *Deferred — discovery currently registers fixed `MIN_LENGTH`-token windows. Extending outward when surrounding tokens also recur would tighten the registry.*
 
-**Value:** catches what segment-level dedup misses entirely. Most valuable on creative / unique-per-call content where exact dedup gets nothing but token sequences still repeat through the corpus. Could be the largest win of the three on the right workload.
-
-**Why this position:** hardest of the three. Largest correctness surface (interleaved frames), needs a cost model, needs compaction strategy. Doing it last means we have v0.2's real-world data to know whether the substring distribution justifies the complexity.
-
-**Risks to watch:** if substring promotion is too aggressive, retrieval becomes a graph walk and gets slow. If too conservative, we leave value on the table. Needs careful benchmarking.
+**Value (measured):** on the synthetic large-segment drift corpus, substrings push savings from 58.8% (baseline) to **78.8%** (+20pp). On OpenAssistant the cost-model promotes zero substrings — no regression on workloads without genuine substring drift.
 
 ---
 

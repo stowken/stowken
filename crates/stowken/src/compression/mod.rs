@@ -12,6 +12,7 @@
 //! | 0x02 | varint + zstd                     | `zstd(varint(tokens))`                             |
 //! | 0x03 | varint + zstd with dictionary     | `dict_id(u32 LE) || zstd(varint(tokens), dict)`    |
 //! | 0x04 | delta against a canonical segment | `canonical_hash(32 bytes) || delta_ops`            |
+//! | 0x05 | substring-referenced segment      | sequence of `Inline(tokens)` and `Ref(substring_id)` ops |
 //!
 //! For 0x03, the 4-byte little-endian dictionary ID directly follows the
 //! version byte. The decompressor looks the ID up in the [`DictRegistry`]
@@ -24,14 +25,26 @@
 //! op format. The decompressor must be configured with a [`CanonicalResolver`]
 //! that knows how to load tokens for a given hash; this keeps
 //! `CompressionPipeline` decoupled from the storage backend.
+//!
+//! For 0x05, the body is a sequence of opcodes:
+//!   - `0x01 || varint(length) || varint(token) × length` — inline tokens
+//!   - `0x02 || varint(substring_id)` — reference an entry in the
+//!     [`crate::substring_registry::SubstringRegistry`]
+//!
+//! Decompression streams the ops, emitting inline tokens directly and
+//! looking up referenced substrings from the registry. Used by token-level
+//! shared-substring dedup — one shared blob can replace the same long
+//! token sequence across thousands of otherwise-distinct segments.
 
 pub mod varint;
 
+use std::io::Read;
 use std::sync::Arc;
 
 use thiserror::Error;
 
 use crate::dict_registry::{DictError, DictRegistry};
+use crate::substring_registry::{SubstringError, SubstringId, SubstringRegistry};
 use crate::types::Token;
 
 /// Format version tag at the head of every compressed frame.
@@ -46,6 +59,8 @@ pub enum FrameVersion {
     VarintZstdDict = 0x03,
     /// Delta against a canonical segment. 32-byte hash + op stream follows.
     Delta = 0x04,
+    /// Sequence of inline runs and substring references.
+    Substring = 0x05,
 }
 
 impl FrameVersion {
@@ -55,6 +70,7 @@ impl FrameVersion {
             0x02 => Ok(Self::VarintZstd),
             0x03 => Ok(Self::VarintZstdDict),
             0x04 => Ok(Self::Delta),
+            0x05 => Ok(Self::Substring),
             other => Err(CompressionError::UnsupportedVersion(other)),
         }
     }
@@ -90,6 +106,107 @@ pub enum CompressionError {
     NoCanonicalResolver,
     #[error("delta frame error: {0}")]
     Delta(String),
+    #[error("substring registry error: {0}")]
+    Substring(#[from] SubstringError),
+    #[error("substring frame requires a registry but none is attached")]
+    NoSubstringRegistry,
+}
+
+/// Op in a `0x05` substring-referenced frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubstringOp {
+    /// Emit `tokens` directly.
+    Inline(Vec<Token>),
+    /// Resolve `id` in the substring registry and emit those tokens.
+    Ref(SubstringId),
+}
+
+const SUBSTRING_OP_INLINE: u8 = 0x01;
+const SUBSTRING_OP_REF: u8 = 0x02;
+
+/// Encode a sequence of substring ops as the body of a `0x05` frame.
+/// Inserts the version tag at position 0.
+pub fn encode_substring_frame(ops: &[SubstringOp]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(FrameVersion::Substring as u8);
+    for op in ops {
+        match op {
+            SubstringOp::Inline(tokens) => {
+                out.push(SUBSTRING_OP_INLINE);
+                varint_write_u32(tokens.len() as u32, &mut out);
+                for t in tokens {
+                    varint_write_u32(*t, &mut out);
+                }
+            }
+            SubstringOp::Ref(id) => {
+                out.push(SUBSTRING_OP_REF);
+                varint_write_u32(*id, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Decode the body of a `0x05` frame (caller has already stripped the
+/// version byte) into a sequence of substring ops.
+pub fn decode_substring_frame(body: &[u8]) -> Result<Vec<SubstringOp>, CompressionError> {
+    let mut ops = Vec::new();
+    let mut cursor = std::io::Cursor::new(body);
+    while (cursor.position() as usize) < body.len() {
+        let mut tag = [0u8; 1];
+        cursor
+            .read_exact(&mut tag)
+            .map_err(|e| CompressionError::Decompress(format!("substring frame: {e}")))?;
+        match tag[0] {
+            SUBSTRING_OP_INLINE => {
+                let len = varint_read_u32(&mut cursor)?;
+                let mut tokens = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    tokens.push(varint_read_u32(&mut cursor)?);
+                }
+                ops.push(SubstringOp::Inline(tokens));
+            }
+            SUBSTRING_OP_REF => {
+                let id = varint_read_u32(&mut cursor)?;
+                ops.push(SubstringOp::Ref(id));
+            }
+            other => {
+                return Err(CompressionError::Decompress(format!(
+                    "unknown substring op tag 0x{other:02x}"
+                )));
+            }
+        }
+    }
+    Ok(ops)
+}
+
+fn varint_write_u32(mut v: u32, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn varint_read_u32(cursor: &mut std::io::Cursor<&[u8]>) -> Result<u32, CompressionError> {
+    let mut shift: u32 = 0;
+    let mut result: u32 = 0;
+    loop {
+        let mut byte = [0u8; 1];
+        cursor
+            .read_exact(&mut byte)
+            .map_err(|e| CompressionError::Decompress(format!("varint truncated: {e}")))?;
+        let b = byte[0];
+        result |= ((b & 0x7F) as u32) << shift;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift > 28 {
+            return Err(CompressionError::Decompress("varint overflows u32".into()));
+        }
+    }
+    Ok(result)
 }
 
 /// Full compression/decompression pipeline.
@@ -105,11 +222,18 @@ pub struct CompressionPipeline {
     level: i32,
     registry: Option<Arc<DictRegistry>>,
     resolver: Option<Arc<dyn CanonicalResolver>>,
+    substrings: Option<Arc<SubstringRegistry>>,
 }
 
 impl CompressionPipeline {
     pub fn new(enabled: bool, compression_level: i32) -> Self {
-        Self { enabled, level: compression_level, registry: None, resolver: None }
+        Self {
+            enabled,
+            level: compression_level,
+            registry: None,
+            resolver: None,
+            substrings: None,
+        }
     }
 
     /// Attach a dictionary registry. Compression and decompression will use
@@ -125,6 +249,18 @@ impl CompressionPipeline {
     pub fn with_resolver(mut self, resolver: Arc<dyn CanonicalResolver>) -> Self {
         self.resolver = Some(resolver);
         self
+    }
+
+    /// Attach a substring registry. Required for `0x05` frame decompression
+    /// and used by the vault to build `0x05` frames at write time.
+    pub fn with_substring_registry(mut self, substrings: Arc<SubstringRegistry>) -> Self {
+        self.substrings = Some(substrings);
+        self
+    }
+
+    /// Read access to the attached substring registry.
+    pub fn substring_registry(&self) -> Option<&Arc<SubstringRegistry>> {
+        self.substrings.as_ref()
     }
 
     /// Build a `0x04` (delta) frame against the named canonical segment.
@@ -207,10 +343,13 @@ impl CompressionPipeline {
         let (&version_byte, rest) = data.split_first().ok_or(CompressionError::EmptyFrame)?;
         let version = FrameVersion::from_byte(version_byte)?;
 
-        // 0x04 takes a different path entirely — its payload is a delta
-        // against another segment, not a varint-encoded token stream.
+        // 0x04 and 0x05 take different paths entirely — their payloads
+        // aren't varint-encoded token streams.
         if version == FrameVersion::Delta {
             return self.decompress_delta(rest);
+        }
+        if version == FrameVersion::Substring {
+            return self.decompress_substring_frame(rest);
         }
 
         let varint_bytes = match version {
@@ -244,11 +383,83 @@ impl CompressionPipeline {
                     .decompress(payload, 256 * 1024 * 1024)
                     .map_err(|e| CompressionError::Decompress(e.to_string()))?
             }
-            FrameVersion::Delta => unreachable!("handled above"),
+            FrameVersion::Delta | FrameVersion::Substring => unreachable!("handled above"),
         };
 
         varint::decode_tokens(&varint_bytes)
             .map_err(|e| CompressionError::Decompress(e.to_string()))
+    }
+
+    /// Decompression path for `0x05` frames: stream the ops, emitting
+    /// inline tokens directly and looking up substring refs from the
+    /// registry.
+    fn decompress_substring_frame(&self, body: &[u8]) -> Result<Vec<Token>, CompressionError> {
+        let registry = self.substrings.as_ref().ok_or(CompressionError::NoSubstringRegistry)?;
+        let ops = decode_substring_frame(body)?;
+        // Pre-allocate based on op count — a rough upper bound is enough
+        // to avoid most reallocations.
+        let mut out = Vec::with_capacity(ops.len() * 16);
+        for op in ops {
+            match op {
+                SubstringOp::Inline(tokens) => out.extend_from_slice(&tokens),
+                SubstringOp::Ref(id) => {
+                    let tokens = registry.get_tokens(id)?;
+                    out.extend_from_slice(tokens.as_slice());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Greedy substring-match over `tokens` using the attached
+    /// substring registry. Returns the encoded `0x05` frame *only if*
+    /// it ends up shorter than `fallback_len` (typically the size of a
+    /// fresh full compression of the same tokens). Otherwise returns
+    /// `None` so the caller can fall back to a normal frame.
+    pub fn try_compress_substring_frame(
+        &self,
+        tokens: &[Token],
+        fallback_len: usize,
+    ) -> Result<Option<Vec<u8>>, CompressionError> {
+        let registry = match &self.substrings {
+            Some(r) if !r.is_empty() => r,
+            _ => return Ok(None),
+        };
+
+        let mut ops: Vec<SubstringOp> = Vec::new();
+        let mut inline_buffer: Vec<Token> = Vec::new();
+        let mut i = 0usize;
+        let mut any_ref = false;
+
+        while i < tokens.len() {
+            if let Some((id, length)) = registry.find_longest_match_at(&tokens[i..]) {
+                if !inline_buffer.is_empty() {
+                    ops.push(SubstringOp::Inline(std::mem::take(&mut inline_buffer)));
+                }
+                ops.push(SubstringOp::Ref(id));
+                any_ref = true;
+                i += length;
+            } else {
+                inline_buffer.push(tokens[i]);
+                i += 1;
+            }
+        }
+        if !inline_buffer.is_empty() {
+            ops.push(SubstringOp::Inline(inline_buffer));
+        }
+
+        // Skip 0x05 entirely if we never matched a substring — a
+        // fully-inline frame is strictly worse than 0x02.
+        if !any_ref {
+            return Ok(None);
+        }
+
+        let frame = encode_substring_frame(&ops);
+        if frame.len() < fallback_len {
+            Ok(Some(frame))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Decompression path for `0x04` frames: read the canonical hash,
@@ -485,6 +696,112 @@ mod tests {
         // Decompressing without a resolver should fail with the dedicated error.
         let err = pipeline.decompress(&frame).unwrap_err();
         assert!(matches!(err, CompressionError::NoCanonicalResolver));
+    }
+
+    #[test]
+    fn substring_frame_op_roundtrip() {
+        let ops = vec![
+            SubstringOp::Inline(vec![100, 200, 300]),
+            SubstringOp::Ref(7),
+            SubstringOp::Inline(vec![400, 500]),
+            SubstringOp::Ref(42),
+        ];
+        let frame = encode_substring_frame(&ops);
+        assert_eq!(frame[0], FrameVersion::Substring as u8);
+        let decoded = decode_substring_frame(&frame[1..]).unwrap();
+        assert_eq!(decoded, ops);
+    }
+
+    #[test]
+    fn substring_frame_decompress_roundtrip() {
+        use crate::substring_registry::SubstringRegistry;
+
+        let registry = Arc::new(SubstringRegistry::in_memory());
+        let chunk_a: Vec<Token> = (0u32..32).collect();
+        let chunk_b: Vec<Token> = (1000u32..1064).collect();
+        let id_a = registry.register(chunk_a.clone(), 50).unwrap().id;
+        let id_b = registry.register(chunk_b.clone(), 30).unwrap().id;
+
+        let pipeline = CompressionPipeline::new(true, 3)
+            .with_substring_registry(Arc::clone(&registry));
+
+        // Encode a frame that interleaves a Ref, an Inline run, and another Ref.
+        let ops = vec![
+            SubstringOp::Ref(id_a),
+            SubstringOp::Inline(vec![99_999, 88_888, 77_777]),
+            SubstringOp::Ref(id_b),
+        ];
+        let frame = encode_substring_frame(&ops);
+
+        let recovered = pipeline.decompress(&frame).unwrap();
+        let mut expected = chunk_a.clone();
+        expected.extend_from_slice(&[99_999, 88_888, 77_777]);
+        expected.extend_from_slice(&chunk_b);
+        assert_eq!(recovered, expected);
+    }
+
+    #[test]
+    fn substring_frame_errors_without_registry() {
+        let pipeline = CompressionPipeline::new(true, 3);
+        let frame = encode_substring_frame(&[SubstringOp::Ref(1)]);
+        let err = pipeline.decompress(&frame).unwrap_err();
+        assert!(matches!(err, CompressionError::NoSubstringRegistry));
+    }
+
+    #[test]
+    fn try_compress_substring_frame_returns_none_when_no_match() {
+        use crate::substring_registry::SubstringRegistry;
+        let registry = Arc::new(SubstringRegistry::in_memory());
+        registry
+            .register((0u32..32).collect(), 5)
+            .unwrap();
+        let pipeline =
+            CompressionPipeline::new(true, 3).with_substring_registry(registry);
+        // No registered substring matches this prefix.
+        let tokens: Vec<Token> = (90_000u32..90_064).collect();
+        let result = pipeline.try_compress_substring_frame(&tokens, 1024).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_compress_substring_frame_returns_none_when_not_smaller() {
+        use crate::substring_registry::SubstringRegistry;
+        let registry = Arc::new(SubstringRegistry::in_memory());
+        registry
+            .register((0u32..32).collect(), 5)
+            .unwrap();
+        let pipeline =
+            CompressionPipeline::new(true, 3).with_substring_registry(registry);
+        let tokens: Vec<Token> = (0u32..32).collect();
+        // Pretend the fallback is ridiculously small — substring frame
+        // can't beat that.
+        let result = pipeline.try_compress_substring_frame(&tokens, 1).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_compress_substring_frame_uses_match_when_smaller() {
+        use crate::substring_registry::SubstringRegistry;
+        let registry = Arc::new(SubstringRegistry::in_memory());
+        let chunk: Vec<Token> = (0u32..200).collect();
+        registry.register(chunk.clone(), 5).unwrap();
+        let pipeline =
+            CompressionPipeline::new(true, 3).with_substring_registry(Arc::clone(&registry));
+
+        // Build a token sequence: one chunk + a small inline tail.
+        let mut tokens = chunk.clone();
+        tokens.extend_from_slice(&[55_555, 66_666]);
+
+        // Fallback len of 1024 is more than enough for the substring frame
+        // to beat (frame is ~5 bytes for the Ref + a tiny Inline run).
+        let result = pipeline.try_compress_substring_frame(&tokens, 1024).unwrap();
+        let frame = result.expect("substring frame should be smaller than fallback");
+        assert_eq!(frame[0], FrameVersion::Substring as u8);
+
+        // Round-trip: decompressing the produced frame must give the
+        // exact input back.
+        let recovered = pipeline.decompress(&frame).unwrap();
+        assert_eq!(recovered, tokens);
     }
 
     #[test]

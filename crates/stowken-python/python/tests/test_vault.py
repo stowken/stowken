@@ -408,6 +408,63 @@ class TestDictionaries:
             assert sys_seg["tokens"] == persisted_tokens
 
 
+# ── Substring dedup (v0.5) ────────────────────────────────────────────────────
+
+def _drift_system(seed: int, length: int = 250) -> list:
+    """Match the synth-drift fixture: a deterministic base with a few
+    interpolated tokens at seed-derived positions."""
+    tokens = list(range(length))
+    positions = [
+        seed % length,
+        (seed * 7) % length,
+        (seed * 13) % length,
+    ]
+    for i, p in enumerate(positions):
+        tokens[p] = 90_000 + (seed * 17 + i * 11) % 5_000
+    return tokens
+
+
+class TestSubstrings:
+    def test_empty_vault_no_substrings(self):
+        v = stowken.Stowken()
+        assert v.list_substrings() == []
+
+    def test_train_promotes_high_frequency_windows(self):
+        v = stowken.Stowken()
+        for i in range(30):
+            v.store(make_token_conv(f"seed-{i}", _drift_system(i, 200), [1000 + i]))
+        promoted = v.train_substrings(samples=30, min_occurrences=5)
+        assert len(promoted) > 0
+        for info in promoted:
+            assert info["length"] >= 16
+            assert info["source_occurrences"] >= 5
+
+    def test_post_train_round_trip(self):
+        v = stowken.Stowken()
+        for i in range(30):
+            v.store(make_token_conv(f"seed-{i}", _drift_system(i, 250), [i]))
+        v.train_substrings(samples=30, min_occurrences=5)
+
+        novel = _drift_system(999, 250)
+        v.store(make_token_conv("post-train", novel, [88_888]))
+        r = v.retrieve("post-train")
+        sys = next(s for s in r["segments"] if s["segment_type"] == "system_prompt")
+        assert sys["tokens"] == novel
+
+    def test_substring_persistence_across_reopen(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            v = stowken.Stowken.open(data_dir)
+            for i in range(30):
+                v.store(make_token_conv(f"seed-{i}", _drift_system(i, 250), [i]))
+            promoted = v.train_substrings(samples=30, min_occurrences=5)
+            count = len(promoted)
+            assert count > 0
+            del v
+
+            v2 = stowken.Stowken.open(data_dir)
+            assert len(v2.list_substrings()) == count
+
+
 # ── Near-duplicate detection ──────────────────────────────────────────────────
 
 class TestNearDedup:

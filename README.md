@@ -12,8 +12,9 @@ It depends on how much your traffic repeats. To make this concrete, here are two
 |---|---:|---:|---:|---:|---:|
 | **OpenAssistant** (English, full — unique content) | 3,482 | 1.30M | 5.0 MB | 2.3 MB | **54.2%** (zstd only) |
 | **Production chatbot** (5 shared prompts × 500 convs) | 500 | 101K | 395 KB | 2.6 KB | **99.3%** (dedup-dominated) |
-| **Drift workload, near-dedup off** (1000 convs, 1K-token system prompts with interpolated names + RAG) | 1,000 | 3.12M | 11.9 MB | 4.9 MB | 58.8% |
-| **Drift workload, `--near-dedup 0.85`** (same corpus) | 1,000 | 3.12M | 11.9 MB | 3.5 MB | **71.0%** (+12 pp) |
+| **Drift workload, baseline** (1000 convs, 1K-token system prompts with interpolated names + RAG) | 1,000 | 3.12M | 11.9 MB | 4.9 MB | 58.8% |
+| **Drift workload, `--near-dedup 0.85`** | 1,000 | 3.12M | 11.9 MB | 3.5 MB | **71.0%** (+12 pp) |
+| **Drift workload, `substrings train`** | 1,000 | 3.12M | 11.9 MB | 2.5 MB | **78.8%** (+20 pp) |
 
 Real production usage lands somewhere along this spectrum depending on:
 - How much your system prompts and RAG contexts are reused **byte-for-byte** (exact dedup wins here)
@@ -211,6 +212,10 @@ stowken dict activate 1234567890                 # rotate to a specific dict
 # Near-duplicate detection (off by default)
 stowken --near-dedup 0.85 store conv.json        # ingest with near-dedup ON
 stowken find-near-duplicates --threshold 0.85    # surface drift clusters
+
+# Token-level shared-substring dedup (v0.5; off until trained)
+stowken substrings train --samples 500           # discover + register substrings
+stowken substrings list                          # inspect the registry
 ```
 
 ---
@@ -299,10 +304,13 @@ The first byte of every compressed segment identifies the codec:
 | 0x02 | varint + zstd                  | zstd(varint(tokens))                                |
 | 0x03 | varint + zstd with dict        | dict_id(u32 LE) ‖ zstd(varint(tokens), dict)        |
 | 0x04 | delta against canonical        | canonical_hash(32 bytes) ‖ streaming delta ops      |
+| 0x05 | substring-referenced segment   | sequence of `Inline(tokens)` and `Ref(substring_id)` ops |
 
 For 0x03 frames, the 4-byte little-endian zstd dictionary ID directly follows the version byte. The decompressor looks the ID up in the per-vault dictionary registry; multiple dictionaries coexist so rotation is non-destructive — old frames stay readable as long as their dict file is in the registry.
 
 For 0x04 frames, the variant is stored as a streaming delta against another segment (the *canonical*). Decompression fetches the canonical from the backend and applies the delta. Used by near-duplicate detection — variants can be 80–95% smaller than the full token stream.
+
+For 0x05 frames, the segment is encoded as a sequence of inline runs and references into a per-vault substring registry. Long shared boilerplate (e.g. "as a large language model, I cannot...") is stored once as a substring blob; every segment that contains it gets a small reference instead of the full tokens. Used by token-level shared-substring dedup; train substrings with `stowken substrings train` and the next ingest pass uses them automatically when they win.
 
 The manifest carries a `schema_version` field with the same forward-compatibility guarantee. Future codecs get new bytes; existing data stays readable indefinitely.
 

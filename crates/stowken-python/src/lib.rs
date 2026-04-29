@@ -342,6 +342,47 @@ async fn vault_reindex(
     }
 }
 
+async fn vault_train_substrings(
+    inner: &VaultKind,
+    samples: usize,
+    min_occurrences: u32,
+) -> Result<Vec<sk::substring_registry::SubstringInfo>, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.train_substrings(samples, min_occurrences).await,
+        VaultKind::Filesystem(v) => v.train_substrings(samples, min_occurrences).await,
+    }
+}
+
+fn vault_list_substrings(inner: &VaultKind) -> Vec<sk::substring_registry::SubstringInfo> {
+    match inner {
+        VaultKind::Memory(v) => v.list_substrings(),
+        VaultKind::Filesystem(v) => v.list_substrings(),
+    }
+}
+
+fn build_substring_info_dict(
+    py: Python<'_>,
+    info: &sk::substring_registry::SubstringInfo,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("id", info.id)?;
+    dict.set_item("length", info.length)?;
+    dict.set_item("created_at", info.created_at.to_rfc3339())?;
+    dict.set_item("source_occurrences", info.source_occurrences)?;
+    Ok(dict.into())
+}
+
+fn build_substring_info_list(
+    py: Python<'_>,
+    infos: &[sk::substring_registry::SubstringInfo],
+) -> PyResult<PyObject> {
+    let list = PyList::empty_bound(py);
+    for info in infos {
+        list.append(build_substring_info_dict(py, info)?)?;
+    }
+    Ok(list.into())
+}
+
 async fn vault_find_near_duplicates(
     inner: &VaultKind,
     threshold: f64,
@@ -668,6 +709,57 @@ impl PyStowken {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let report = vault_reindex(&inner).await.map_err(py_err)?;
             Python::with_gil(|py| build_reindex_dict(py, &report))
+        })
+    }
+
+    // ── substrings (v0.5) ────────────────────────────────────────────────────
+
+    /// Discover and register high-frequency token-level substrings from
+    /// existing segments. Returns a list of dicts describing each
+    /// promoted substring (`{id, length, created_at, source_occurrences}`).
+    /// Future ingests use frame format `0x05` (substring references)
+    /// when it beats the baseline; old segments are unaffected.
+    #[pyo3(signature = (samples=500, min_occurrences=5))]
+    fn train_substrings(
+        &self,
+        py: Python<'_>,
+        samples: usize,
+        min_occurrences: u32,
+    ) -> PyResult<PyObject> {
+        let promoted = runtime()
+            .block_on(vault_train_substrings(&self.inner, samples, min_occurrences))
+            .map_err(py_err)?;
+        build_substring_info_list(py, &promoted)
+    }
+
+    #[pyo3(signature = (samples=500, min_occurrences=5))]
+    fn train_substrings_async<'py>(
+        &self,
+        py: Python<'py>,
+        samples: usize,
+        min_occurrences: u32,
+    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let promoted =
+                vault_train_substrings(&inner, samples, min_occurrences)
+                    .await
+                    .map_err(py_err)?;
+            Python::with_gil(|py| build_substring_info_list(py, &promoted))
+        })
+    }
+
+    /// List all registered substrings.
+    fn list_substrings(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let infos = vault_list_substrings(&self.inner);
+        build_substring_info_list(py, &infos)
+    }
+
+    fn list_substrings_async<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let infos = vault_list_substrings(&inner);
+            Python::with_gil(|py| build_substring_info_list(py, &infos))
         })
     }
 

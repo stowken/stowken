@@ -234,6 +234,27 @@ async def test_find_near_duplicates_async():
     assert len(clusters) >= 1
 
 
+# ── Substrings via async ───────────────────────────────────────────────────────
+
+def _drift_system_async(seed: int, length: int = 200) -> list:
+    tokens = list(range(length))
+    for i, p in enumerate([seed % length, (seed * 7) % length, (seed * 13) % length]):
+        tokens[p] = 90_000 + (seed * 17 + i * 11) % 5_000
+    return tokens
+
+
+@pytest.mark.asyncio
+async def test_train_substrings_async():
+    v = stowken.Stowken()
+    for i in range(30):
+        await v.store_async(make_token_conv(f"seed-{i}", _drift_system_async(i), [i]))
+    promoted = await v.train_substrings_async(samples=30, min_occurrences=5)
+    assert len(promoted) > 0
+
+    listed = await v.list_substrings_async()
+    assert len(listed) == len(promoted)
+
+
 # ── Mixing sync and async on the same vault ───────────────────────────────────
 
 @pytest.mark.asyncio

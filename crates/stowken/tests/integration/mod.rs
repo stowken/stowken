@@ -5,3 +5,4 @@ pub mod analytics;
 pub mod reindex;
 pub mod dict_rotation;
 pub mod near_dedup;
+pub mod substrings;

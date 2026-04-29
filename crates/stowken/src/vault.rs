@@ -17,6 +17,9 @@ use crate::{
     near_dedup::{self, MinHashSignature},
     segmenter::{Segmenter, SegmenterConfig, SegmenterError},
     storage::backend::{StorageBackend, StorageError},
+    substring_registry::{
+        hash_window, SubstringError, SubstringInfo, SubstringRegistry, MIN_LENGTH as SUBSTR_MIN_LEN,
+    },
     types::{
         AnalyticsQuery, Conversation, ConversationManifest, ExportConfig, ExportStats,
         NearDuplicateCluster, NearDuplicateVariant, RetrievedConversation, RetrievedSegment,
@@ -33,6 +36,77 @@ struct NearDedupOutcome {
     delta_frame: Vec<u8>,
 }
 
+/// Substring discovery on a sample of segments. For each MIN_LENGTH-token
+/// window, count distinct segments observed it (the same window appearing
+/// twice in one segment counts once). Promote windows that occurred in
+/// `min_occurrences` or more distinct segments.
+///
+/// Greedy left-to-right per segment so we don't double-count overlapping
+/// matches, and so the resulting promotions favour the highest-frequency
+/// canonical position. Emits each promoted window as a `MIN_LENGTH`-token
+/// substring; v0.5.x will extend promising windows outward.
+///
+/// Sync function (called from `tokio::task::spawn_blocking`) so it doesn't
+/// hold a runtime thread during the linear scan.
+fn discover_substrings(
+    samples: &[Vec<Token>],
+    min_occurrences: u32,
+    registry: &SubstringRegistry,
+) -> Result<Vec<SubstringInfo>, StowkenError> {
+    use std::collections::HashMap;
+
+    // First pass: count distinct segments per window hash.
+    // hash → (occurrences, prototype_tokens)
+    let mut counts: HashMap<u64, (u32, Vec<Token>)> = HashMap::new();
+    for sample in samples {
+        if sample.len() < SUBSTR_MIN_LEN {
+            continue;
+        }
+        // Per-segment dedup: a window seen multiple times in one segment
+        // shouldn't inflate the count.
+        let mut seen_this_segment: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
+        for start in 0..=sample.len() - SUBSTR_MIN_LEN {
+            let window = &sample[start..start + SUBSTR_MIN_LEN];
+            let h = hash_window(window);
+            if !seen_this_segment.insert(h) {
+                continue;
+            }
+            let entry = counts
+                .entry(h)
+                .or_insert_with(|| (0, window.to_vec()));
+            entry.0 += 1;
+        }
+    }
+
+    // Second pass: promote windows clearing the threshold. Skip ones that
+    // are already in the registry (e.g. from a previous train pass) — the
+    // registry's `register` would error, but we'd rather just no-op.
+    let mut promoted: Vec<SubstringInfo> = Vec::new();
+    let mut sorted: Vec<(u64, u32, Vec<Token>)> = counts
+        .into_iter()
+        .filter(|(_, (count, _))| *count >= min_occurrences)
+        .map(|(h, (count, tokens))| (h, count, tokens))
+        .collect();
+    // Highest-occurrence first so the most valuable substrings get
+    // registered first (and survive if we ever cap the registry).
+    sorted.sort_by_key(|t| std::cmp::Reverse(t.1));
+
+    for (_h, count, tokens) in sorted {
+        match registry.register(tokens, count) {
+            Ok(info) => promoted.push(info),
+            // A duplicate window registration shouldn't happen unless two
+            // distinct token sequences hash-collide — extremely rare with
+            // a 64-bit FNV-style hash on a real corpus, but safe to skip.
+            Err(SubstringError::TooShort(_)) => continue,
+            Err(SubstringError::Serialization(_)) => continue,
+            Err(other) => return Err(StowkenError::Substring(other)),
+        }
+    }
+
+    Ok(promoted)
+}
+
 /// Errors from vault operations.
 #[derive(Debug, Error)]
 pub enum StowkenError {
@@ -46,6 +120,8 @@ pub enum StowkenError {
     Compression(String),
     #[error("dictionary error: {0}")]
     Dict(#[from] DictError),
+    #[error("substring registry error: {0}")]
+    Substring(#[from] SubstringError),
     #[error("not enough segments to train a dictionary ({0} < {1} required)")]
     InsufficientTrainingSamples(usize, usize),
     #[error("export error: {0}")]
@@ -66,6 +142,10 @@ pub struct Stowken<B: StorageBackend> {
     /// Registry of zstd compression dictionaries. In-memory for `Stowken::new`;
     /// filesystem-backed (under `<dirname(db_path)>/dictionaries/`) for `Stowken::open`.
     dict_registry: Arc<DictRegistry>,
+    /// Registry of token-level substrings for v0.5 substring dedup.
+    /// In-memory for `Stowken::new`, file-backed under
+    /// `<dirname(db_path)>/substrings/` for `Stowken::open`.
+    substring_registry: Arc<SubstringRegistry>,
     segmenter_config: SegmenterConfig,
     tokenizer: Option<Arc<dyn TokenizerAdapter>>,
     /// Cached from StowkenConfig — threshold for near-dedup. None disables.
@@ -79,14 +159,17 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     pub async fn new(backend: B, config: StowkenConfig) -> Result<Self, StowkenError> {
         let index = MetadataIndex::open_in_memory()?;
         let dict_registry = Arc::new(DictRegistry::in_memory());
+        let substring_registry = Arc::new(SubstringRegistry::in_memory());
         let compressor = CompressionPipeline::new(config.enable_compression, 3)
-            .with_registry(Arc::clone(&dict_registry));
+            .with_registry(Arc::clone(&dict_registry))
+            .with_substring_registry(Arc::clone(&substring_registry));
         let near_dedup_threshold = config.near_dedup_threshold;
         Ok(Self {
             backend: Arc::new(backend),
             compressor,
             index,
             dict_registry,
+            substring_registry,
             segmenter_config: SegmenterConfig::default(),
             tokenizer: None,
             near_dedup_threshold,
@@ -98,20 +181,24 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     pub async fn open(backend: B, config: StowkenConfig, db_path: &str) -> Result<Self, StowkenError> {
         let index = MetadataIndex::open(db_path)?;
 
-        let dict_root = std::path::Path::new(db_path)
+        let parent = std::path::Path::new(db_path)
             .parent()
-            .map(|p| p.join("dictionaries"))
-            .unwrap_or_else(|| std::path::PathBuf::from("dictionaries"));
-        let dict_registry = Arc::new(DictRegistry::open(&dict_root)?);
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let dict_registry = Arc::new(DictRegistry::open(parent.join("dictionaries"))?);
+        let substring_registry =
+            Arc::new(SubstringRegistry::open(parent.join("substrings"))?);
 
         let compressor = CompressionPipeline::new(config.enable_compression, 3)
-            .with_registry(Arc::clone(&dict_registry));
+            .with_registry(Arc::clone(&dict_registry))
+            .with_substring_registry(Arc::clone(&substring_registry));
         let near_dedup_threshold = config.near_dedup_threshold;
         Ok(Self {
             backend: Arc::new(backend),
             compressor,
             index,
             dict_registry,
+            substring_registry,
             segmenter_config: SegmenterConfig::default(),
             tokenizer: None,
             near_dedup_threshold,
@@ -557,6 +644,97 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             .map_err(Into::into)
     }
 
+    // ── Substring management (v0.5) ────────────────────────────────────────
+
+    /// Result of a `train_substrings` pass.
+    pub fn substring_registry(&self) -> &Arc<SubstringRegistry> {
+        &self.substring_registry
+    }
+
+    /// All known substrings, in registration order.
+    pub fn list_substrings(&self) -> Vec<SubstringInfo> {
+        self.substring_registry.list()
+    }
+
+    /// Discover candidate substrings in `sample_count` recent segments,
+    /// filter by occurrence threshold, and register the survivors. Returns
+    /// the list of newly-registered substrings.
+    ///
+    /// Discovery is a fixed-window scan: every `MIN_LENGTH`-token window
+    /// across the sample is hashed; windows occurring in at least
+    /// `min_occurrences` distinct segments are promoted as substrings.
+    ///
+    /// New segments stored after this call automatically use the
+    /// registered substrings if the resulting `0x05` frame is smaller
+    /// than the baseline.
+    pub async fn train_substrings(
+        &self,
+        sample_count: usize,
+        min_occurrences: u32,
+    ) -> Result<Vec<SubstringInfo>, StowkenError> {
+        let samples = self.collect_substring_samples(sample_count).await?;
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // For each MIN_LENGTH-token window, count distinct segments
+        // observed it. We dedup within a single segment (a window seen
+        // 5x in one segment counts as 1 occurrence) by collecting per-
+        // segment hashes into a set first.
+        let registry = Arc::clone(&self.substring_registry);
+        let report = task::spawn_blocking(move || {
+            discover_substrings(&samples, min_occurrences, &registry)
+        })
+        .await
+        .map_err(|e| StowkenError::Internal(e.to_string()))??;
+
+        info!(
+            promoted = report.len(),
+            "trained substring registry"
+        );
+        Ok(report)
+    }
+
+    /// Pull at most `count` recent segments (decompressed) for substring
+    /// discovery. Skips delta segments — their tokens are derivable but
+    /// they're already a near-dedup variant, so promoting substrings from
+    /// them would double-count.
+    async fn collect_substring_samples(&self, count: usize) -> Result<Vec<Vec<Token>>, StowkenError> {
+        let query = AnalyticsQuery::default();
+        let ids = self.backend.list_conversations(&query, count as u64, 0).await?;
+
+        let mut samples: Vec<Vec<Token>> = Vec::with_capacity(count);
+        for id in &ids {
+            if samples.len() >= count {
+                break;
+            }
+            let manifest = match self.backend.get_manifest(id).await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            for seg_ref in &manifest.segments {
+                if samples.len() >= count {
+                    break;
+                }
+                let stored = match self.backend.get_segment(&seg_ref.hash).await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                if stored.compressed_data.first() == Some(&(FrameVersion::Delta as u8)) {
+                    continue;
+                }
+                let tokens = match self.decompress_segment_async(&stored.compressed_data).await {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if tokens.len() >= SUBSTR_MIN_LEN {
+                    samples.push(tokens);
+                }
+            }
+        }
+        Ok(samples)
+    }
+
     // ── Dictionary management ──────────────────────────────────────────────
 
     /// Minimum samples required to train a dictionary. The zstd builder
@@ -796,7 +974,19 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         total_compressed: &mut u64,
         total_raw: &mut u64,
     ) -> Result<(), StowkenError> {
-        let compressed = self.compress_tokens(&segment.tokens)?;
+        // Always start with the baseline frame (0x02 / 0x03 / 0x01).
+        let baseline = self.compress_tokens(&segment.tokens)?;
+        // Try the substring-frame path; keep it only if the result beats
+        // the baseline.
+        let compressed = match self
+            .compressor
+            .try_compress_substring_frame(&segment.tokens, baseline.len())
+            .map_err(|e| StowkenError::Compression(e.to_string()))?
+        {
+            Some(substring_frame) => substring_frame,
+            None => baseline,
+        };
+
         let raw_size = (segment.tokens.len() as u32) * 4;
         let compressed_size = compressed.len() as u32;
         *total_compressed += compressed_size as u64;

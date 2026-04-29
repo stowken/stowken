@@ -2,6 +2,45 @@
 
 For planned future work see [ROADMAP.md](ROADMAP.md). Items move from the roadmap to a version section in this file when they ship.
 
+## 0.5.0 — Unreleased *(in progress)*
+
+### Added — token-level shared-substring dedup
+
+The third and last of the three deferred-with-intent features from v0.1 returns. Long boilerplate that recurs across thousands of otherwise-distinct segments — "as a large language model, I cannot...", boilerplate disclaimers, RAG context fragments — is now promoted to shared blobs and replaced in segments by tiny references.
+
+- **New frame format `0x05`**: sequence of two ops, `Inline(tokens)` and `Ref(substring_id)`. Compact varint-encoded body. Decompression streams the ops, emitting inline tokens directly and resolving refs from the registry.
+- **`SubstringRegistry`** under `<vault-root>/substrings/{blobs.dat, index.json}`. **Packed-file storage** — substrings concatenate into one `blobs.dat` rather than one file per substring, so a registry of 3,000 typical 16-token substrings takes ~600 KB on disk instead of ~24 MB (the per-file approach paid 4 KiB cluster cost on each tiny file). In-memory cache is populated eagerly at open so the write hot path is a single hashmap lookup.
+- **`Stowken::train_substrings(samples, min_occurrences)`** discovers high-frequency MIN_LENGTH-token windows across a sample of stored segments and promotes those clearing the threshold. Subsequent `store()` calls automatically use registered substrings when the resulting `0x05` frame is smaller than the baseline; otherwise it falls back to `0x02`/`0x03`. Strict opt-in win — never net regression.
+- **`Stowken::list_substrings`** for inspection.
+- **CLI**: `stowken substrings train [--samples N] [--min-occurrences M]` and `stowken substrings list`. Both support `--json`.
+- **Python**: `vault.train_substrings(samples=500, min_occurrences=5)`, `vault.list_substrings()`, plus `_async` variants.
+- **Compression pipeline** holds an optional `Arc<SubstringRegistry>` and exposes `try_compress_substring_frame(tokens, fallback_len)` — returns `Some(frame)` only when a substring frame ends up smaller than `fallback_len`.
+
+### Measured impact
+
+On the synthetic large-segment drift corpus (1000 convs, 1000-token system prompts + 2000-token RAG with interpolated names):
+
+| Configuration | Stored | Saved vs incoming |
+|---|---:|---:|
+| Baseline (varint + zstd) | 4.9 MB | 58.8% |
+| `--near-dedup 0.85` | 3.5 MB | 71.0% |
+| `substrings train` | **2.5 MB** | **78.8%** |
+
+That's a 49% reduction in stored bytes vs. the baseline, on a corpus where the per-segment zstd context can't see across the many shared canonical fragments. Substrings catch what zstd misses.
+
+On OpenAssistant (1000 convs, genuinely unique crowd-sourced content) the cost model correctly promotes **zero** substrings — there's no recurring 16-token window worth promoting — and stored bytes match the baseline exactly. No regression on workloads without substring drift.
+
+### Not yet — deferred to v0.5.x
+
+- **Compaction pass** for retroactive rewrite of pre-train segments. Currently new ingests benefit; old segments are unaffected unless re-stored. The compaction has the largest correctness surface (atomic rewrites + ref-count migration + partial-failure recovery), so it gets its own focused milestone.
+- **Variable-length substring extension.** Discovery currently registers exactly `MIN_LENGTH`-token windows. Extending promising windows outward when the surrounding tokens also recur would tighten the registry and increase per-ref savings.
+- **GC of unused substrings.** Once a substring's only references are GC'd from the segments backend, the substring blob is currently kept. Add ref-count tracking + cleanup in v0.5.x.
+
+### Tests
+
+- 99 core (was 84, +9 substring registry + +6 substring frame) + **44** integration (was 37, +7 substring) + **14** CLI (unchanged) + **60** Python (was 55, +4 sync substring + +1 async substring) = **217 green** (was 191, +26).
+- Clippy clean across the workspace.
+
 ## 0.4.0 — Unreleased *(in progress)*
 
 ### Added — persistent MinHash near-duplicate detection

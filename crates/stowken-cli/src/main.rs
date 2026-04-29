@@ -53,6 +53,21 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum SubstringsAction {
+    /// Discover and register high-frequency token-level substrings.
+    Train {
+        /// Number of segments to sample for discovery.
+        #[arg(long, default_value_t = 500)]
+        samples: usize,
+        /// Minimum distinct-segment occurrences for a window to be promoted.
+        #[arg(long, default_value_t = 5)]
+        min_occurrences: u32,
+    },
+    /// List all registered substrings.
+    List,
+}
+
+#[derive(Subcommand)]
 enum DictAction {
     /// Train a new dictionary from existing segments. Without --activate the
     /// dict is registered but not used for new compressions.
@@ -176,6 +191,18 @@ enum Command {
     Dict {
         #[command(subcommand)]
         action: DictAction,
+    },
+
+    /// Manage shared token-level substrings for v0.5 substring dedup.
+    ///
+    /// Train discovers high-frequency token-level substrings across stored
+    /// segments and registers them as shared blobs. Future ingests use
+    /// frame format 0x05 (substring references) when it beats the
+    /// baseline. Old segments are unaffected; `compact` to retroactively
+    /// rewrite them lands in v0.5.x.
+    Substrings {
+        #[command(subcommand)]
+        action: SubstringsAction,
     },
 
     /// Audit unique system prompts by reference count (find prompt drift).
@@ -329,6 +356,9 @@ async fn main() -> Result<()> {
         }
         Command::Dict { action } => {
             cmd_dict(&data_dir, config, action, cli.json).await?;
+        }
+        Command::Substrings { action } => {
+            cmd_substrings(&data_dir, config, action, cli.json).await?;
         }
         Command::AuditSystemPrompts { min_refs, limit } => {
             cmd_audit_system_prompts(&data_dir, config, min_refs, limit, cli.json).await?;
@@ -909,6 +939,70 @@ async fn cmd_find_near_duplicates(
          often indicate prompt drift (interpolated values, formatting changes).",
         clusters.len()
     );
+    Ok(())
+}
+
+// ── Substrings ────────────────────────────────────────────────────────────────
+
+async fn cmd_substrings(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    action: SubstringsAction,
+    json: bool,
+) -> Result<()> {
+    let vault = open_vault(data_dir, config).await?;
+    match action {
+        SubstringsAction::Train { samples, min_occurrences } => {
+            let promoted = vault
+                .train_substrings(samples, min_occurrences)
+                .await
+                .context("training substrings")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&promoted)?);
+            } else {
+                println!(
+                    "Promoted {} substring(s) (sampled {} segments, min occurrences {}).",
+                    promoted.len(),
+                    samples,
+                    min_occurrences
+                );
+                if promoted.is_empty() {
+                    println!("Tip: try lowering --min-occurrences or sampling more segments.");
+                }
+            }
+        }
+        SubstringsAction::List => {
+            let listed = vault.list_substrings();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&listed)?);
+            } else if listed.is_empty() {
+                println!("No substrings registered for this vault.");
+            } else {
+                #[derive(Tabled)]
+                struct Row {
+                    #[tabled(rename = "ID")]
+                    id: u32,
+                    #[tabled(rename = "Length")]
+                    length: u32,
+                    #[tabled(rename = "Source occ.")]
+                    occurrences: u32,
+                    #[tabled(rename = "Created")]
+                    created: String,
+                }
+                let rows: Vec<Row> = listed
+                    .iter()
+                    .map(|s| Row {
+                        id: s.id,
+                        length: s.length,
+                        occurrences: s.source_occurrences,
+                        created: s.created_at.format("%Y-%m-%d %H:%M").to_string(),
+                    })
+                    .collect();
+                println!("{}", Table::new(rows));
+                println!("({} substring(s) total)", listed.len());
+            }
+        }
+    }
     Ok(())
 }
 

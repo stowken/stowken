@@ -69,6 +69,7 @@ pub mod index;
 pub mod near_dedup;
 pub mod segmenter;
 pub mod storage;
+pub mod substring_registry;
 pub mod tokenizer;
 pub mod types;
 pub mod vault;
