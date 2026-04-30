@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "stowken"
-version = "0.1.0"
+version = "0.5.1"
 description = "Compressed, deduplicated storage for LLM token sequences"
 requires-python = ">=3.8"
 classifiers = [

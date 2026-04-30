@@ -1392,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "stowken"
-version = "0.1.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "stowken-cli"
-version = "0.1.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "stowken-python"
-version = "0.1.0"
+version = "0.5.1"
 dependencies = [
  "chrono",
  "pyo3",
