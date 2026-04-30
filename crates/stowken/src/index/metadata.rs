@@ -204,6 +204,33 @@ impl MetadataIndex {
         Ok(())
     }
 
+    /// Every distinct segment hash currently tracked by the index.
+    /// Used by compaction and substring GC to walk the corpus.
+    pub fn all_segment_hashes(&self) -> MetadataResult<Vec<SegmentHash>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT hash FROM segments_meta")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().map(SegmentHash).collect())
+    }
+
+    /// Update the `compressed_size` of an existing segment without
+    /// touching ref_count or any other column. Used by compaction to
+    /// keep stats accurate after re-encoding.
+    pub fn update_segment_compressed_size(
+        &self,
+        hash: &SegmentHash,
+        new_size: u32,
+    ) -> MetadataResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE segments_meta SET compressed_size = ?1 WHERE hash = ?2",
+            params![new_size as i64, hash.0],
+        )?;
+        Ok(())
+    }
+
     /// Increment ref_count for an existing segment.
     pub fn increment_ref(&self, hash: &SegmentHash) -> MetadataResult<()> {
         let conn = self.conn.lock().unwrap();

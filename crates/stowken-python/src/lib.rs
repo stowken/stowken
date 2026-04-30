@@ -353,6 +353,24 @@ async fn vault_train_substrings(
     }
 }
 
+async fn vault_compact_substrings(
+    inner: &VaultKind,
+) -> Result<sk::types::SubstringCompactStats, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.compact_substrings().await,
+        VaultKind::Filesystem(v) => v.compact_substrings().await,
+    }
+}
+
+async fn vault_gc_substrings(
+    inner: &VaultKind,
+) -> Result<sk::types::SubstringGcStats, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.gc_substrings().await,
+        VaultKind::Filesystem(v) => v.gc_substrings().await,
+    }
+}
+
 fn vault_list_substrings(inner: &VaultKind) -> Vec<sk::substring_registry::SubstringInfo> {
     match inner {
         VaultKind::Memory(v) => v.list_substrings(),
@@ -760,6 +778,70 @@ impl PyStowken {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let infos = vault_list_substrings(&inner);
             Python::with_gil(|py| build_substring_info_list(py, &infos))
+        })
+    }
+
+    /// Retroactively rewrite pre-train segments to use the substring
+    /// registry. Returns a dict with ``segments_examined``,
+    /// ``segments_rewritten``, ``bytes_saved``, and ``segments_skipped``.
+    fn compact_substrings(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let report = runtime()
+            .block_on(vault_compact_substrings(&self.inner))
+            .map_err(py_err)?;
+        let dict = PyDict::new_bound(py);
+        dict.set_item("segments_examined", report.segments_examined)?;
+        dict.set_item("segments_rewritten", report.segments_rewritten)?;
+        dict.set_item("bytes_saved", report.bytes_saved)?;
+        dict.set_item("segments_skipped", report.segments_skipped)?;
+        Ok(dict.into())
+    }
+
+    fn compact_substrings_async<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let report = vault_compact_substrings(&inner).await.map_err(py_err)?;
+            Python::with_gil(|py| {
+                let dict = PyDict::new_bound(py);
+                dict.set_item("segments_examined", report.segments_examined)?;
+                dict.set_item("segments_rewritten", report.segments_rewritten)?;
+                dict.set_item("bytes_saved", report.bytes_saved)?;
+                dict.set_item("segments_skipped", report.segments_skipped)?;
+                Ok::<PyObject, PyErr>(dict.into())
+            })
+        })
+    }
+
+    /// Drop substrings from the registry that no `0x05` frame
+    /// references anymore. Returns a dict with ``registry_size_before``,
+    /// ``registry_size_after``, ``substrings_dropped``.
+    fn gc_substrings(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let report = runtime()
+            .block_on(vault_gc_substrings(&self.inner))
+            .map_err(py_err)?;
+        let dict = PyDict::new_bound(py);
+        dict.set_item("registry_size_before", report.registry_size_before)?;
+        dict.set_item("registry_size_after", report.registry_size_after)?;
+        dict.set_item("substrings_dropped", report.substrings_dropped)?;
+        Ok(dict.into())
+    }
+
+    fn gc_substrings_async<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let report = vault_gc_substrings(&inner).await.map_err(py_err)?;
+            Python::with_gil(|py| {
+                let dict = PyDict::new_bound(py);
+                dict.set_item("registry_size_before", report.registry_size_before)?;
+                dict.set_item("registry_size_after", report.registry_size_after)?;
+                dict.set_item("substrings_dropped", report.substrings_dropped)?;
+                Ok::<PyObject, PyErr>(dict.into())
+            })
         })
     }
 

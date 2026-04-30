@@ -52,7 +52,7 @@ Everything currently in the repo: segmentation, exact dedup, varint+zstd, frame 
 
 ---
 
-## v0.5 — Token-level shared-substring dedup *(complete in v0.5.0; compaction deferred)*
+## v0.5 — Token-level shared-substring dedup *(complete)*
 
 **Theme:** extract savings from sub-segment repetition. The most ambitious of the three.
 
@@ -61,11 +61,11 @@ Everything currently in the repo: segmentation, exact dedup, varint+zstd, frame 
 - [x] **Reference-by-substring frame format.** *Shipped: new frame byte `0x05` with `Inline(tokens)` and `Ref(substring_id)` ops, varint-encoded.*
 - [x] **Substring registry.** *Shipped under `<vault-root>/substrings/{blobs.dat, index.json}`. Packed-file storage (one concatenated blob, not a file per substring) so a 3,000-substring registry costs ~600 KB instead of ~24 MB. In-memory cache populated eagerly at open.*
 - [x] **Backwards-compatible retrieval.** *Shipped: frames written before substring promotion stay readable forever. The vault's substring-aware compress only runs at write time.*
-- [ ] **Optional compaction job.** *Deferred to v0.5.x. Largest correctness surface (atomic rewrites + ref-count migration + partial-failure recovery) — gets its own focused milestone.*
-- [ ] **Substring GC.** *Deferred to v0.5.x. Once a substring's last referencing segment is GC'd, its blob should be reclaimable. Needs ref-count tracking on substring usage.*
-- [ ] **Variable-length substring extension.** *Deferred — discovery currently registers fixed `MIN_LENGTH`-token windows. Extending outward when surrounding tokens also recur would tighten the registry.*
+- [x] **Optional compaction job.** *Shipped in v0.5.1: `stowken substrings compact` walks every segment, decompresses, retries the substring path, and replaces the stored bytes when smaller. Atomic per-segment via `StorageBackend::replace_segment_data`. Skips 0x04 and 0x05 frames (already in their final form).*
+- [x] **Substring GC.** *Shipped in v0.5.1: `stowken substrings gc` walks every segment, decodes 0x05 frames to collect referenced substring ids, and prunes the registry. Atomic packed-file rebuild via `SubstringRegistry::retain`.*
+- [ ] **Variable-length substring extension.** *Deferred — discovery currently registers fixed `MIN_LENGTH`-token windows. Extending outward when surrounding tokens also recur would tighten the registry. Optimization, not a correctness gap.*
 
-**Value (measured):** on the synthetic large-segment drift corpus, substrings push savings from 58.8% (baseline) to **78.8%** (+20pp). On OpenAssistant the cost-model promotes zero substrings — no regression on workloads without genuine substring drift.
+**Value (measured):** on the synthetic large-segment drift corpus, substrings push savings from 58.8% (baseline) to **78.8%** (`train` only) to **83.8%** (`train` + `compact` for retroactive rewrite of existing data). On OpenAssistant the cost-model promotes zero substrings — no regression on workloads without genuine substring drift.
 
 ---
 

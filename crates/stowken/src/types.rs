@@ -300,6 +300,31 @@ pub struct ReindexStats {
     pub segments_missing: u64,
 }
 
+/// Result of a substring compaction pass.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubstringCompactStats {
+    /// Distinct segments examined.
+    pub segments_examined: u64,
+    /// Segments rewritten to use the substring registry.
+    pub segments_rewritten: u64,
+    /// Total bytes saved across all rewrites (`old - new`, summed).
+    pub bytes_saved: u64,
+    /// Segments skipped because they're already 0x04 (delta) or 0x05
+    /// (substring) frames and shouldn't be re-encoded.
+    pub segments_skipped: u64,
+}
+
+/// Result of a substring GC pass.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubstringGcStats {
+    /// Substrings examined in the registry.
+    pub registry_size_before: u64,
+    /// Substrings still referenced after the scan.
+    pub registry_size_after: u64,
+    /// Substrings dropped from the registry.
+    pub substrings_dropped: u64,
+}
+
 /// One canonical-and-its-near-duplicates cluster surfaced by
 /// `find_near_duplicates`. The canonical has the highest reference count
 /// in the cluster; variants are ordered by similarity descending.

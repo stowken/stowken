@@ -65,6 +65,15 @@ enum SubstringsAction {
     },
     /// List all registered substrings.
     List,
+    /// Retroactively rewrite pre-train segments to use the substring
+    /// registry. Walks every segment, decompresses it, tries `0x05`
+    /// encoding, and replaces the stored bytes when smaller.
+    /// Skips delta (0x04) and already-substring (0x05) frames.
+    Compact,
+    /// Drop substrings from the registry whose only references in any
+    /// 0x05 frame have been deleted. Walks every segment to compute the
+    /// reference set, then prunes the registry.
+    Gc,
 }
 
 #[derive(Subcommand)]
@@ -969,6 +978,48 @@ async fn cmd_substrings(
                 if promoted.is_empty() {
                     println!("Tip: try lowering --min-occurrences or sampling more segments.");
                 }
+            }
+        }
+        SubstringsAction::Compact => {
+            let report = vault
+                .compact_substrings()
+                .await
+                .context("compacting segments to use substring registry")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Compaction: examined {} segment(s), rewrote {}, skipped {} \
+                     ({} delta or already-substring), saved {}.",
+                    report.segments_examined,
+                    report.segments_rewritten,
+                    report.segments_skipped,
+                    report.segments_skipped,
+                    format_bytes(report.bytes_saved),
+                );
+                if report.segments_rewritten == 0 && report.segments_examined > 0 {
+                    println!(
+                        "No segments benefited from substring encoding. \
+                         Tip: train substrings first (`stowken substrings train`) \
+                         or check that your corpus has structural repetition."
+                    );
+                }
+            }
+        }
+        SubstringsAction::Gc => {
+            let report = vault
+                .gc_substrings()
+                .await
+                .context("gc'ing unreferenced substrings")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Substring GC: registry had {} substring(s), {} dropped, {} remaining.",
+                    report.registry_size_before,
+                    report.substrings_dropped,
+                    report.registry_size_after,
+                );
             }
         }
         SubstringsAction::List => {

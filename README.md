@@ -15,6 +15,7 @@ It depends on how much your traffic repeats. To make this concrete, here are two
 | **Drift workload, baseline** (1000 convs, 1K-token system prompts with interpolated names + RAG) | 1,000 | 3.12M | 11.9 MB | 4.9 MB | 58.8% |
 | **Drift workload, `--near-dedup 0.85`** | 1,000 | 3.12M | 11.9 MB | 3.5 MB | **71.0%** (+12 pp) |
 | **Drift workload, `substrings train`** | 1,000 | 3.12M | 11.9 MB | 2.5 MB | **78.8%** (+20 pp) |
+| **Drift workload, train + `substrings compact`** (retroactive rewrite) | 1,000 | 3.12M | 11.9 MB | 1.9 MB | **83.8%** (+25 pp) |
 
 Real production usage lands somewhere along this spectrum depending on:
 - How much your system prompts and RAG contexts are reused **byte-for-byte** (exact dedup wins here)
@@ -216,6 +217,8 @@ stowken find-near-duplicates --threshold 0.85    # surface drift clusters
 # Token-level shared-substring dedup (v0.5; off until trained)
 stowken substrings train --samples 500           # discover + register substrings
 stowken substrings list                          # inspect the registry
+stowken substrings compact                       # retroactively rewrite pre-train segments
+stowken substrings gc                            # drop unreferenced substrings
 ```
 
 ---

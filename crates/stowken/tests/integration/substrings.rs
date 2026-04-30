@@ -304,3 +304,215 @@ async fn empty_corpus_train_returns_empty() {
     assert!(promoted.is_empty());
     assert_eq!(vault.list_substrings().len(), 0);
 }
+
+#[tokio::test]
+async fn compact_rewrites_pre_train_segments() {
+    let vault = Stowken::new(MemoryBackend::new(), StowkenConfig::default())
+        .await
+        .unwrap();
+
+    // Ingest 30 drift conversations BEFORE training. These segments will
+    // be 0x02 frames at first.
+    let pre_tokens: Vec<Vec<u32>> = (0..30u32).map(|i| make_drift_system(i, 250)).collect();
+    for (i, sys) in pre_tokens.iter().enumerate() {
+        vault
+            .store(make_conv(&format!("pre-{i}"), sys.clone(), vec![100 + i as u32]))
+            .await
+            .unwrap();
+    }
+
+    let pre_compaction_storage = vault.stats().await.unwrap().storage_bytes;
+    vault.train_substrings(30, 5).await.unwrap();
+
+    // After training, no segments are rewritten yet — only new ingests
+    // would use the registry. Storage should be unchanged.
+    let mid_storage = vault.stats().await.unwrap().storage_bytes;
+    assert_eq!(mid_storage, pre_compaction_storage, "training shouldn't rewrite existing segments");
+
+    // Compact rewrites the existing segments where it's a win.
+    let report = vault.compact_substrings().await.unwrap();
+    assert!(report.segments_rewritten > 0, "expected at least one rewrite on a drift corpus");
+    assert!(report.bytes_saved > 0);
+
+    let post_storage = vault.stats().await.unwrap().storage_bytes;
+    assert!(
+        post_storage < pre_compaction_storage,
+        "compaction should reduce storage; before={pre_compaction_storage} after={post_storage}"
+    );
+
+    // Round-trip every original conversation — compaction must not
+    // change tokens, only their on-disk encoding.
+    for (i, original) in pre_tokens.iter().enumerate() {
+        let r = vault.retrieve(&format!("pre-{i}")).await.unwrap();
+        let sys = r
+            .segments
+            .iter()
+            .find(|s| matches!(s.segment_type, stowken::types::SegmentType::SystemPrompt))
+            .unwrap();
+        assert_eq!(&sys.tokens, original, "compaction corrupted segment {i}");
+    }
+}
+
+#[tokio::test]
+async fn compact_skips_delta_and_substring_frames() {
+    // Compaction must skip 0x04 (delta) and 0x05 (already-substring)
+    // frames — re-encoding them would either lose information or be a
+    // no-op that wastes work.
+    let vault = Stowken::new(
+        MemoryBackend::new(),
+        StowkenConfig {
+            enable_compression: true,
+            near_dedup_threshold: Some(0.80),
+        },
+    )
+    .await
+    .unwrap();
+
+    // Seed with a canonical and a near-variant (the variant becomes a 0x04 frame).
+    let canon: Vec<u32> = (0..200u32).collect();
+    let mut variant = canon.clone();
+    variant[10] = 99_999;
+    variant[100] = 88_888;
+    vault.store(make_conv("canon", canon.clone(), vec![1])).await.unwrap();
+    vault.store(make_conv("variant", variant.clone(), vec![2])).await.unwrap();
+
+    // Add some drift segments and train substrings. After training,
+    // store one more conversation that should produce a 0x05 frame.
+    for i in 0..30u32 {
+        vault
+            .store(make_conv(&format!("drift-{i}"), make_drift_system(i, 250), vec![100 + i]))
+            .await
+            .unwrap();
+    }
+    vault.train_substrings(30, 5).await.unwrap();
+    vault
+        .store(make_conv("substr", make_drift_system(999, 250), vec![3]))
+        .await
+        .unwrap();
+
+    // Now compact. Any 0x04 / 0x05 frame should be skipped, not
+    // rewritten or corrupted.
+    let report = vault.compact_substrings().await.unwrap();
+    assert!(report.segments_skipped >= 1, "expected at least one skip");
+
+    // Round-trip the variant (0x04) and the substring-encoded segment
+    // (0x05) to confirm they're intact.
+    let v = vault.retrieve("variant").await.unwrap();
+    let v_sys = v
+        .segments
+        .iter()
+        .find(|s| matches!(s.segment_type, stowken::types::SegmentType::SystemPrompt))
+        .unwrap();
+    assert_eq!(v_sys.tokens, variant);
+
+    let s = vault.retrieve("substr").await.unwrap();
+    let s_sys = s
+        .segments
+        .iter()
+        .find(|s| matches!(s.segment_type, stowken::types::SegmentType::SystemPrompt))
+        .unwrap();
+    assert_eq!(s_sys.tokens, make_drift_system(999, 250));
+}
+
+#[tokio::test]
+async fn gc_drops_unreferenced_substrings() {
+    let vault = Stowken::new(MemoryBackend::new(), StowkenConfig::default())
+        .await
+        .unwrap();
+
+    // Train on a focused drift corpus → registry will have several
+    // substrings, all referenced by the post-training ingests.
+    for i in 0..30u32 {
+        vault
+            .store(make_conv(&format!("seed-{i}"), make_drift_system(i, 250), vec![i]))
+            .await
+            .unwrap();
+    }
+    vault.train_substrings(30, 5).await.unwrap();
+    let before = vault.list_substrings().len() as u64;
+    assert!(before > 0);
+
+    // No 0x05 frames exist yet (training doesn't rewrite). All
+    // substrings are unreferenced — GC should drop everything.
+    let report = vault.gc_substrings().await.unwrap();
+    assert_eq!(report.registry_size_before, before);
+    assert_eq!(report.registry_size_after, 0);
+    assert_eq!(report.substrings_dropped, before);
+    assert_eq!(vault.list_substrings().len(), 0);
+}
+
+#[tokio::test]
+async fn gc_after_compaction_keeps_referenced_substrings() {
+    let vault = Stowken::new(MemoryBackend::new(), StowkenConfig::default())
+        .await
+        .unwrap();
+
+    for i in 0..30u32 {
+        vault
+            .store(make_conv(&format!("seed-{i}"), make_drift_system(i, 250), vec![i]))
+            .await
+            .unwrap();
+    }
+    vault.train_substrings(30, 5).await.unwrap();
+    vault.compact_substrings().await.unwrap();
+
+    let before = vault.list_substrings().len() as u64;
+    let report = vault.gc_substrings().await.unwrap();
+
+    // After compaction, at least some substrings are referenced by
+    // 0x05 frames and shouldn't be dropped. Some may still be unused
+    // (rejected by the cost-model fallback during compact).
+    assert!(report.registry_size_after > 0, "compacted segments should keep at least some substrings alive");
+    assert_eq!(
+        report.registry_size_before,
+        before,
+        "registry size before should match list_substrings"
+    );
+}
+
+#[tokio::test]
+async fn gc_persistence_across_reopen() {
+    use std::path::PathBuf;
+    use stowken::storage::FilesystemBackend;
+
+    let dir = TempDir::new().unwrap();
+    let data_path: PathBuf = dir.path().to_path_buf();
+    let db_path = data_path.join("metadata.db");
+    let db_str = db_path.to_str().unwrap().to_owned();
+
+    {
+        let backend = FilesystemBackend::new(&data_path).await.unwrap();
+        let vault = Stowken::open(backend, StowkenConfig::default(), &db_str)
+            .await
+            .unwrap();
+        for i in 0..30u32 {
+            vault
+                .store(make_conv(
+                    &format!("seed-{i}"),
+                    make_drift_system(i, 250),
+                    vec![i],
+                ))
+                .await
+                .unwrap();
+        }
+        vault.train_substrings(30, 5).await.unwrap();
+        vault.compact_substrings().await.unwrap();
+        let _ = vault.gc_substrings().await.unwrap();
+    }
+
+    // Reopen and confirm the surviving substrings are still loaded
+    // from disk and the substring-encoded segments still round-trip.
+    let backend = FilesystemBackend::new(&data_path).await.unwrap();
+    let vault = Stowken::open(backend, StowkenConfig::default(), &db_str)
+        .await
+        .unwrap();
+
+    // Random sample: pick a stored conversation and round-trip it.
+    let r = vault.retrieve("seed-7").await.unwrap();
+    let sys = r
+        .segments
+        .iter()
+        .find(|s| matches!(s.segment_type, stowken::types::SegmentType::SystemPrompt))
+        .unwrap();
+    assert_eq!(sys.tokens, make_drift_system(7, 250));
+}

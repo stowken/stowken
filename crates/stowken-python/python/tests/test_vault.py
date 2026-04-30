@@ -464,6 +464,45 @@ class TestSubstrings:
             v2 = stowken.Stowken.open(data_dir)
             assert len(v2.list_substrings()) == count
 
+    def test_compact_rewrites_existing_segments(self):
+        v = stowken.Stowken()
+        # Store BEFORE training — these become 0x02 frames.
+        pre = [_drift_system(i, 250) for i in range(30)]
+        for i, sys in enumerate(pre):
+            v.store(make_token_conv(f"pre-{i}", sys, [100 + i]))
+
+        before = v.stats().storage_bytes
+        v.train_substrings(samples=30, min_occurrences=5)
+        # Training alone shouldn't change stored bytes.
+        assert v.stats().storage_bytes == before
+
+        report = v.compact_substrings()
+        assert report["segments_examined"] >= 30
+        assert report["segments_rewritten"] > 0
+        assert report["bytes_saved"] > 0
+
+        after = v.stats().storage_bytes
+        assert after < before, "compaction must reduce storage"
+
+        # Round-trip every original.
+        for i, sys in enumerate(pre):
+            r = v.retrieve(f"pre-{i}")
+            sys_seg = next(s for s in r["segments"] if s["segment_type"] == "system_prompt")
+            assert sys_seg["tokens"] == sys
+
+    def test_gc_drops_unreferenced_substrings(self):
+        v = stowken.Stowken()
+        for i in range(30):
+            v.store(make_token_conv(f"seed-{i}", _drift_system(i, 250), [i]))
+        v.train_substrings(samples=30, min_occurrences=5)
+        before = len(v.list_substrings())
+        assert before > 0
+        # No 0x05 frames yet — every substring is unreferenced.
+        report = v.gc_substrings()
+        assert report["registry_size_before"] == before
+        assert report["registry_size_after"] == 0
+        assert report["substrings_dropped"] == before
+
 
 # ── Near-duplicate detection ──────────────────────────────────────────────────
 

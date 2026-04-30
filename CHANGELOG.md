@@ -2,6 +2,34 @@
 
 For planned future work see [ROADMAP.md](ROADMAP.md). Items move from the roadmap to a version section in this file when they ship.
 
+## 0.5.1 — Unreleased *(in progress)*
+
+### Added — substring compaction & GC
+
+The two pieces v0.5.0 deferred. Together they close the substring story: pre-train segments now get the substring win retroactively, and dead substrings get cleaned up.
+
+- **`stowken substrings compact`** + **`Stowken::compact_substrings`** + Python `vault.compact_substrings()` (sync + async). Walks every unique segment in the index, decompresses to native tokens, tries `0x05` encoding, and replaces the stored bytes when smaller. Atomic per-segment via the new `StorageBackend::replace_segment_data`. Skips `0x04` (delta) and `0x05` (already-substring) frames — they aren't candidates.
+- **`stowken substrings gc`** + **`Stowken::gc_substrings`** + Python `vault.gc_substrings()` (sync + async). Walks every segment, decodes any `0x05` frame to collect referenced substring ids, and prunes the registry. Returns `{registry_size_before, registry_size_after, substrings_dropped}`.
+- **`SubstringRegistry::retain`** — atomic packed-file rebuild. The kept substrings are re-concatenated into a new `blobs.dat`; the new `index.json` is renamed atomically over the old one. A crash mid-rebuild leaves the old blobs.dat in place; the index.json rename is the commit point.
+- **`StorageBackend::replace_segment_data`** — overwrite a segment's compressed bytes without touching ref_count. Atomic-ish (tmp-file rename) on FilesystemBackend; trivial on MemoryBackend. Used by compaction to keep pre-train segments' hash and ref-count stable while updating their on-disk encoding.
+- **`MetadataIndex::update_segment_compressed_size`** + **`all_segment_hashes`** — small bookkeeping helpers used by compaction and GC.
+
+### Measured impact
+
+Same drift corpus as v0.5.0, with `compact` after `train`:
+
+| Configuration | Stored | Saved |
+|---|---:|---:|
+| baseline (varint + zstd) | 4.9 MB | 58.8% |
+| `substrings train` (new ingests only) | 2.5 MB | 78.8% (+20 pp) |
+| `substrings train` + `compact` (retroactive) | **1.9 MB** | **83.8%** (+25 pp) |
+
+3.0 MB freed by compaction on this corpus — `Compaction: examined 3000 segment(s), rewrote 2000, skipped 0`. Round-trip verified on every rewritten segment.
+
+### Tests
+
+- 99 core (unchanged) + **49** integration (was 44, +5 compact + GC) + **14** CLI (unchanged) + **63** Python (was 60, +3 compact + GC sync/async) = **225 green** (was 217, +8). Clippy clean.
+
 ## 0.5.0 — Unreleased *(in progress)*
 
 ### Added — token-level shared-substring dedup

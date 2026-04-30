@@ -646,6 +646,171 @@ impl<B: StorageBackend + 'static> Stowken<B> {
 
     // ── Substring management (v0.5) ────────────────────────────────────────
 
+    /// Retroactively rewrite pre-train segments to use the substring
+    /// registry. Walks every unique segment in the index, decompresses
+    /// it, tries `0x05` encoding, and replaces the stored bytes if the
+    /// substring frame is smaller. Skips `0x04` (delta) and `0x05`
+    /// (already-substring) frames.
+    ///
+    /// Atomic per-segment via the backend's `replace_segment_data`. A
+    /// crash mid-compaction leaves each segment in either old or new
+    /// form — both decompressible. The metadata index's
+    /// `compressed_size` is updated after each replace, so stats
+    /// remain consistent.
+    pub async fn compact_substrings(&self) -> Result<crate::types::SubstringCompactStats, StowkenError> {
+        if self.substring_registry.is_empty() {
+            return Ok(crate::types::SubstringCompactStats {
+                segments_examined: 0,
+                segments_rewritten: 0,
+                bytes_saved: 0,
+                segments_skipped: 0,
+            });
+        }
+
+        let hashes = self.list_all_segment_hashes().await?;
+
+        let mut examined = 0u64;
+        let mut rewritten = 0u64;
+        let mut skipped = 0u64;
+        let mut bytes_saved: u64 = 0;
+
+        for hash in hashes {
+            examined += 1;
+            let stored = match self.backend.get_segment(&hash).await {
+                Ok(s) => s,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            // Skip 0x04 (delta) and 0x05 (already substring-encoded)
+            // frames. 0x04 frames hold edit scripts against another
+            // canonical, not native tokens — re-encoding them as 0x05
+            // would be conceptually wrong. 0x05 frames are already in
+            // their final form.
+            let first_byte = match stored.compressed_data.first() {
+                Some(&b) => b,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if first_byte == FrameVersion::Delta as u8
+                || first_byte == FrameVersion::Substring as u8
+            {
+                skipped += 1;
+                continue;
+            }
+
+            // Decompress to native tokens and try the substring path.
+            let tokens = self
+                .decompress_segment_async(&stored.compressed_data)
+                .await?;
+            let baseline_len = stored.compressed_data.len();
+            let new_frame = match self
+                .compressor
+                .try_compress_substring_frame(&tokens, baseline_len)
+                .map_err(|e| StowkenError::Compression(e.to_string()))?
+            {
+                Some(frame) => frame,
+                None => continue, // not a win — leave the segment alone
+            };
+
+            let saved = (baseline_len - new_frame.len()) as u64;
+            let new_size = new_frame.len() as u32;
+            self.backend.replace_segment_data(&hash, new_frame).await?;
+
+            // Keep the metadata index in sync with the on-disk size.
+            let index = self.index.clone();
+            let h = hash.clone();
+            task::spawn_blocking(move || index.update_segment_compressed_size(&h, new_size))
+                .await
+                .map_err(|e| StowkenError::Internal(e.to_string()))??;
+
+            rewritten += 1;
+            bytes_saved += saved;
+        }
+
+        info!(
+            examined,
+            rewritten,
+            skipped,
+            bytes_saved,
+            "compacted segments to use substring registry"
+        );
+        Ok(crate::types::SubstringCompactStats {
+            segments_examined: examined,
+            segments_rewritten: rewritten,
+            bytes_saved,
+            segments_skipped: skipped,
+        })
+    }
+
+    /// Drop substrings from the registry that are no longer referenced
+    /// by any `0x05` frame in the backend. Walks every segment, decodes
+    /// any `0x05` frame to collect referenced substring ids, then
+    /// retains only those in the registry.
+    pub async fn gc_substrings(&self) -> Result<crate::types::SubstringGcStats, StowkenError> {
+        let before = self.substring_registry.len() as u64;
+        if before == 0 {
+            return Ok(crate::types::SubstringGcStats {
+                registry_size_before: 0,
+                registry_size_after: 0,
+                substrings_dropped: 0,
+            });
+        }
+
+        // Collect every substring id referenced by a 0x05 frame.
+        let hashes = self.list_all_segment_hashes().await?;
+        let mut referenced: std::collections::HashSet<crate::substring_registry::SubstringId> =
+            std::collections::HashSet::new();
+        for hash in hashes {
+            let stored = match self.backend.get_segment(&hash).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if stored.compressed_data.first() != Some(&(FrameVersion::Substring as u8)) {
+                continue;
+            }
+            // Body starts at byte 1 (skip version tag).
+            let ops = match crate::compression::decode_substring_frame(&stored.compressed_data[1..]) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            for op in ops {
+                if let crate::compression::SubstringOp::Ref(id) = op {
+                    referenced.insert(id);
+                }
+            }
+        }
+
+        let dropped = self.substring_registry.retain(&referenced)?;
+        let after = self.substring_registry.len() as u64;
+
+        info!(
+            before,
+            after,
+            dropped,
+            "garbage-collected substring registry"
+        );
+        Ok(crate::types::SubstringGcStats {
+            registry_size_before: before,
+            registry_size_after: after,
+            substrings_dropped: dropped,
+        })
+    }
+
+    /// Helper: every distinct segment hash known to the metadata index.
+    async fn list_all_segment_hashes(&self) -> Result<Vec<SegmentHash>, StowkenError> {
+        let index = self.index.clone();
+        task::spawn_blocking(move || index.all_segment_hashes())
+            .await
+            .map_err(|e| StowkenError::Internal(e.to_string()))?
+            .map_err(Into::into)
+    }
+
+
     /// Result of a `train_substrings` pass.
     pub fn substring_registry(&self) -> &Arc<SubstringRegistry> {
         &self.substring_registry

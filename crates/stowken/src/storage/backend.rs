@@ -50,6 +50,20 @@ pub trait StorageBackend: Send + Sync {
     /// Increment the reference count of an existing segment.
     async fn increment_ref(&self, hash: &SegmentHash) -> StorageResult<()>;
 
+    /// Replace the compressed bytes of an existing segment without
+    /// touching its `ref_count`. Used by `compact_substrings` to
+    /// rewrite pre-train segments to use the substring registry.
+    ///
+    /// Atomicity: implementations must update the data and any
+    /// metadata sidecar consistently. A crash mid-replace must leave
+    /// the segment in either the old or new form — both decompressible
+    /// since the frame version byte dispatches per-frame.
+    async fn replace_segment_data(
+        &self,
+        hash: &SegmentHash,
+        new_data: Vec<u8>,
+    ) -> StorageResult<()>;
+
     /// Decrement the reference count. Returns `true` if `ref_count` reaches 0
     /// (segment is eligible for garbage collection).
     async fn decrement_ref(&self, hash: &SegmentHash) -> StorageResult<bool>;

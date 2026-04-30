@@ -255,6 +255,23 @@ async def test_train_substrings_async():
     assert len(listed) == len(promoted)
 
 
+@pytest.mark.asyncio
+async def test_compact_and_gc_substrings_async():
+    v = stowken.Stowken()
+    for i in range(30):
+        await v.store_async(make_token_conv(f"seed-{i}", _drift_system_async(i), [i]))
+    await v.train_substrings_async(samples=30, min_occurrences=5)
+
+    before = (await v.stats_async()).storage_bytes
+    report = await v.compact_substrings_async()
+    assert report["segments_rewritten"] > 0
+    assert (await v.stats_async()).storage_bytes < before
+
+    gc_report = await v.gc_substrings_async()
+    # After compact, at least some substrings should still be referenced.
+    assert gc_report["registry_size_after"] > 0
+
+
 # ── Mixing sync and async on the same vault ───────────────────────────────────
 
 @pytest.mark.asyncio

@@ -57,6 +57,21 @@ impl StorageBackend for MyBackend {
         }
     }
 
+    async fn replace_segment_data(
+        &self,
+        hash: &SegmentHash,
+        new_data: Vec<u8>,
+    ) -> StorageResult<()> {
+        let mut map = self.segments.write().await;
+        if let Some(seg) = map.get_mut(&hash.0) {
+            seg.compressed_size = new_data.len() as u32;
+            seg.compressed_data = new_data;
+            Ok(())
+        } else {
+            Err(StorageError::SegmentNotFound(hash.0.clone()))
+        }
+    }
+
     async fn decrement_ref(&self, hash: &SegmentHash) -> StorageResult<bool> {
         let mut map = self.segments.write().await;
         if let Some(seg) = map.get_mut(&hash.0) {

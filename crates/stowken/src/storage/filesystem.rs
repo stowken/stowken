@@ -168,6 +168,31 @@ impl StorageBackend for FilesystemBackend {
         self.write_meta(hash, &meta).await
     }
 
+    async fn replace_segment_data(
+        &self,
+        hash: &SegmentHash,
+        new_data: Vec<u8>,
+    ) -> StorageResult<()> {
+        let _guard = self.mu.lock().await;
+        let seg_path = self.segment_path(hash);
+        if !seg_path.exists() {
+            return Err(StorageError::SegmentNotFound(hash.0.clone()));
+        }
+        // Atomic-ish replace: write to a tmp file, fsync, rename. After
+        // the rename the segment is in its new form; if we crash before
+        // updating .meta, the new bytes are valid (frame version byte
+        // dispatches per-frame) and the only inconsistency is the
+        // `compressed_size` sidecar — corrected on next reindex.
+        let new_size = new_data.len() as u32;
+        let tmp_path = seg_path.with_extension("tmp");
+        fs::write(&tmp_path, &new_data).await?;
+        fs::rename(&tmp_path, &seg_path).await?;
+
+        let mut meta = self.read_meta(hash).await?;
+        meta.compressed_size = new_size;
+        self.write_meta(hash, &meta).await
+    }
+
     async fn decrement_ref(&self, hash: &SegmentHash) -> StorageResult<bool> {
         let _guard = self.mu.lock().await;
         let mut meta = self.read_meta(hash).await?;

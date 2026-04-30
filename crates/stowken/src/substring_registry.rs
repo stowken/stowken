@@ -324,6 +324,91 @@ impl SubstringRegistry {
     pub fn is_empty(&self) -> bool {
         self.inner.read().unwrap().known.is_empty()
     }
+
+    /// Drop substrings whose ids are NOT in `keep`. Returns the number
+    /// of dropped entries.
+    ///
+    /// On filesystem-backed registries the packed `blobs.dat` is
+    /// rebuilt from scratch (with the kept substrings re-concatenated)
+    /// and `index.json` is rewritten with new offsets. Atomicity is
+    /// best-effort tmp-rename: a crash mid-rebuild leaves the old
+    /// blobs.dat in place; the index.json rename is the commit point.
+    pub fn retain(&self, keep: &std::collections::HashSet<SubstringId>) -> SubstringResult<u64> {
+        let mut state = self.inner.write().unwrap();
+
+        // First, decide what's going. Capture the target ids in
+        // creation-time order so the rebuilt blobs.dat preserves
+        // sequential layout.
+        let dropping: Vec<SubstringId> = state
+            .known
+            .keys()
+            .copied()
+            .filter(|id| !keep.contains(id))
+            .collect();
+
+        if dropping.is_empty() {
+            return Ok(0);
+        }
+
+        // Persist first when filesystem-backed.
+        if let Some(root) = state.root.clone() {
+            // Rebuild blobs.dat by re-encoding kept entries in order.
+            let kept_ids: Vec<SubstringId> = {
+                let mut ids: Vec<SubstringId> = state
+                    .known
+                    .keys()
+                    .copied()
+                    .filter(|id| keep.contains(id))
+                    .collect();
+                ids.sort();
+                ids
+            };
+
+            let mut new_entries: Vec<IndexEntry> = Vec::with_capacity(kept_ids.len());
+            let mut new_blobs: Vec<u8> = Vec::new();
+            for id in &kept_ids {
+                let info = state.known.get(id).expect("kept id present in known");
+                let tokens = state
+                    .cache
+                    .get(id)
+                    .ok_or(SubstringError::NotFound(*id))?
+                    .clone();
+                let bytes = encode_varint_tokens(&tokens);
+                let offset = new_blobs.len() as u64;
+                new_blobs.extend_from_slice(&bytes);
+                new_entries.push(IndexEntry {
+                    info: info.clone(),
+                    offset,
+                    bytes: bytes.len() as u32,
+                });
+            }
+
+            // Atomic-ish rebuild: write tmp files, then rename.
+            let blobs_tmp = root.join("blobs.dat.tmp");
+            std::fs::write(&blobs_tmp, &new_blobs)?;
+            std::fs::rename(&blobs_tmp, root.join("blobs.dat"))?;
+            write_index(&root, &new_entries)?;
+        }
+
+        // Then mutate in-memory state.
+        let dropped_count = dropping.len() as u64;
+        for id in &dropping {
+            // Drop from cache / known / window_index.
+            if let Some(tokens) = state.cache.remove(id) {
+                if tokens.len() >= MIN_LENGTH {
+                    let h = hash_window(&tokens[..MIN_LENGTH]);
+                    if let Some(bucket) = state.window_index.get_mut(&h) {
+                        bucket.retain(|other| other != id);
+                        if bucket.is_empty() {
+                            state.window_index.remove(&h);
+                        }
+                    }
+                }
+            }
+            state.known.remove(id);
+        }
+        Ok(dropped_count)
+    }
 }
 
 // ── Window hash + varint helpers ──────────────────────────────────────────────
