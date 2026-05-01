@@ -69,15 +69,17 @@ Everything currently in the repo: segmentation, exact dedup, varint+zstd, frame 
 
 ---
 
-## v0.6 — Cloud backends
+## v0.6 — Cloud backends *(complete except CLI integration)*
 
 **Theme:** scale beyond a single host.
 
-- [ ] **S3 backend** with ETag-based optimistic ref-count writes (`If-Match` header, retry on `412`). Multi-writer safe. Re-add the v0.1 implementation that we cut, with the concurrency bug fixed.
-- [ ] **Region-aware manifest cache** for hot conversations.
-- [ ] **GCS / Azure backends** if there's demand. Same trait, same pattern.
+- [x] **S3 backend** with ETag-based optimistic ref-count writes. *Shipped: `stowken::storage::s3::S3Backend` behind `s3` Cargo feature. `If-None-Match: *` for first-time meta writes, `If-Match: <etag>` for ref-count updates, capped exponential backoff with 8-retry budget. The v0.1 race condition is structurally impossible — pinned by `s3_concurrent_increments_no_lost_writes`. Compatible with AWS S3, MinIO, localstack, R2, Spaces via `with_options(endpoint, region)`.*
+- [x] **Python integration.** *Shipped: `stowken.Stowken.open_s3(bucket, local_db_path, *, prefix, endpoint, region, enable_compression, near_dedup)`. The SQLite metadata index stays local (derived cache, rebuildable from S3 manifests via reindex).*
+- [ ] **CLI integration.** *Deferred to v0.6.1 — contained refactor (each command needs to become generic over `<B: StorageBackend>`).*
+- [ ] **Region-aware manifest cache** for hot conversations. *Deferred — measure first.*
+- [ ] **GCS / Azure backends.** *Deferred — same trait, same pattern. Add when demand exists; no architectural blockers.*
 
-**Why this position:** cloud is an operational problem, not a product problem. The differentiator is the dedup / compression / analytics, not the backend. Local-first is fine for v0.x; cloud once the product itself is proven.
+**Why this position:** cloud is an operational problem, not a product problem. The differentiator is the dedup / compression / analytics, not the backend. Local-first was fine for v0.1 → v0.5; cloud now that the product itself is proven.
 
 ---
 

@@ -9,7 +9,7 @@ name = "stowken"
 crate-type = ["cdylib"]
 
 [dependencies]
-stowken = { workspace = true }
+stowken = { workspace = true, features = ["s3"] }
 pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }
 pyo3-async-runtimes = { version = "0.21", features = ["tokio-runtime"] }
 tokio = { workspace = true }

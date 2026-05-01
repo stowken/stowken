@@ -164,7 +164,7 @@ fn make_conversation(index: usize, multi_turn_depth: usize) -> Conversation {
     }];
 
     // Optionally inject a RAG context block into the first user message
-    let use_rag = index % 4 == 0;
+    let use_rag = index.is_multiple_of(4);
     let rag_idx = index % RAG_CONTEXTS.len();
 
     for turn in 0..=multi_turn_depth {

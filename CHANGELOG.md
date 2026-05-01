@@ -2,6 +2,31 @@
 
 For planned future work see [ROADMAP.md](ROADMAP.md). Items move from the roadmap to a version section in this file when they ship.
 
+## 0.6.0 — Unreleased *(in progress)*
+
+### Added — multi-writer S3 backend
+
+Last roadmap item. Stowken can now run against S3 with the v0.1 ref-count race fixed at the protocol layer.
+
+- **`stowken::storage::s3::S3Backend`** behind the new `s3` Cargo feature. Implements the full `StorageBackend` trait including `replace_segment_data`, `list_garbage`, `garbage_collect`, and `storage_size_bytes`.
+- **Multi-writer ref-count safety via S3 conditional writes:**
+  - `put_object` with `If-None-Match: *` for first-time `.meta` writes (only the first writer succeeds).
+  - `put_object` with `If-Match: <etag>` for every ref-count update; on `412 Precondition Failed`, re-read and retry up to `MAX_CAS_RETRIES = 8` times with capped exponential backoff (10ms, 20ms, ..., 320ms).
+  - The `s3_concurrent_increments_no_lost_writes` integration test fires 20 concurrent `increment_ref` calls against the same segment and pins `final_ref_count == 21`. The v0.1 implementation would silently lose writes here.
+- **`StorageBackend::replace_segment_data`** for S3 — same semantics as filesystem, atomic from the caller's perspective; CAS-updates the `.meta`'s `compressed_size` afterwards so a concurrent ref-count update doesn't race with size update.
+- **`S3Backend::with_options(bucket, prefix, endpoint, region)`** — single helper covering AWS, MinIO, localstack, Cloudflare R2, etc. When `endpoint` is set, path-style addressing is forced.
+- **Python: `stowken.Stowken.open_s3(bucket, local_db_path, *, prefix, endpoint, region, ...)`**. The metadata index (SQLite) stays local — it's a derived cache rebuildable from on-S3 manifests via `reindex()`. Explicit so multiple readers can each have their own.
+- **Integration tests gated by `STOWKEN_S3_TEST_BUCKET` env var.** Run against MinIO / localstack / real S3 with `cargo test -p stowken --features s3 --test integration_tests s3 -- --test-threads 1`. Eight tests cover: roundtrip, idempotent put, concurrent first-writers, concurrent increments, decrement-signals-gc, replace-keeps-ref-count, garbage_collect, full vault store/retrieve/delete.
+
+### Deferred to v0.6.1
+
+- **CLI integration for S3.** Adding `--storage s3 --s3-bucket NAME` requires turning every CLI command into a generic-over-backend function. Contained refactor, but big enough to deserve its own commit. Python is the more important interface for cloud-storage users in the meantime.
+
+### Tests
+
+- 99 core (unchanged) + 49 integration + **8 S3 integration (env-gated)** + 14 CLI + 63 Python = **225 + 8 = 233 green** when MinIO is available; 225 in normal CI runs.
+- Clippy clean across both feature configurations (default and `--features s3`).
+
 ## 0.5.1 — Unreleased *(in progress)*
 
 ### Added — substring compaction & GC

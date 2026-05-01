@@ -21,7 +21,7 @@ use tokio::runtime::Runtime;
 extern crate stowken as sk;
 
 use sk::{
-    storage::{FilesystemBackend, MemoryBackend},
+    storage::{s3::S3Backend, FilesystemBackend, MemoryBackend},
     types::{Conversation, Message, MessageContent, StowkenConfig},
     Stowken,
 };
@@ -259,10 +259,11 @@ fn build_hash_list(py: Python<'_>, hashes: &[sk::types::SegmentHash]) -> PyResul
 
 // ── Backend variants ─────────────────────────────────────────────────────────
 
-/// Wraps either an in-memory or filesystem-backed `Stowken`.
+/// Wraps an in-memory, filesystem-backed, or S3-backed `Stowken`.
 enum VaultKind {
     Memory(Stowken<MemoryBackend>),
     Filesystem(Stowken<FilesystemBackend>),
+    S3(Stowken<S3Backend>),
 }
 
 // ── Per-method dispatch helpers ──────────────────────────────────────────────
@@ -279,6 +280,7 @@ async fn vault_store(
     match inner {
         VaultKind::Memory(v) => v.store(conv).await,
         VaultKind::Filesystem(v) => v.store(conv).await,
+        VaultKind::S3(v) => v.store(conv).await,
     }
 }
 
@@ -289,6 +291,7 @@ async fn vault_retrieve(
     match inner {
         VaultKind::Memory(v) => v.retrieve(id).await,
         VaultKind::Filesystem(v) => v.retrieve(id).await,
+        VaultKind::S3(v) => v.retrieve(id).await,
     }
 }
 
@@ -296,6 +299,7 @@ async fn vault_delete(inner: &VaultKind, id: &str) -> Result<(), sk::vault::Stow
     match inner {
         VaultKind::Memory(v) => v.delete(id).await,
         VaultKind::Filesystem(v) => v.delete(id).await,
+        VaultKind::S3(v) => v.delete(id).await,
     }
 }
 
@@ -305,6 +309,7 @@ async fn vault_stats(
     match inner {
         VaultKind::Memory(v) => v.stats().await,
         VaultKind::Filesystem(v) => v.stats().await,
+        VaultKind::S3(v) => v.stats().await,
     }
 }
 
@@ -312,6 +317,7 @@ async fn vault_gc(inner: &VaultKind) -> Result<u64, sk::vault::StowkenError> {
     match inner {
         VaultKind::Memory(v) => v.gc().await,
         VaultKind::Filesystem(v) => v.gc().await,
+        VaultKind::S3(v) => v.gc().await,
     }
 }
 
@@ -321,6 +327,7 @@ async fn vault_gc_candidates(
     match inner {
         VaultKind::Memory(v) => v.gc_candidates().await,
         VaultKind::Filesystem(v) => v.gc_candidates().await,
+        VaultKind::S3(v) => v.gc_candidates().await,
     }
 }
 
@@ -330,6 +337,7 @@ async fn vault_segment_stats(
     match inner {
         VaultKind::Memory(v) => v.segment_stats().await,
         VaultKind::Filesystem(v) => v.segment_stats().await,
+        VaultKind::S3(v) => v.segment_stats().await,
     }
 }
 
@@ -339,6 +347,7 @@ async fn vault_reindex(
     match inner {
         VaultKind::Memory(v) => v.reindex().await,
         VaultKind::Filesystem(v) => v.reindex().await,
+        VaultKind::S3(v) => v.reindex().await,
     }
 }
 
@@ -350,6 +359,7 @@ async fn vault_train_substrings(
     match inner {
         VaultKind::Memory(v) => v.train_substrings(samples, min_occurrences).await,
         VaultKind::Filesystem(v) => v.train_substrings(samples, min_occurrences).await,
+        VaultKind::S3(v) => v.train_substrings(samples, min_occurrences).await,
     }
 }
 
@@ -359,6 +369,7 @@ async fn vault_compact_substrings(
     match inner {
         VaultKind::Memory(v) => v.compact_substrings().await,
         VaultKind::Filesystem(v) => v.compact_substrings().await,
+        VaultKind::S3(v) => v.compact_substrings().await,
     }
 }
 
@@ -368,6 +379,7 @@ async fn vault_gc_substrings(
     match inner {
         VaultKind::Memory(v) => v.gc_substrings().await,
         VaultKind::Filesystem(v) => v.gc_substrings().await,
+        VaultKind::S3(v) => v.gc_substrings().await,
     }
 }
 
@@ -375,6 +387,7 @@ fn vault_list_substrings(inner: &VaultKind) -> Vec<sk::substring_registry::Subst
     match inner {
         VaultKind::Memory(v) => v.list_substrings(),
         VaultKind::Filesystem(v) => v.list_substrings(),
+        VaultKind::S3(v) => v.list_substrings(),
     }
 }
 
@@ -410,6 +423,7 @@ async fn vault_find_near_duplicates(
     match inner {
         VaultKind::Memory(v) => v.find_near_duplicates(threshold, min_refs, limit).await,
         VaultKind::Filesystem(v) => v.find_near_duplicates(threshold, min_refs, limit).await,
+        VaultKind::S3(v) => v.find_near_duplicates(threshold, min_refs, limit).await,
     }
 }
 
@@ -419,6 +433,7 @@ async fn vault_near_dedup_index_size(
     match inner {
         VaultKind::Memory(v) => v.near_dedup_index_size().await,
         VaultKind::Filesystem(v) => v.near_dedup_index_size().await,
+        VaultKind::S3(v) => v.near_dedup_index_size().await,
     }
 }
 
@@ -454,6 +469,7 @@ async fn vault_train_dict(
     match inner {
         VaultKind::Memory(v) => v.train_dictionary(samples).await,
         VaultKind::Filesystem(v) => v.train_dictionary(samples).await,
+        VaultKind::S3(v) => v.train_dictionary(samples).await,
     }
 }
 
@@ -464,6 +480,7 @@ async fn vault_train_and_activate_dict(
     match inner {
         VaultKind::Memory(v) => v.train_and_activate_dictionary(samples).await,
         VaultKind::Filesystem(v) => v.train_and_activate_dictionary(samples).await,
+        VaultKind::S3(v) => v.train_and_activate_dictionary(samples).await,
     }
 }
 
@@ -474,6 +491,7 @@ async fn vault_activate_dict(
     match inner {
         VaultKind::Memory(v) => v.activate_dictionary(dict_id).await,
         VaultKind::Filesystem(v) => v.activate_dictionary(dict_id).await,
+        VaultKind::S3(v) => v.activate_dictionary(dict_id).await,
     }
 }
 
@@ -481,6 +499,7 @@ fn vault_list_dicts(inner: &VaultKind) -> Vec<sk::dict_registry::DictInfo> {
     match inner {
         VaultKind::Memory(v) => v.list_dictionaries(),
         VaultKind::Filesystem(v) => v.list_dictionaries(),
+        VaultKind::S3(v) => v.list_dictionaries(),
     }
 }
 
@@ -559,6 +578,68 @@ impl PyStowken {
             .block_on(Stowken::new(backend, config))
             .map_err(py_err)?;
         Ok(Self { inner: Arc::new(VaultKind::Memory(inner)) })
+    }
+
+    /// Open an S3-backed vault.
+    ///
+    /// Multi-writer safe via ETag-based optimistic concurrency on
+    /// ref-count writes (see :mod:`stowken.storage.s3`). Two processes
+    /// pointing at the same `(bucket, prefix)` can ingest concurrently
+    /// without losing increments.
+    ///
+    /// The metadata index (SQLite) stays *local* at `local_db_path` —
+    /// it's a derived cache that any vault can rebuild from the on-S3
+    /// manifests via :meth:`reindex`. Multiple readers can each have
+    /// their own local index; they'll converge on the same answer.
+    ///
+    /// Args:
+    ///     bucket: S3 bucket name.
+    ///     local_db_path: Path to a local SQLite file for the metadata
+    ///         index. Created if absent. Per-process; do NOT share between
+    ///         concurrent writers.
+    ///     prefix: Key prefix inside the bucket. Default empty (root).
+    ///     endpoint: Custom S3 endpoint URL (for MinIO, localstack, R2).
+    ///     region: AWS region. Falls back to AWS_REGION env var if unset.
+    ///     enable_compression: zstd on/off. Default ``True``.
+    ///     near_dedup: Jaccard threshold for near-dedup. Default off.
+    #[classmethod]
+    #[pyo3(signature = (
+        bucket,
+        local_db_path,
+        *,
+        prefix = String::new(),
+        endpoint = None,
+        region = None,
+        enable_compression = true,
+        near_dedup = None,
+    ))]
+    #[allow(clippy::too_many_arguments)] // each arg is a Python kwarg by design
+    fn open_s3(
+        _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
+        _py: Python<'_>,
+        bucket: String,
+        local_db_path: String,
+        prefix: String,
+        endpoint: Option<String>,
+        region: Option<String>,
+        enable_compression: bool,
+        near_dedup: Option<f64>,
+    ) -> PyResult<Self> {
+        let config = StowkenConfig {
+            enable_compression,
+            near_dedup_threshold: near_dedup,
+        };
+        let inner = runtime()
+            .block_on(async move {
+                let backend = S3Backend::with_options(bucket, prefix, endpoint, region)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Stowken::open(backend, config, &local_db_path)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(Self { inner: Arc::new(VaultKind::S3(inner)) })
     }
 
     /// Open a filesystem-backed vault rooted at `path`.

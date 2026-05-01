@@ -107,8 +107,8 @@ async fn reindex_after_db_deletion_restores_all_stats() {
         // SQL row order isn't guaranteed.
         let mut after = vault.segment_stats().await.unwrap();
         let mut before = segment_stats_before.clone();
-        after.sort_by(|a, b| a.segment_type.to_string().cmp(&b.segment_type.to_string()));
-        before.sort_by(|a, b| a.segment_type.to_string().cmp(&b.segment_type.to_string()));
+        after.sort_by_key(|a| a.segment_type.to_string());
+        before.sort_by_key(|a| a.segment_type.to_string());
         for (a, b) in after.iter().zip(before.iter()) {
             assert_eq!(a.segment_type, b.segment_type);
             assert_eq!(a.unique_count, b.unique_count);

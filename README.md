@@ -137,6 +137,15 @@ vault = stowken.Stowken()
 # Persistent (creates the directory + metadata.db if needed)
 vault = stowken.Stowken.open("/var/lib/stowken")
 
+# S3-backed (multi-writer safe; v0.6+)
+vault = stowken.Stowken.open_s3(
+    bucket="my-vault",
+    local_db_path="/var/lib/stowken-s3.db",   # SQLite metadata index, local
+    prefix="prod/",                            # optional key prefix
+    region="us-east-1",                        # optional; AWS_REGION env also works
+    # endpoint="http://localhost:9000",        # optional MinIO/R2/etc. endpoint
+)
+
 result = vault.store({
     "id": "conv-001",
     "model": "gpt-4",
@@ -370,6 +379,16 @@ pytest python/tests/              # 28 Python tests
 ## License
 
 Apache 2.0. See `LICENSE`.
+
+## Storage backends
+
+| Backend | Persistence | Multi-writer safe | Where |
+|---|---|---|---|
+| `MemoryBackend` | none | n/a | testing, ephemeral caches |
+| `FilesystemBackend` | local disk | no (single-process) | local dev, single-host servers |
+| `S3Backend` *(v0.6, behind `s3` Cargo feature)* | S3 | **yes** — ETag-based optimistic ref-count CAS | cloud workloads, multi-writer ingest |
+
+The S3 backend uses `If-None-Match: *` for first-time `.meta` writes and `If-Match: <etag>` for ref-count updates, with capped exponential backoff on `412 Precondition Failed`. Two writers concurrently incrementing the same segment's ref-count produce the correct final value (see the `s3_concurrent_increments_no_lost_writes` test). Compatible with any S3-compatible store: AWS S3, MinIO, localstack, Cloudflare R2, DigitalOcean Spaces.
 
 ## Status
 
