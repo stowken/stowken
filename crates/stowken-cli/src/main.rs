@@ -270,7 +270,9 @@ enum Command {
     ///
     /// Ingests every `*.json` (one conversation per file) and `*.jsonl` (one
     /// per line) under INPUT into a fresh in-memory vault, then reports the
-    /// three-stage savings breakdown plus per-segment-type detail.
+    /// three-stage savings breakdown plus per-segment-type detail. After
+    /// ingest, samples N conversations and times retrieval to report
+    /// decompression throughput + latency percentiles.
     ///
     /// Does not touch the configured data directory — bench is read-only
     /// w.r.t. your real vault.
@@ -280,6 +282,10 @@ enum Command {
         /// Cap on conversations ingested. Default: no cap.
         #[arg(long)]
         max: Option<u64>,
+        /// Number of conversations to retrieve in the post-ingest
+        /// retrieval pass. Default: min(ingested, 1000).
+        #[arg(long)]
+        retrieve: Option<u64>,
     },
 
     /// Print the resolved data directory and exit.
@@ -381,8 +387,8 @@ async fn main() -> Result<()> {
         Command::FindNearDuplicates { threshold, min_refs, limit } => {
             cmd_find_near_duplicates(&data_dir, config, threshold, min_refs, limit, cli.json).await?;
         }
-        Command::Bench { input, max } => {
-            cmd_bench(config, input, max, cli.json).await?;
+        Command::Bench { input, max, retrieve } => {
+            cmd_bench(config, input, max, retrieve, cli.json).await?;
         }
     }
 
@@ -1149,6 +1155,7 @@ async fn cmd_bench(
     config: StowkenConfig,
     input: PathBuf,
     max: Option<u64>,
+    retrieve: Option<u64>,
     json: bool,
 ) -> Result<()> {
     let conversations = collect_conversations(&input, max)?;
@@ -1163,9 +1170,13 @@ async fn cmd_bench(
     let started = std::time::Instant::now();
     let mut ingested = 0u64;
     let mut failures = 0u64;
+    let mut ingested_ids: Vec<String> = Vec::new();
     for conv in conversations {
         match vault.store(conv).await {
-            Ok(_) => ingested += 1,
+            Ok(result) => {
+                ingested += 1;
+                ingested_ids.push(result.id);
+            }
             Err(_) => failures += 1,
         }
     }
@@ -1178,8 +1189,11 @@ async fn cmd_bench(
         .context("fetching dedup-only bytes")?;
     let seg_stats = vault.segment_stats().await.context("fetching segment stats")?;
 
+    // Retrieval pass: sample some ingested IDs and time each retrieve.
+    let retrieval = run_retrieval_pass(&vault, &ingested_ids, retrieve).await?;
+
     if json {
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "source":            input.display().to_string(),
             "ingested":          ingested,
             "failures":          failures,
@@ -1202,6 +1216,21 @@ async fn cmd_bench(
                 "compressed_bytes": s.compressed_bytes,
             })).collect::<Vec<_>>(),
         });
+        if let Some(r) = &retrieval {
+            out.as_object_mut().unwrap().insert(
+                "retrieval".into(),
+                serde_json::json!({
+                    "sampled":              r.count,
+                    "elapsed_ms":           r.elapsed.as_millis(),
+                    "tokens_returned":      r.tokens,
+                    "tokens_per_sec":       r.tokens_per_sec(),
+                    "convs_per_sec":        r.convs_per_sec(),
+                    "p50_us":               r.p50_us(),
+                    "p95_us":               r.p95_us(),
+                    "p99_us":               r.p99_us(),
+                }),
+            );
+        }
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
@@ -1305,7 +1334,123 @@ async fn cmd_bench(
         })
         .collect();
     println!("{}", Table::new(rows));
+
+    if let Some(r) = retrieval {
+        println!();
+        println!("Retrieval (decompression-only, MemoryBackend)");
+        println!("{}", "-".repeat(60));
+        println!(
+            "  Sampled       : {} conversations",
+            r.count
+        );
+        println!(
+            "  Time          : {}ms  ({} tok/s, {} conv/s)",
+            r.elapsed.as_millis(),
+            r.tokens_per_sec(),
+            r.convs_per_sec(),
+        );
+        println!(
+            "  Latency p50/p95/p99: {}µs / {}µs / {}µs per conversation",
+            r.p50_us(),
+            r.p95_us(),
+            r.p99_us(),
+        );
+    }
     Ok(())
+}
+
+/// Per-conversation retrieval timing collected during a bench pass.
+struct RetrievalReport {
+    count: u64,
+    tokens: u64,
+    elapsed: std::time::Duration,
+    /// Sorted ascending in microseconds — used for percentile lookups.
+    sorted_micros: Vec<u128>,
+}
+
+impl RetrievalReport {
+    fn tokens_per_sec(&self) -> u64 {
+        let secs = self.elapsed.as_secs_f64();
+        if secs <= 0.0 {
+            0
+        } else {
+            (self.tokens as f64 / secs) as u64
+        }
+    }
+    fn convs_per_sec(&self) -> u64 {
+        let secs = self.elapsed.as_secs_f64();
+        if secs <= 0.0 {
+            0
+        } else {
+            (self.count as f64 / secs) as u64
+        }
+    }
+    fn percentile_us(&self, p: f64) -> u128 {
+        if self.sorted_micros.is_empty() {
+            return 0;
+        }
+        // Nearest-rank percentile.
+        let rank = ((p / 100.0) * self.sorted_micros.len() as f64).ceil() as usize;
+        let idx = rank.saturating_sub(1).min(self.sorted_micros.len() - 1);
+        self.sorted_micros[idx]
+    }
+    fn p50_us(&self) -> u128 { self.percentile_us(50.0) }
+    fn p95_us(&self) -> u128 { self.percentile_us(95.0) }
+    fn p99_us(&self) -> u128 { self.percentile_us(99.0) }
+}
+
+/// Time `min(retrieve_n, ingested.len())` retrievals against the bench
+/// vault. Defaults to `min(ingested, 1000)` when `retrieve_n` is None.
+/// Returns `Ok(None)` if there's nothing to retrieve.
+async fn run_retrieval_pass<B>(
+    vault: &Stowken<B>,
+    ingested: &[String],
+    retrieve_n: Option<u64>,
+) -> Result<Option<RetrievalReport>>
+where
+    B: stowken::storage::StorageBackend + 'static,
+{
+    if ingested.is_empty() {
+        return Ok(None);
+    }
+    let n = retrieve_n
+        .unwrap_or_else(|| (ingested.len() as u64).min(1000))
+        .min(ingested.len() as u64) as usize;
+
+    // Pick `n` IDs spread evenly across the ingest order. Avoids the
+    // pathological case where the first/last `n` are all stored under
+    // the same dictionary or the same canonical, which would skew the
+    // mix of frame types we exercise.
+    let stride = ingested.len() / n.max(1);
+    let mut sample: Vec<&String> = (0..n)
+        .map(|i| &ingested[(i * stride.max(1)).min(ingested.len() - 1)])
+        .collect();
+    sample.dedup();
+
+    let mut tokens = 0u64;
+    let mut micros: Vec<u128> = Vec::with_capacity(sample.len());
+    let started = std::time::Instant::now();
+    for id in &sample {
+        let t = std::time::Instant::now();
+        let conv = vault
+            .retrieve(id)
+            .await
+            .with_context(|| format!("bench retrieve {id}"))?;
+        let elapsed_micros = t.elapsed().as_micros();
+        for seg in &conv.segments {
+            tokens += seg.tokens.len() as u64;
+        }
+        micros.push(elapsed_micros);
+    }
+    let total = started.elapsed();
+    micros.sort_unstable();
+
+    Ok(Some(RetrievalReport {
+        count: micros.len() as u64,
+        tokens,
+        elapsed: total,
+        sorted_micros: micros,
+    }))
 }
 
 fn pct_saved(before: u64, after: u64) -> f64 {
