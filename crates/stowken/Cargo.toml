@@ -1,9 +1,9 @@
 [package]
 name = "stowken"
-version = "0.5.1"
+version = "0.6.1"
 edition = "2021"
 description = "Compressed storage and retrieval of LLM token sequences"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/stowken/stowken"
 keywords = ["llm", "tokens", "compression", "storage", "deduplication"]
 categories = ["compression", "database", "data-structures"]

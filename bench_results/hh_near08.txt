@@ -1,0 +1,34 @@
+Stowken Benchmark
+============================================================
+Source        : hh_rlhf.jsonl
+
+Ingest
+------------------------------------------------------------
+  Conversations : 10000  (0 failed)
+  Tokens        : 1350353
+  Time          : 32526ms  (3252µs/conv, 41515 tok/s)
+
+Storage layers
+------------------------------------------------------------
+  Incoming (u32):     5.2 MB   (ingested tokens × 4)
+  After dedup   :     3.1 MB    38.9% saved by exact dedup (near-dedup delta savings in compression layer)
+  After zstd    :     1.8 MB    43.5% saved on top of dedup
+
+  Combined      : 65.5% smaller than incoming  (5.2 MB → 1.8 MB)
+
+Per-segment-type breakdown
+------------------------------------------------------------
+  (Refs/Dedup% include canonical GC-pin refs from near-dedup variants)
++----------------+--------+-------+--------+--------+------------+
+| Type           | Unique | Refs  | Dedup% | Tokens | Compressed |
++----------------+--------+-------+--------+--------+------------+
+| assistant_turn | 15910  | 24441 | 34.9%  | 995252 | 1.4 MB     |
++----------------+--------+-------+--------+--------+------------+
+| user_turn      | 10830  | 24376 | 55.6%  | 355175 | 417.1 KB   |
++----------------+--------+-------+--------+--------+------------+
+
+Retrieval (decompression-only, MemoryBackend)
+------------------------------------------------------------
+  Sampled       : 1000 conversations
+  Time          : 27ms  (4645584 tok/s, 35997 conv/s)
+  Latency p50/p95/p99: 21µs / 49µs / 87µs per conversation

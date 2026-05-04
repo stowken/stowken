@@ -2850,7 +2850,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stowken"
-version = "0.5.1"
+version = "0.6.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2876,7 +2876,7 @@ dependencies = [
 
 [[package]]
 name = "stowken-cli"
-version = "0.5.1"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2892,7 +2892,7 @@ dependencies = [
 
 [[package]]
 name = "stowken-python"
-version = "0.5.1"
+version = "0.6.1"
 dependencies = [
  "chrono",
  "pyo3",

@@ -1,0 +1,35 @@
+Stowken Benchmark
+============================================================
+Source        : lmsys.jsonl
+
+Ingest
+------------------------------------------------------------
+  Conversations : 10000  (0 failed)
+  Tokens        : 4916069
+  Time          : 8750ms  (875µs/conv, 561779 tok/s)
+
+Storage layers
+------------------------------------------------------------
+  Incoming (u32):    18.8 MB   (ingested tokens × 4)
+  After dedup   :    16.8 MB    10.2% saved by dedup alone (refs × raw → unique × raw)
+  After zstd    :     8.4 MB    50.1% saved on top of dedup
+
+  Combined      : 55.2% smaller than incoming  (18.8 MB → 8.4 MB)
+
+Per-segment-type breakdown
+------------------------------------------------------------
++----------------+--------+-------+--------+---------+------------+
+| Type           | Unique | Refs  | Dedup% | Tokens  | Compressed |
++----------------+--------+-------+--------+---------+------------+
+| continuation   | 28877  | 33457 | 13.7%  | 2893128 | 4.5 MB     |
++----------------+--------+-------+--------+---------+------------+
+| user_turn      | 17705  | 19378 | 8.6%   | 657131  | 1.3 MB     |
++----------------+--------+-------+--------+---------+------------+
+| assistant_turn | 17973  | 19049 | 5.6%   | 1365810 | 2.6 MB     |
++----------------+--------+-------+--------+---------+------------+
+
+Retrieval (decompression-only, MemoryBackend)
+------------------------------------------------------------
+  Sampled       : 1000 conversations
+  Time          : 39ms  (11996596 tok/s, 25188 conv/s)
+  Latency p50/p95/p99: 26µs / 114µs / 184µs per conversation

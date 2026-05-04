@@ -27,6 +27,16 @@ pub struct SegmenterConfig {
     /// and the actual user query. When the delimiter is found inside a
     /// `UserTurn`, the message is split into a `Context` + `UserTurn` pair.
     pub context_delimiter: Option<Vec<Token>>,
+
+    /// Maximum tokens per stored segment. When set, messages longer than
+    /// this limit are split into a leading segment (original type) followed
+    /// by one or more `Continuation` segments. For text messages, splits
+    /// prefer paragraph boundaries (`\n\n`) before falling back to the hard
+    /// token limit. For pre-tokenized messages, splits at the token limit.
+    ///
+    /// Smaller values create more, shorter segments with higher exact-dedup
+    /// probability at the cost of more segment refs per conversation.
+    pub max_segment_tokens: Option<usize>,
 }
 
 /// Decomposes a `Conversation` into a flat list of typed `Segment`s.
@@ -59,9 +69,39 @@ impl Segmenter {
     }
 
     fn segment_message(&self, msg: &Message) -> Result<Vec<Segment>, SegmenterError> {
-        let tokens = self.resolve_tokens(msg)?;
         let seg_type = self.classify_role(msg)?;
+        let meta = extract_metadata(msg);
 
+        // For text content with a max_segment_tokens limit, split on paragraph
+        // boundaries in text space before tokenizing so split points land at
+        // natural sentence boundaries rather than mid-word.
+        if let (MessageContent::Text(text), Some(max_tokens)) =
+            (&msg.content, self.config.max_segment_tokens)
+        {
+            if let Some(adapter) = &self.tokenizer {
+                let chunks = split_text_at_paragraphs(text, max_tokens, adapter.as_ref());
+                if chunks.len() > 1 {
+                    return Ok(chunks
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_, tokens)| !tokens.is_empty())
+                        .map(|(i, tokens)| Segment {
+                            segment_type: if i == 0 {
+                                seg_type.clone()
+                            } else {
+                                SegmentType::Continuation
+                            },
+                            tokens,
+                            metadata: meta.clone(),
+                        })
+                        .collect());
+                }
+            }
+        }
+
+        let tokens = self.resolve_tokens(msg)?;
+
+        // Context-delimiter split for user turns.
         if seg_type == SegmentType::UserTurn {
             if let Some(delimiter) = &self.config.context_delimiter {
                 if let Some(split_pos) = find_subsequence(&tokens, delimiter) {
@@ -72,14 +112,14 @@ impl Segmenter {
                         result.push(Segment {
                             segment_type: SegmentType::Context,
                             tokens: context_tokens,
-                            metadata: extract_metadata(msg),
+                            metadata: meta.clone(),
                         });
                     }
                     if !user_tokens.is_empty() {
                         result.push(Segment {
                             segment_type: SegmentType::UserTurn,
                             tokens: user_tokens,
-                            metadata: extract_metadata(msg),
+                            metadata: meta,
                         });
                     }
                     return Ok(result);
@@ -87,10 +127,18 @@ impl Segmenter {
             }
         }
 
+        // Token-only content (or text with no paragraph split needed): apply
+        // max_segment_tokens hard split if configured.
+        if let Some(max_tokens) = self.config.max_segment_tokens {
+            if tokens.len() > max_tokens {
+                return Ok(split_tokens_at_limit(&tokens, max_tokens, seg_type, meta));
+            }
+        }
+
         Ok(vec![Segment {
             segment_type: seg_type,
             tokens,
-            metadata: extract_metadata(msg),
+            metadata: meta,
         }])
     }
 
@@ -140,6 +188,74 @@ fn extract_metadata(msg: &Message) -> Option<std::collections::HashMap<String, s
     } else {
         Some(map)
     }
+}
+
+/// Split text on `\n\n` paragraph boundaries, tokenize each paragraph, then
+/// merge adjacent paragraphs until adding the next would exceed `max_tokens`.
+/// Falls back to a hard token-count split for paragraphs that are themselves
+/// too long.
+fn split_text_at_paragraphs(
+    text: &str,
+    max_tokens: usize,
+    adapter: &dyn crate::types::TokenizerAdapter,
+) -> Vec<Vec<Token>> {
+    let paragraphs: Vec<&str> = text.split("\n\n").collect();
+    let mut chunks: Vec<Vec<Token>> = Vec::new();
+    let mut current: Vec<Token> = Vec::new();
+
+    for para in paragraphs {
+        let para_tokens = adapter.tokenize(para);
+        // A single paragraph that exceeds the limit is hard-split by tokens.
+        if para_tokens.len() > max_tokens {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            for token_chunk in para_tokens.chunks(max_tokens) {
+                chunks.push(token_chunk.to_vec());
+            }
+            continue;
+        }
+        // Append paragraph separator tokens (newline × 2) when joining.
+        let sep_tokens = if current.is_empty() {
+            vec![]
+        } else {
+            adapter.tokenize("\n\n")
+        };
+        if current.len() + sep_tokens.len() + para_tokens.len() > max_tokens && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current = para_tokens;
+        } else {
+            current.extend(sep_tokens);
+            current.extend(para_tokens);
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Split a pre-tokenized sequence into chunks of at most `max_tokens`, emitting
+/// the first chunk with `seg_type` and subsequent chunks as `Continuation`.
+fn split_tokens_at_limit(
+    tokens: &[Token],
+    max_tokens: usize,
+    seg_type: SegmentType,
+    meta: Option<std::collections::HashMap<String, serde_json::Value>>,
+) -> Vec<Segment> {
+    tokens
+        .chunks(max_tokens)
+        .enumerate()
+        .map(|(i, chunk)| Segment {
+            segment_type: if i == 0 {
+                seg_type.clone()
+            } else {
+                SegmentType::Continuation
+            },
+            tokens: chunk.to_vec(),
+            metadata: meta.clone(),
+        })
+        .collect()
 }
 
 /// Find the first occurrence of `needle` in `haystack`. Returns the start index.

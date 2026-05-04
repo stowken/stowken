@@ -16,6 +16,12 @@ pub enum SegmentType {
     AssistantTurn,
     ToolCall,
     ToolResult,
+    /// A sub-segment continuation of the immediately preceding segment.
+    /// Produced when `max_segment_tokens` splits a long message across
+    /// multiple chunks. Callers that need the original message should
+    /// concatenate all contiguous `Continuation` tokens with the preceding
+    /// non-`Continuation` segment.
+    Continuation,
 }
 
 impl std::fmt::Display for SegmentType {
@@ -27,6 +33,7 @@ impl std::fmt::Display for SegmentType {
             Self::AssistantTurn => "assistant_turn",
             Self::ToolCall => "tool_call",
             Self::ToolResult => "tool_result",
+            Self::Continuation => "continuation",
         };
         write!(f, "{s}")
     }
@@ -42,6 +49,7 @@ impl std::str::FromStr for SegmentType {
             "assistant_turn" => Ok(Self::AssistantTurn),
             "tool_call" => Ok(Self::ToolCall),
             "tool_result" => Ok(Self::ToolResult),
+            "continuation" => Ok(Self::Continuation),
             other => Err(format!("unknown segment type: {other}")),
         }
     }

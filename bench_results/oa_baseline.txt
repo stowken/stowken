@@ -1,0 +1,33 @@
+Stowken Benchmark
+============================================================
+Source        : open_assistant.jsonl
+
+Ingest
+------------------------------------------------------------
+  Conversations : 3482  (0 failed)
+  Tokens        : 1297767
+  Time          : 1828ms  (525µs/conv, 709810 tok/s)
+
+Storage layers
+------------------------------------------------------------
+  Incoming (u32):     5.0 MB   (ingested tokens × 4)
+  After dedup   :     4.9 MB     0.0% saved by dedup alone (refs × raw → unique × raw)
+  After zstd    :     2.3 MB    54.1% saved on top of dedup
+
+  Combined      : 54.2% smaller than incoming  (5.0 MB → 2.3 MB)
+
+Per-segment-type breakdown
+------------------------------------------------------------
++----------------+--------+------+--------+---------+------------+
+| Type           | Unique | Refs | Dedup% | Tokens  | Compressed |
++----------------+--------+------+--------+---------+------------+
+| user_turn      | 6317   | 6378 | 1.0%   | 186669  | 409.8 KB   |
++----------------+--------+------+--------+---------+------------+
+| assistant_turn | 5162   | 5173 | 0.2%   | 1111098 | 1.9 MB     |
++----------------+--------+------+--------+---------+------------+
+
+Retrieval (decompression-only, MemoryBackend)
+------------------------------------------------------------
+  Sampled       : 1000 conversations
+  Time          : 17ms  (20751278 tok/s, 56235 conv/s)
+  Latency p50/p95/p99: 16µs / 27µs / 33µs per conversation

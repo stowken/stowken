@@ -19,4 +19,4 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 thiserror = "1"
 tracing = "0.1"
-stowken = { version = "0.5.1", path = "crates/stowken" }
+stowken = { version = "0.6.1", path = "crates/stowken" }

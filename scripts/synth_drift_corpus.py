@@ -26,22 +26,39 @@ import sys
 #    skip the tokenizer dependency in this script — Stowken accepts
 #    `{"role": "user", "tokens": [...]}` directly.
 
+_SYSTEM_BASE: list[int] = []
+_RAG_BASE: list[int] = []
+
+def _ensure_bases(max_size: int) -> None:
+    """Generate random base token sequences once using a fixed seed so all
+    conversations share the same canonical base (the drift signal)."""
+    global _SYSTEM_BASE, _RAG_BASE
+    if len(_SYSTEM_BASE) >= max_size and len(_RAG_BASE) >= max_size:
+        return
+    base_rng = random.Random(0xdeadbeef)
+    # Use realistic cl100k_base token IDs: uniform over [1, 50257].
+    _SYSTEM_BASE = [base_rng.randint(1, 50_257) for _ in range(max_size)]
+    _RAG_BASE    = [base_rng.randint(1, 50_257) for _ in range(max_size)]
+
+
 def synth_system_prompt(rng: random.Random, size: int) -> list[int]:
-    tokens = list(range(0, size))
-    # Interpolate 3 slots with random tokens (the "drift" signal).
+    _ensure_bases(size)
+    tokens = _SYSTEM_BASE[:size].copy()
+    # Drift: substitute a few positions with out-of-range tokens.
     edits = max(3, size // 33)
     for _ in range(edits):
         pos = rng.randint(0, size - 1)
-        tokens[pos] = rng.randint(50_000, 60_000)
+        tokens[pos] = rng.randint(50_258, 65_000)
     return tokens
 
 
 def synth_rag_context(rng: random.Random, size: int) -> list[int]:
-    tokens = list(range(1000, 1000 + size))
+    _ensure_bases(size)
+    tokens = _RAG_BASE[:size].copy()
     edits = max(4, size // 50)
     for _ in range(edits):
         pos = rng.randint(0, size - 1)
-        tokens[pos] = rng.randint(70_000, 80_000)
+        tokens[pos] = rng.randint(65_001, 80_000)
     return tokens
 
 

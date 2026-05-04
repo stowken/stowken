@@ -2,7 +2,59 @@
 
 For planned future work see [ROADMAP.md](ROADMAP.md). Items move from the roadmap to a version section in this file when they ship.
 
-## 0.6.0 — Unreleased *(in progress)*
+## 0.6.1 — 2026-05-04
+
+### Added — sub-segment splitting (`--split-segments N`)
+
+Long messages can now be split into shorter, independently-deduplicated chunks before storage. When `--split-segments N` is set (or `SegmenterConfig::max_segment_tokens` in the Rust API), messages are split at paragraph boundaries (`\n\n`) in text space, falling back to a hard token-count limit for oversized paragraphs. The first chunk keeps the original segment type; subsequent chunks use the new `SegmentType::Continuation` variant.
+
+- **`SegmentType::Continuation`** — marks chunks produced by splitting. Callers reconstructing the original message concatenate all contiguous `Continuation` segments with the preceding non-`Continuation` one.
+- **`SegmenterConfig::max_segment_tokens: Option<usize>`** — paragraph-boundary text split before tokenizing; hard token-count split for pre-tokenized messages or paragraphs that are themselves oversized.
+- **`--split-segments N` global CLI flag** — wires `max_segment_tokens` into the vault's segmenter for all commands.
+
+### Added — bench enhancements
+
+Two new flags for `stowken bench`:
+
+- **`--dict-warmup N`** — ingests the first N conversations as a training sample, trains+activates a zstd dictionary, then ingests the remainder with the dictionary active. Reports warmup vs. post-warmup timing.
+- **`--with-substrings`** — after ingest, runs `train_substrings(500, 5)` + `compact_substrings()` and reports segments rewritten and bytes saved.
+
+### Added — corpus scripts and sweep
+
+- **`scripts/fetch_hh_rlhf.py`** — fetches Anthropic/hh-rlhf from HuggingFace (no license gating). Emits both chosen and rejected conversations per row, producing high-exact-dedup chosen+rejected prefix pairs.
+- **`scripts/bench_sweep.sh`** — 23-run sweep across all four corpora (drift, hh\_rlhf, lmsys, open\_assistant) with every flag combination. Results saved to `bench_results/` with a full markdown report at `bench_results/REPORT.md`.
+
+### Fixed — near-dedup LSH query performance
+
+Two SQLite bottlenecks were making near-dedup ingest ~55× slower than baseline at 10K-conversation scale:
+
+- **UNION ALL candidate lookup** — 16 per-band `SELECT` statements replaced with a single `UNION ALL` query (16→1 round-trips per segment).
+- **Batch signature fetch** — per-candidate `spawn_blocking` calls replaced with a single `IN`-clause query returning all signatures at once.
+
+Net result on the drift corpus: near-dedup ingest dropped from 13.3s to 4.7s (2.9× speedup); on HH-RLHF at 10K conversations the overhead is 8.7× baseline rather than ~55×.
+
+### Fixed — synthetic drift corpus token distribution
+
+`scripts/synth_drift_corpus.py` previously generated sequential integer token IDs (`range(0, size)`) which zstd compresses trivially, making near-dedup effects invisible in benchmarks. The script now uses a fixed-seed PRNG to produce realistic token IDs drawn from `[1, 50257]`, with drift substitutions from `[50258, 80000]`. Benchmark numbers are now meaningfully distinguishable between modes.
+
+### Measured impact — four-corpus sweep
+
+Full results and per-flag analysis in [`bench_results/REPORT.md`](bench_results/REPORT.md).
+
+| Corpus | Baseline | Best flag | Best savings | Flag cost |
+|--------|----------|-----------|--------------|-----------|
+| drift (1 K convs, near-dup synthetic) | 35.9% | `--dict-warmup 200` | **69.7%** | 1.4× ingest, 4× p99 retrieval |
+| hh\_rlhf (10 K convs, chosen+rejected) | 65.5% | *(none helpful)* | 65.5% | — |
+| lmsys (10 K convs, diverse real-world) | 60.4% | `--dict-warmup 2000` | **62.5%** | 2.6× ingest, 13× p99 retrieval |
+| open\_assistant (3.5 K convs, unique Q&A) | 54.2% | `--dict-warmup 500` | **56.1%** | 3.3× ingest, 4× p99 retrieval |
+
+Near-dedup at threshold 0.8 adds +13pp on the drift corpus but zero gain on the three real-world datasets — at 8–18× ingest cost. Sub-segment splitting at 256 tokens raises exact-dedup rate on diverse data (LMSys: 1.5% → 8.8%) but combined savings decreases due to shorter segments compressing less well.
+
+---
+
+## 0.6.0 — 2026-05-01
+
+First public release. Dual-licensed MIT OR Apache-2.0. Published to crates.io (`stowken`, `stowken-cli`) and PyPI (`stowken`).
 
 ### Added — multi-writer S3 backend
 
@@ -18,14 +70,41 @@ Last roadmap item. Stowken can now run against S3 with the v0.1 ref-count race f
 - **Python: `stowken.Stowken.open_s3(bucket, local_db_path, *, prefix, endpoint, region, ...)`**. The metadata index (SQLite) stays local — it's a derived cache rebuildable from on-S3 manifests via `reindex()`. Explicit so multiple readers can each have their own.
 - **Integration tests gated by `STOWKEN_S3_TEST_BUCKET` env var.** Run against MinIO / localstack / real S3 with `cargo test -p stowken --features s3 --test integration_tests s3 -- --test-threads 1`. Eight tests cover: roundtrip, idempotent put, concurrent first-writers, concurrent increments, decrement-signals-gc, replace-keeps-ref-count, garbage_collect, full vault store/retrieve/delete.
 
+### Added — retrieval benchmarks
+
+- **`stowken bench --retrieve N`** extends the bench command with a post-ingest retrieval pass. Samples N conversations spread evenly across the ingest order, times each `retrieve()`, and reports throughput (tokens/sec, conversations/sec) plus p50/p95/p99 latency in microseconds. Defaults to `min(ingested, 1000)`. Both human-readable and `--json` output include the new metrics.
+
+  Measured on a hot in-memory vault:
+
+  | Corpus | Tokens/sec | Conv/sec | p50 | p95 | p99 |
+  |---|---:|---:|---:|---:|---:|
+  | OpenAssistant 3,482 convs | 20.9M | 56,684 | 16 µs | 26 µs | 31 µs |
+  | Drift baseline 500 convs | 99M | 31K | — | — | 63 µs |
+  | Drift + near-dedup | 69M | 22K | — | — | 63 µs |
+
+  Near-dedup adds ~30% canonical-resolution overhead on 0x04-heavy corpora. Filesystem and S3 add their respective I/O on top.
+
+### Added — LMSys-Chat-1M fetcher
+
+- **`scripts/fetch_lmsys.py`** — converts the gated [LMSys-Chat-1M](https://huggingface.co/datasets/lmsys/lmsys-chat-1m) dataset to Stowken JSONL. Accepts `--max`, `--language`, and `--output` flags. Dataset requires HF terms acceptance and `HF_TOKEN`; the script's docstring walks through the auth dance.
+
+### Changed — license
+
+- Relicensed from Apache-2.0 to **MIT OR Apache-2.0**. Downstream users choose whichever fits their project. Both `LICENSE-MIT` and `LICENSE-APACHE` are present at the repo root.
+
+### Changed — README restructure
+
+- Reorganised around the v0.6 reality: four-corpus storage spectrum table, retrieval throughput table, storage backends moved up, quick-start Python-first, CLI cheatsheet consolidated, frame format table includes 0x05, how-it-works section covers all four compression paths, "Reproducing the benchmarks" section, accurate test counts and CI reference.
+
 ### Deferred to v0.6.1
 
 - **CLI integration for S3.** Adding `--storage s3 --s3-bucket NAME` requires turning every CLI command into a generic-over-backend function. Contained refactor, but big enough to deserve its own commit. Python is the more important interface for cloud-storage users in the meantime.
 
 ### Tests
 
-- 99 core (unchanged) + 49 integration + **8 S3 integration (env-gated)** + 14 CLI + 63 Python = **225 + 8 = 233 green** when MinIO is available; 225 in normal CI runs.
+- 100 core + 57 integration (incl. 8 env-gated S3 skip-noops) + 14 CLI + 1 doctest = **172 Rust** + **63 Python** = **235 green**.
 - Clippy clean across both feature configurations (default and `--features s3`).
+- CI runs Rust build + test + clippy and Python 3.11 + 3.12 maturin build + pytest on every push.
 
 ## 0.5.1 — Unreleased *(in progress)*
 

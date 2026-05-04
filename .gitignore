@@ -39,3 +39,6 @@ yarn-error.log*
 *.dylib
 *.dll
 *.a
+
+# Test data
+/data/

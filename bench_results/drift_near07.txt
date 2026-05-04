@@ -1,0 +1,36 @@
+Stowken Benchmark
+============================================================
+Source        : drift.jsonl
+
+Ingest
+------------------------------------------------------------
+  Conversations : 1000  (0 failed)
+  Tokens        : 420000
+  Time          : 5537ms  (5537µs/conv, 75851 tok/s)
+
+Storage layers
+------------------------------------------------------------
+  Incoming (u32):     1.6 MB   (ingested tokens × 4)
+  After dedup   :     1.6 MB     0.0% saved by exact dedup (near-dedup delta savings in compression layer)
+  After zstd    :   848.7 KB    48.3% saved on top of dedup
+
+  Combined      : 48.3% smaller than incoming  (1.6 MB → 848.7 KB)
+
+Per-segment-type breakdown
+------------------------------------------------------------
+  (Refs/Dedup% include canonical GC-pin refs from near-dedup variants)
++----------------+--------+------+--------+--------+------------+
+| Type           | Unique | Refs | Dedup% | Tokens | Compressed |
++----------------+--------+------+--------+--------+------------+
+| user_turn      | 1000   | 1488 | 32.8%  | 357120 | 489.5 KB   |
++----------------+--------+------+--------+--------+------------+
+| system_prompt  | 1000   | 1457 | 31.4%  | 145700 | 188.1 KB   |
++----------------+--------+------+--------+--------+------------+
+| assistant_turn | 1000   | 1000 | 0.0%   | 80000  | 171.1 KB   |
++----------------+--------+------+--------+--------+------------+
+
+Retrieval (decompression-only, MemoryBackend)
+------------------------------------------------------------
+  Sampled       : 1000 conversations
+  Time          : 27ms  (15485643 tok/s, 36870 conv/s)
+  Latency p50/p95/p99: 24µs / 35µs / 35µs per conversation

@@ -14,39 +14,41 @@ Runs locally on a filesystem or against S3 (and any S3-compatible store: MinIO, 
 
 ### Storage
 
-Same `stowken bench` command across four corpora, four configurations:
+`stowken bench` across four real corpora with the best available flag per workload (v0.6.1, full results in [`bench_results/REPORT.md`](bench_results/REPORT.md)):
 
-| Workload | Tokens | Incoming | Stowken | Saved |
-|---|---:|---:|---:|---:|
-| **OpenAssistant** (3,482 convs, unique crowd-sourced content) | 1.30M | 5.0 MB | 2.3 MB | **54%** (zstd only) |
-| **Production chatbot** (5 shared prompts × 500 convs) | 101K | 395 KB | 2.6 KB | **99.3%** (dedup-dominated) |
-| **Drift workload, baseline** (1000 convs, 1K-token system prompts with interpolated names + RAG) | 3.12M | 11.9 MB | 4.9 MB | 58.8% |
-| **Drift workload, `--near-dedup 0.85`** | 3.12M | 11.9 MB | 3.5 MB | **71.0%** *(+12 pp)* |
-| **Drift workload, `substrings train`** | 3.12M | 11.9 MB | 2.5 MB | **78.8%** *(+20 pp)* |
-| **Drift workload, `substrings train` + `compact`** *(retroactive rewrite)* | 3.12M | 11.9 MB | **1.9 MB** | **83.8%** *(+25 pp)* |
+| Corpus | Convs | Tokens | Incoming | Stowken | Saved | Best flag |
+|---|---:|---:|---:|---:|---:|---|
+| **Production chatbot** (5 shared prompts × 500 convs) | 500 | 101K | 395 KB | 2.6 KB | **99.3%** | exact dedup |
+| **HH-RLHF** (chosen+rejected pairs, shared prefixes) | 10 K | 1.35M | 5.2 MB | 1.8 MB | **65.5%** | *(baseline is optimal)* |
+| **LMSys-Chat-1M** sample (diverse real-world) | 10 K | 4.9M | 18.7 MB | 7.0 MB | **62.5%** | `--dict-warmup 2000` |
+| **OpenAssistant** (unique crowd-sourced Q&A) | 3.5K | 1.30M | 5.0 MB | 2.2 MB | **56.1%** | `--dict-warmup 500` |
+| **Drift, baseline** (near-dup synthetic, no flags) | 1 K | 420K | 1.6 MB | 1.0 MB | 35.9% | — |
+| **Drift, dict-warmup** | 1 K | 420K | 1.6 MB | 497 KB | **69.7%** | `--dict-warmup 200` |
+| **Drift, substrings** | 1 K | 420K | 1.6 MB | 522 KB | **68.2%** | `--with-substrings` |
+| **Drift, near-dedup 0.8** | 1 K | 420K | 1.6 MB | 838 KB | 48.9% | `--near-dedup 0.8` |
 
-Real production usage lands somewhere along this spectrum. The shape that matters is **how much of your traffic is shared between calls**:
+The shape that matters is **how repetitive your traffic is**:
 
-| Trait of your data | Best feature | Typical add'l savings |
+| Trait of your data | Best feature | Typical savings |
 |---|---|---:|
 | Identical system prompts byte-for-byte | exact dedup *(always on)* | up to 99% |
 | System prompts with interpolated values (`Hi, {name}`) | `--near-dedup` | +5–20pp |
 | Long shared boilerplate inside otherwise-distinct messages | `substrings train` + `compact` | +5–25pp |
-| Genuinely unique content (creative writing, crowdsourced) | varint + zstd *(always on)* | ~50% |
+| Domain-specific token distributions | `--dict-warmup` | +2–34pp |
+| Genuinely unique content (creative writing, crowdsourced) | varint + zstd *(always on)* | ~50–65% |
 
 ### Retrieval
 
-Decompression-only on a hot in-memory vault, OpenAssistant 3,482 convs, 1.30M tokens:
+Decompression-only on a hot in-memory vault across four corpora (v0.6.1):
 
-| Metric | Value |
-|---|---:|
-| Throughput | **20.9M tokens/sec** |
-| Conversations/sec | **56,684** |
-| Latency p50 | **16 µs** |
-| Latency p95 | 26 µs |
-| Latency p99 | 31 µs |
+| Corpus | Tokens/sec | Conv/sec | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|---:|
+| OpenAssistant (3.5K convs, baseline) | 20.9M | 56,235 | 16 µs | 27 µs | 33 µs |
+| HH-RLHF (10K convs, baseline) | 4.9M | 38,242 | 20 µs | 49 µs | 80 µs |
+| LMSys (10K convs, baseline) | 18.3M | 38,622 | 15 µs | 72 µs | 122 µs |
+| Drift (1K convs, `--with-substrings`) | 30.4M | 72,272 | 13 µs | 14 µs | **18 µs** |
 
-Near-dedup adds canonical-resolution overhead — ~30% slower on a 0x04-heavy corpus (drift, p50 29 µs → 42 µs). Substring frames decompress at the same speed as plain zstd. Filesystem and S3 add their respective I/O on top of these numbers.
+Dict-warmup increases retrieval latency (each segment decompresses with a dictionary lookup): LMSys p99 rises from 122 µs to 1,601 µs at `--dict-warmup 2000`. Near-dedup adds canonical-resolution overhead (~30% on 0x04-heavy corpora). Substring frames decompress at the same speed as plain zstd. Filesystem and S3 add their respective I/O on top.
 
 ---
 
@@ -170,7 +172,10 @@ stowken substrings gc                       # drop unreferenced substrings
 
 # Benchmarking
 stowken bench /path/to/conversations.jsonl
-stowken bench /path/to/conversations.jsonl --retrieve 1000  # +retrieval pass
+stowken bench /path/to/conversations.jsonl --retrieve 1000       # +retrieval pass
+stowken --dict-warmup 200 bench conversations.jsonl --retrieve 1000  # train dict on first 200 convs
+stowken --split-segments 256 bench conversations.jsonl           # split long messages at 256 tokens
+stowken bench conversations.jsonl --with-substrings              # train+compact substrings post-ingest
 
 # Export training pairs
 stowken export --format jsonl --output training.jsonl
@@ -326,6 +331,13 @@ stowken --near-dedup 0.85 bench drift.jsonl --retrieve 500
 huggingface-cli login
 python scripts/fetch_lmsys.py --output lmsys.jsonl --max 10000
 stowken bench lmsys.jsonl --retrieve 1000
+
+# Chosen+rejected pairs (HH-RLHF; no gating required):
+python scripts/fetch_hh_rlhf.py --output hh_rlhf.jsonl --max 10000
+stowken bench hh_rlhf.jsonl --retrieve 1000
+
+# Full 23-run sweep (all corpora × all flags):
+bash scripts/bench_sweep.sh     # results → bench_results/
 ```
 
 Each `bench` run reports the three-stage savings breakdown (naive → dedup-only → zstd), per-segment-type detail, and (if `--retrieve N` is set) decompression throughput + p50/p95/p99 latency.
@@ -342,8 +354,12 @@ stowken/
 │   └── stowken-python/  # Python bindings (PyO3 + maturin)
 ├── scripts/
 │   ├── fetch_openassistant.py
+│   ├── fetch_hh_rlhf.py
 │   ├── fetch_lmsys.py
-│   └── synth_drift_corpus.py
+│   ├── synth_drift_corpus.py
+│   └── bench_sweep.sh
+├── bench_results/
+│   └── REPORT.md
 ├── ROADMAP.md
 ├── CHANGELOG.md
 └── CONTRIBUTING.md
@@ -386,7 +402,12 @@ CI runs the first two of these on every push (see `.github/workflows/ci.yml`).
 
 ## License
 
-Apache 2.0. See `LICENSE`.
+Licensed under either of:
+
+- [MIT License](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+
+at your option.
 
 ## Contributing
 

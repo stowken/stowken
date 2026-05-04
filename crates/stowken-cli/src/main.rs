@@ -44,6 +44,14 @@ struct Cli {
     #[arg(long, global = true)]
     near_dedup: Option<f64>,
 
+    /// Split long messages into sub-segments of at most N tokens. Text
+    /// messages are split at paragraph boundaries first; pre-tokenized
+    /// messages are split at the hard token limit. Subsequent chunks use
+    /// the Continuation segment type, increasing exact-dedup hit rate for
+    /// messages that share common openings, closings, or boilerplate.
+    #[arg(long, global = true, value_name = "N")]
+    split_segments: Option<usize>,
+
     /// Output as JSON (where applicable).
     #[arg(long, short = 'j', global = true)]
     json: bool,
@@ -286,6 +294,17 @@ enum Command {
         /// retrieval pass. Default: min(ingested, 1000).
         #[arg(long)]
         retrieve: Option<u64>,
+        /// Ingest the first N conversations, train and activate a zstd
+        /// dictionary from them, then ingest the remainder with the
+        /// dictionary active. Shows dictionary compression benefit on
+        /// the tail of the corpus.
+        #[arg(long, value_name = "N")]
+        dict_warmup: Option<usize>,
+        /// After ingesting all conversations, run substring discovery
+        /// (train) and compact all segments to use the substring registry.
+        /// Reports final storage after the compaction pass.
+        #[arg(long)]
+        with_substrings: bool,
     },
 
     /// Print the resolved data directory and exit.
@@ -303,6 +322,7 @@ async fn main() -> Result<()> {
         enable_compression: !cli.no_compression,
         near_dedup_threshold: cli.near_dedup,
     };
+    let split_segments = cli.split_segments;
 
     match cli.command {
         Command::DataDir => {
@@ -387,8 +407,8 @@ async fn main() -> Result<()> {
         Command::FindNearDuplicates { threshold, min_refs, limit } => {
             cmd_find_near_duplicates(&data_dir, config, threshold, min_refs, limit, cli.json).await?;
         }
-        Command::Bench { input, max, retrieve } => {
-            cmd_bench(config, input, max, retrieve, cli.json).await?;
+        Command::Bench { input, max, retrieve, dict_warmup, with_substrings } => {
+            cmd_bench(config, split_segments, input, max, retrieve, dict_warmup, with_substrings, cli.json).await?;
         }
     }
 
@@ -1153,9 +1173,12 @@ async fn cmd_dict(
 
 async fn cmd_bench(
     config: StowkenConfig,
+    split_segments: Option<usize>,
     input: PathBuf,
     max: Option<u64>,
     retrieve: Option<u64>,
+    dict_warmup: Option<usize>,
+    with_substrings: bool,
     json: bool,
 ) -> Result<()> {
     let conversations = collect_conversations(&input, max)?;
@@ -1163,16 +1186,47 @@ async fn cmd_bench(
         anyhow::bail!("no conversations found under {}", input.display());
     }
 
-    let vault = Stowken::new(MemoryBackend::new(), config)
+    let near_dedup_active = config.near_dedup_threshold.is_some();
+    let mut vault = Stowken::new(MemoryBackend::new(), config)
         .await
         .context("opening in-memory bench vault")?;
+
+    if let Some(max_tokens) = split_segments {
+        vault.set_segmenter_config(stowken::segmenter::SegmenterConfig {
+            max_segment_tokens: Some(max_tokens),
+            ..Default::default()
+        });
+    }
+
+    // Dict-warmup phase: ingest the first N conversations, train + activate a
+    // zstd dictionary, then ingest the remainder with it active.
+    let (warmup_count, warmup_elapsed) = if let Some(n) = dict_warmup {
+        let warmup = conversations[..n.min(conversations.len())].to_vec();
+        let t0 = std::time::Instant::now();
+        for conv in &warmup {
+            let _ = vault.store(conv.clone()).await;
+        }
+        let warmup_elapsed = t0.elapsed();
+        vault
+            .train_and_activate_dictionary(warmup.len().min(500))
+            .await
+            .context("training dictionary after warmup")?;
+        (warmup.len(), Some(warmup_elapsed))
+    } else {
+        (0, None)
+    };
 
     let started = std::time::Instant::now();
     let mut ingested = 0u64;
     let mut failures = 0u64;
     let mut ingested_ids: Vec<String> = Vec::new();
-    for conv in conversations {
-        match vault.store(conv).await {
+    let tail = if dict_warmup.is_some() {
+        &conversations[warmup_count..]
+    } else {
+        &conversations[..]
+    };
+    for conv in tail {
+        match vault.store(conv.clone()).await {
             Ok(result) => {
                 ingested += 1;
                 ingested_ids.push(result.id);
@@ -1181,6 +1235,22 @@ async fn cmd_bench(
         }
     }
     let elapsed = started.elapsed();
+
+    // Substring phase: train registry + compact all segments.
+    let (substring_elapsed, substring_compacted) = if with_substrings {
+        let t0 = std::time::Instant::now();
+        vault
+            .train_substrings(500, 5)
+            .await
+            .context("training substring registry")?;
+        let compact = vault
+            .compact_substrings()
+            .await
+            .context("compacting substrings")?;
+        (Some(t0.elapsed()), Some(compact))
+    } else {
+        (None, None)
+    };
 
     let stats = vault.stats().await.context("fetching stats")?;
     let dedup_only_bytes = vault
@@ -1252,6 +1322,9 @@ async fn cmd_bench(
     } else {
         0
     };
+    if let Some(we) = warmup_elapsed {
+        println!("  Warmup        : {} convs (dict trained in {}ms)", warmup_count, we.as_millis());
+    }
     println!(
         "  Conversations : {}  ({} failed)",
         ingested, failures
@@ -1263,6 +1336,14 @@ async fn cmd_bench(
         per_conv_us,
         toks_per_sec
     );
+    if let Some(compact) = &substring_compacted {
+        println!(
+            "  Substrings    : {}ms — {} segs rewritten, {} bytes saved",
+            substring_elapsed.unwrap_or_default().as_millis(),
+            compact.segments_rewritten,
+            compact.bytes_saved,
+        );
+    }
     println!();
 
     // Two reference points:
@@ -1277,18 +1358,26 @@ async fn cmd_bench(
 
     println!("Storage layers");
     println!("{}", "-".repeat(60));
-    let dedup_save_pct = pct_saved(stats.naive_bytes, dedup_only_bytes);
+    let dedup_save_pct = pct_saved(incoming_bytes, dedup_only_bytes);
     let zstd_save_pct = pct_saved(dedup_only_bytes, stats.storage_bytes);
     let total_save_pct = pct_saved(incoming_bytes, stats.storage_bytes);
     println!(
         "  Incoming (u32): {:>10}   (ingested tokens \u{00d7} 4)",
         format_bytes(incoming_bytes)
     );
-    println!(
-        "  After dedup   : {:>10}   {:>5.1}% saved by dedup alone (refs \u{00d7} raw \u{2192} unique \u{00d7} raw)",
-        format_bytes(dedup_only_bytes),
-        dedup_save_pct
-    );
+    if near_dedup_active {
+        println!(
+            "  After dedup   : {:>10}   {:>5.1}% saved by exact dedup (near-dedup delta savings in compression layer)",
+            format_bytes(dedup_only_bytes),
+            dedup_save_pct
+        );
+    } else {
+        println!(
+            "  After dedup   : {:>10}   {:>5.1}% saved by dedup alone (refs \u{00d7} raw \u{2192} unique \u{00d7} raw)",
+            format_bytes(dedup_only_bytes),
+            dedup_save_pct
+        );
+    }
     println!(
         "  After zstd    : {:>10}   {:>5.1}% saved on top of dedup",
         format_bytes(stats.storage_bytes),
@@ -1305,6 +1394,9 @@ async fn cmd_bench(
 
     println!("Per-segment-type breakdown");
     println!("{}", "-".repeat(60));
+    if near_dedup_active {
+        println!("  (Refs/Dedup% include canonical GC-pin refs from near-dedup variants)");
+    }
     #[derive(Tabled)]
     struct Row {
         #[tabled(rename = "Type")]

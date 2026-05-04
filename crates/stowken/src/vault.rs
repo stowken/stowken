@@ -1195,27 +1195,30 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         .await
         .map_err(|e| StowkenError::Internal(e.to_string()))??;
 
-        // Verify each candidate's actual Jaccard similarity.
+        // Fetch all candidate signatures in one query, then score in memory.
+        let to_score: Vec<SegmentHash> = candidates
+            .into_iter()
+            .filter(|h| h != variant_hash)
+            .collect();
+
         let mut best: Option<(SegmentHash, f64)> = None;
-        for candidate_hash in candidates {
-            // A candidate matching its own hash is a no-op (shouldn't
-            // happen since variant_hash is by definition not yet stored).
-            if &candidate_hash == variant_hash {
-                continue;
-            }
+        if !to_score.is_empty() {
             let index = self.index.clone();
-            let h = candidate_hash.clone();
-            let sig_bytes_opt = task::spawn_blocking(move || index.get_near_dedup_signature(&h))
-                .await
-                .map_err(|e| StowkenError::Internal(e.to_string()))??;
-            let candidate_sig = match sig_bytes_opt {
-                Some(bytes) => MinHashSignature::from_bytes(&bytes)
-                    .map_err(|e| StowkenError::Internal(format!("LSH signature corrupt: {e}")))?,
-                None => continue,
-            };
-            let sim = signature.jaccard(&candidate_sig);
-            if sim >= threshold && best.as_ref().is_none_or(|(_, prev)| sim > *prev) {
-                best = Some((candidate_hash, sim));
+            let to_score_clone = to_score.clone();
+            let sig_map = task::spawn_blocking(move || {
+                index.get_near_dedup_signatures_batch(&to_score_clone)
+            })
+            .await
+            .map_err(|e| StowkenError::Internal(e.to_string()))??;
+
+            for candidate_hash in to_score {
+                let Some(bytes) = sig_map.get(&candidate_hash) else { continue };
+                let candidate_sig = MinHashSignature::from_bytes(bytes)
+                    .map_err(|e| StowkenError::Internal(format!("LSH signature corrupt: {e}")))?;
+                let sim = signature.jaccard(&candidate_sig);
+                if sim >= threshold && best.as_ref().is_none_or(|(_, prev)| sim > *prev) {
+                    best = Some((candidate_hash, sim));
+                }
             }
         }
 

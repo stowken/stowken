@@ -1,9 +1,10 @@
 [package]
 name = "stowken-cli"
-version = "0.5.1"
+version = "0.6.1"
 edition = "2021"
 description = "Command-line interface for Stowken"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/stowken/stowken"
 default-run = "stowken"
 
 [[bin]]

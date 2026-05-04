@@ -320,27 +320,41 @@ impl MetadataIndex {
         &self,
         band_hashes: &[u64],
     ) -> MetadataResult<Vec<SegmentHash>> {
+        if band_hashes.is_empty() {
+            return Ok(vec![]);
+        }
         let conn = self.conn.lock().unwrap();
+
+        // One UNION ALL query instead of N round-trips. Band count is a small
+        // fixed constant (16), so the query string is bounded in size.
+        let arms: Vec<String> = band_hashes
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                format!(
+                    "SELECT segment_hash FROM near_dedup_bands \
+                     WHERE band_index = ?{} AND band_hash = ?{}",
+                    i * 2 + 1,
+                    i * 2 + 2,
+                )
+            })
+            .collect();
+        let sql = arms.join(" UNION ALL ");
+
+        let mut stmt = conn.prepare(&sql)?;
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
-
-        // Build the OR clause manually since rusqlite doesn't bind arrays
-        // cleanly without the "array" feature; this is a small fixed-size
-        // query (16 bands by default).
-        for (band_index, band_hash) in band_hashes.iter().enumerate() {
-            let mut stmt = conn.prepare(
-                "SELECT segment_hash FROM near_dedup_bands \
-                 WHERE band_index = ?1 AND band_hash = ?2",
-            )?;
-            let rows = stmt.query_map(
-                params![band_index as i64, *band_hash as i64],
-                |row| row.get::<_, String>(0),
-            )?;
-            for row in rows {
-                let hash_str = row?;
-                if seen.insert(hash_str.clone()) {
-                    out.push(SegmentHash(hash_str));
-                }
+        let params_iter = rusqlite::params_from_iter(
+            band_hashes
+                .iter()
+                .enumerate()
+                .flat_map(|(i, &bh)| [i as i64, bh as i64]),
+        );
+        let rows = stmt.query_map(params_iter, |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let hash_str = row?;
+            if seen.insert(hash_str.clone()) {
+                out.push(SegmentHash(hash_str));
             }
         }
         Ok(out)
@@ -362,6 +376,35 @@ impl MetadataIndex {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Fetch signatures for multiple segment hashes in one query. Returns a
+    /// map of hash → signature bytes for hashes that exist in the index.
+    pub fn get_near_dedup_signatures_batch(
+        &self,
+        hashes: &[SegmentHash],
+    ) -> MetadataResult<std::collections::HashMap<SegmentHash, Vec<u8>>> {
+        if hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders: Vec<String> = (1..=hashes.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT segment_hash, signature FROM near_dedup_signatures \
+             WHERE segment_hash IN ({})",
+            placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_iter = rusqlite::params_from_iter(hashes.iter().map(|h| &h.0));
+        let rows = stmt.query_map(params_iter, |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (hash_str, sig) = row?;
+            map.insert(SegmentHash(hash_str), sig);
+        }
+        Ok(map)
     }
 
     /// Remove all near-dedup state for a segment (used during GC).
