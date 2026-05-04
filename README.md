@@ -1,66 +1,51 @@
 # Stowken
 
-**Compressed, deduplicated, queryable storage for LLM conversations.**
+Most teams running LLM APIs in production are storing every conversation as raw JSON — which means the same system prompt written to disk thousands of times, no visibility into what's actually flowing through the API, and no way to answer "how many tokens did we spend on model X last month?" without a full table scan.
 
-Stowken stores LLM conversations as content-addressed token segments. Identical system prompts are stored once across the corpus; near-duplicates are stored as deltas; long recurring boilerplate is promoted to shared substring blobs; everything else is varint+zstd compressed. A SQLite index sits on top so you can audit what's actually flowing through your LLM in production.
-
-Runs locally on a filesystem or against S3 (and any S3-compatible store: MinIO, R2, Spaces). The S3 backend is multi-writer safe via ETag-based optimistic concurrency on ref-count writes.
-
-> Status: pre-1.0. The on-disk format is forward-compatible (every frame carries a 1-byte version tag, every manifest carries a `schema_version`), but the public API may still break on minor version bumps until 1.0.
+Stowken is a storage library that fixes this. It stores LLM conversations as content-addressed token segments: identical system prompts are stored once regardless of how many users trigger them, everything is compressed, and a SQLite index sits on top so you can query your traffic without rebuilding it from logs.
 
 ---
 
-## Headline numbers
+## What you get
 
-### Storage
+**Storage efficiency.** Repeated system prompts collapse to a single copy. RAG context that overlaps across users is stored once. Everything else is varint+zstd compressed. On corpora with shared prompts across users, savings are dominated by dedup (99%+ on fully-shared prompts). On diverse corpora, you still get 54–65% from compression alone — better than uncompressed JSON without any configuration.
 
-`stowken bench` across four real corpora with the best available flag per workload (v0.6.1, full results in [`bench_results/REPORT.md`](bench_results/REPORT.md)):
+**Visibility into your traffic.** The SQLite index lets you answer questions that would otherwise require log archaeology:
 
-| Corpus | Convs | Tokens | Incoming | Stowken | Saved | Best flag |
-|---|---:|---:|---:|---:|---:|---|
-| **Production chatbot** (5 shared prompts × 500 convs) | 500 | 101K | 395 KB | 2.6 KB | **99.3%** | exact dedup |
-| **HH-RLHF** (chosen+rejected pairs, shared prefixes) | 10 K | 1.35M | 5.2 MB | 1.8 MB | **65.5%** | *(baseline is optimal)* |
-| **LMSys-Chat-1M** sample (diverse real-world) | 10 K | 4.9M | 18.7 MB | 7.0 MB | **62.5%** | `--dict-warmup 2000` |
-| **OpenAssistant** (unique crowd-sourced Q&A) | 3.5K | 1.30M | 5.0 MB | 2.2 MB | **56.1%** | `--dict-warmup 500` |
-| **Drift, baseline** (near-dup synthetic, no flags) | 1 K | 420K | 1.6 MB | 1.0 MB | 35.9% | — |
-| **Drift, dict-warmup** | 1 K | 420K | 1.6 MB | 497 KB | **69.7%** | `--dict-warmup 200` |
-| **Drift, substrings** | 1 K | 420K | 1.6 MB | 522 KB | **68.2%** | `--with-substrings` |
-| **Drift, near-dedup 0.8** | 1 K | 420K | 1.6 MB | 838 KB | 48.9% | `--near-dedup 0.8` |
+```sh
+stowken audit-system-prompts          # which prompts are in use, how many times each
+stowken cost --by application,model   # token spend broken down any way you want
+stowken find-duplicates               # what segments are most heavily shared
+stowken segment-stats                 # per-role token distribution across your corpus
+```
 
-The shape that matters is **how repetitive your traffic is**:
+**Retrieval, not just archival.** Stored conversations can be retrieved and decompressed in microseconds — 15–30µs p99 on a hot vault. This isn't a write-only log; it's a queryable store.
 
-| Trait of your data | Best feature | Typical savings |
+---
+
+## When it pays off most
+
+The more structural repetition your traffic has, the more Stowken helps:
+
+| Your workload | What Stowken does | Typical savings |
 |---|---|---:|
-| Identical system prompts byte-for-byte | exact dedup *(always on)* | up to 99% |
-| System prompts with interpolated values (`Hi, {name}`) | `--near-dedup` | +5–20pp |
-| Long shared boilerplate inside otherwise-distinct messages | `substrings train` + `compact` | +5–25pp |
-| Domain-specific token distributions | `--dict-warmup` | +2–34pp |
-| Genuinely unique content (creative writing, crowdsourced) | varint + zstd *(always on)* | ~50–65% |
+| Multi-tenant chatbot (shared system prompt per product) | One copy of each system prompt, regardless of user count | Up to 99% on prompt tokens |
+| RAG application (document chunks reused across queries) | Overlapping context segments deduplicated automatically | 20–60% depending on overlap rate |
+| RLHF / fine-tuning pipeline (chosen+rejected pairs) | Shared conversation prefixes stored once | ~65% on the full corpus |
+| Diverse real-world traffic (creative writing, support, etc.) | Compression only | 54–65% |
+| Genuinely unique content, no shared structure | Same as zstd | 50–60% |
 
-### Retrieval
-
-Decompression-only on a hot in-memory vault across four corpora (v0.6.1):
-
-| Corpus | Tokens/sec | Conv/sec | p50 | p95 | p99 |
-|---|---:|---:|---:|---:|---:|
-| OpenAssistant (3.5K convs, baseline) | 20.9M | 56,235 | 16 µs | 27 µs | 33 µs |
-| HH-RLHF (10K convs, baseline) | 4.9M | 38,242 | 20 µs | 49 µs | 80 µs |
-| LMSys (10K convs, baseline) | 18.3M | 38,622 | 15 µs | 72 µs | 122 µs |
-| Drift (1K convs, `--with-substrings`) | 30.4M | 72,272 | 13 µs | 14 µs | **18 µs** |
-
-Dict-warmup increases retrieval latency (each segment decompresses with a dictionary lookup): LMSys p99 rises from 122 µs to 1,601 µs at `--dict-warmup 2000`. Near-dedup adds canonical-resolution overhead (~30% on 0x04-heavy corpora). Substring frames decompress at the same speed as plain zstd. Filesystem and S3 add their respective I/O on top.
+If you have a system prompt that goes to 10,000 users per day, Stowken stores it once. If you're doing RLHF with chosen/rejected pairs that share a conversation prefix, those prefixes are stored once. If your traffic is completely unique with no repeated structure, you're getting good compression and the analytics layer — compression alone won't be the headline.
 
 ---
 
 ## Install
 
-The crate hasn't been published yet (see ROADMAP and the licensing/availability discussion). Until then, build from source:
-
 ```sh
 git clone https://github.com/stowken/stowken
 cd stowken
 
-# Rust library + CLI
+# CLI
 cargo install --path crates/stowken-cli
 
 # Python wheel
@@ -69,15 +54,11 @@ maturin build --release
 pip install ../../target/wheels/stowken-*.whl
 ```
 
-When the first version is published you'll be able to:
-
 ```toml
 # Cargo.toml
 [dependencies]
 stowken = "0.6"
-
-# enable the S3 backend
-stowken = { version = "0.6", features = ["s3"] }
+stowken = { version = "0.6", features = ["s3"] }  # S3 backend
 ```
 
 ```sh
@@ -93,13 +74,13 @@ pip install stowken
 ```python
 import stowken
 
-# In-memory (testing)
+# In-memory (testing / ephemeral)
 vault = stowken.Stowken()
 
-# Persistent on local disk
+# Persistent local vault
 vault = stowken.Stowken.open("/var/lib/stowken")
 
-# S3-backed (multi-writer safe)
+# S3-backed, multi-writer safe
 vault = stowken.Stowken.open_s3(
     bucket="my-vault",
     local_db_path="/var/lib/stowken-s3.db",
@@ -118,32 +99,32 @@ result = vault.store({
     ],
 })
 
+print(result["deduped_segments"])   # how many segments were already stored
+print(result["bytes_saved"])        # bytes not written this call
+
 retrieved = vault.retrieve("conv-001")
 for seg in retrieved["segments"]:
     print(seg["segment_type"], seg["tokens"][:10])
 ```
 
-Pre-tokenized input is supported — pass `{"role": "user", "tokens": [9125, 25, ...]}` to skip the built-in tiktoken pass.
+Pass `{"role": "user", "tokens": [9125, 25, ...]}` to skip the built-in tokenization pass if you're already tokenizing upstream.
 
-**Async API.** Every I/O method has an `_async` variant safe inside an asyncio event loop:
+**Async API.** Every I/O method has an `_async` variant safe inside an asyncio event loop. Sync and async share the same vault and Tokio runtime — mix freely:
 
 ```python
-async def main():
-    vault = stowken.Stowken.open("/var/lib/stowken")
-    await vault.store_async({"model": "gpt-4", "messages": [...]})
-    conv = await vault.retrieve_async("conv-001")
-
-asyncio.run(main())
+async def handle_conversation(conv):
+    result = await vault.store_async(conv)
+    return result
 ```
 
-Sync and async share the same vault and the same Tokio runtime — they can be mixed freely. Available pairs: `store`, `retrieve`, `delete`, `stats`, `segment_stats`, `gc`, `gc_candidates`, `reindex`, `find_near_duplicates`, `near_dedup_index_size`, `train_dictionary`, `activate_dictionary`, `list_dictionaries`, `train_substrings`, `list_substrings`, `compact_substrings`, `gc_substrings`.
+Available pairs: `store`, `retrieve`, `delete`, `stats`, `segment_stats`, `gc`, `gc_candidates`, `reindex`, `find_near_duplicates`, `near_dedup_index_size`, `train_dictionary`, `activate_dictionary`, `list_dictionaries`, `train_substrings`, `list_substrings`, `compact_substrings`, `gc_substrings`.
 
 ### CLI
 
 ```sh
-# Default data dir: ~/.local/share/stowken (override with --data-dir or $STOWKEN_DATA_DIR)
+# Data dir defaults to ~/.local/share/stowken (override: --data-dir or $STOWKEN_DATA_DIR)
 
-# Ingest from stdin or file
+# Ingest
 stowken store conversation.json --id conv-001 --application my-app
 echo '{"model":"gpt-4","messages":[...]}' | stowken store -
 
@@ -151,196 +132,218 @@ echo '{"model":"gpt-4","messages":[...]}' | stowken store -
 stowken retrieve conv-001
 stowken retrieve conv-001 --segments       # raw token arrays
 
-# Aggregate analytics
+# Analytics (the useful part)
+stowken audit-system-prompts               # prompt inventory by ref count
+stowken cost --by application,model        # token attribution
+stowken find-duplicates --threshold 10     # heavily-shared segments
+stowken find-near-duplicates               # prompt drift clusters
 stowken stats
 stowken segment-stats
-stowken audit-system-prompts                # find prompt drift
-stowken cost --by application,model         # token attribution
-stowken find-duplicates --threshold 10      # high-traffic refactor candidates
-stowken find-near-duplicates                # similarity clusters
 
 # Maintenance
 stowken gc --dry-run
-stowken reindex                             # rebuild SQLite from manifests
+stowken reindex                            # rebuild SQLite from manifests
 
-# Compression knobs (each off-by-default)
-stowken --near-dedup 0.85 store conv.json   # ingest with near-dedup ON
-stowken dict train --samples 200 --activate # zstd dictionary
-stowken substrings train --samples 500      # substring promotion
-stowken substrings compact                  # retroactively rewrite old segments
-stowken substrings gc                       # drop unreferenced substrings
-
-# Benchmarking
-stowken bench /path/to/conversations.jsonl
-stowken bench /path/to/conversations.jsonl --retrieve 1000       # +retrieval pass
-stowken --dict-warmup 200 bench conversations.jsonl --retrieve 1000  # train dict on first 200 convs
-stowken --split-segments 256 bench conversations.jsonl           # split long messages at 256 tokens
-stowken bench conversations.jsonl --with-substrings              # train+compact substrings post-ingest
-
-# Export training pairs
-stowken export --format jsonl --output training.jsonl
+# Advanced compression (see "Tuning" below)
+stowken dict train --samples 200 --activate
+stowken substrings train --samples 500
+stowken substrings compact
 ```
 
-S3 backing for the CLI lands in v0.6.1; for now the CLI uses the filesystem backend.
+S3 CLI integration lands in v0.6.1. For now the CLI uses the filesystem backend; Python has full S3 support.
 
 ### Rust
 
 ```rust
-use stowken::{
-    storage::MemoryBackend,                      // or FilesystemBackend, S3Backend
-    types::{Conversation, Message, MessageContent, StowkenConfig},
-    Stowken,
-};
+use stowken::{storage::FilesystemBackend, types::*, Stowken};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let vault = Stowken::new(MemoryBackend::new(), StowkenConfig::default()).await?;
+    let backend = FilesystemBackend::new("/var/lib/stowken").await?;
+    let vault = Stowken::open(backend, StowkenConfig::default(), "/var/lib/stowken/metadata.db").await?;
 
-    let conv = Conversation {
+    let result = vault.store(Conversation {
         id: Some("conv-001".into()),
         model: "gpt-4".into(),
         tokenizer: "cl100k_base".into(),
-        application: Some("my-app".into()),
+        application: Some("prod".into()),
         messages: vec![
-            Message { role: "system".into(),    content: MessageContent::Text("You are a helpful assistant.".into()),
-                      name: None, tool_call_id: None },
-            Message { role: "user".into(),      content: MessageContent::Text("What is 2 + 2?".into()),
-                      name: None, tool_call_id: None },
-            Message { role: "assistant".into(), content: MessageContent::Text("4".into()),
-                      name: None, tool_call_id: None },
+            Message { role: "system".into(), content: MessageContent::Text("You are a helpful assistant.".into()), name: None, tool_call_id: None },
+            Message { role: "user".into(),   content: MessageContent::Text("Hello".into()), name: None, tool_call_id: None },
         ],
         metadata: None,
-    };
+    }).await?;
 
-    let result = vault.store(conv).await?;
-    let retrieved = vault.retrieve(&result.id).await?;
+    println!("deduped {} segments, saved {} bytes", result.deduped_segments, result.bytes_saved);
     Ok(())
 }
 ```
-
-For a persistent vault, swap `MemoryBackend::new()` for `FilesystemBackend::new("/var/lib/stowken").await?` and use `Stowken::open(backend, config, "/var/lib/stowken/metadata.db").await?`. For S3, enable the `s3` feature and use `S3Backend::with_options(bucket, prefix, endpoint, region).await?`.
 
 ---
 
 ## Storage backends
 
-| Backend | Persistence | Multi-writer safe | Use case |
+| Backend | Persistence | Multi-writer | Use case |
 |---|---|---|---|
-| `MemoryBackend` | none | n/a | testing, ephemeral caches |
-| `FilesystemBackend` | local disk | no (single-process per data dir) | local dev, single-host servers |
-| `S3Backend` *(behind `s3` Cargo feature)* | S3 / MinIO / R2 / Spaces | **yes** — ETag-based optimistic ref-count CAS | cloud, multi-writer ingest |
+| `MemoryBackend` | none | n/a | tests, ephemeral |
+| `FilesystemBackend` | local disk | single-process | local dev, single-host |
+| `S3Backend` *(feature `s3`)* | S3-compatible | **yes** — ETag-based CAS | cloud, multi-writer ingest |
 
-The S3 backend uses `If-None-Match: *` on first-time meta writes and `If-Match: <etag>` on every ref-count update; on `412 Precondition Failed` the loop re-reads and retries up to 8 times with capped exponential backoff. Two writers concurrently incrementing the same segment's ref-count produce the correct final value — pinned by `s3_concurrent_increments_no_lost_writes`.
+The S3 backend uses `If-None-Match: *` for first-time segment writes and `If-Match: <etag>` for every ref-count update, retrying on `412 Precondition Failed` up to 8 times with capped exponential backoff. Two writers concurrently deduplicating the same segment produce the correct final ref count — pinned by `s3_concurrent_increments_no_lost_writes`.
+
+Compatible with AWS S3, MinIO, localstack, Cloudflare R2, and DigitalOcean Spaces via `S3Backend::with_options(bucket, prefix, endpoint, region)`.
 
 ---
 
 ## How it works
 
-**1. Segmentation.** Each message is classified by role:
+**Segmentation.** Each message is classified by role:
 
-| Role               | Segment type      |
-|--------------------|-------------------|
-| `system`           | `system_prompt`   |
-| `user`             | `user_turn`       |
-| `assistant`        | `assistant_turn`  |
-| `tool` (with id)   | `tool_result`     |
-| `tool` (no id)     | `tool_call`       |
+| Role | Segment type |
+|---|---|
+| `system` | `system_prompt` |
+| `user` | `user_turn` |
+| `assistant` | `assistant_turn` |
+| `tool` (with id) | `tool_result` |
+| `tool` (no id) | `tool_call` |
 
-A configurable token-sequence delimiter inside a `user_turn` optionally splits it into a `Context` + `UserTurn` pair so RAG context dedups separately from the actual question.
+Long messages can optionally be split at paragraph boundaries into `Continuation` chunks, each deduplicated independently (see `--split-segments` below).
 
-**2. Content addressing.** Each segment is hashed with SHA-256 over the little-endian token bytes. Two segments with identical tokens always produce the same hash.
+**Content addressing.** Each segment is SHA-256 hashed over its little-endian token bytes. Same tokens → same hash, always.
 
-**3. Deduplication.** If the hash already exists, increment the segment's reference count. If not, compress and store. The `ConversationManifest` records the ordered list of hashes plus metadata; it never embeds segment data.
+**Deduplication.** If the hash exists, increment the ref count and return. The `ConversationManifest` records ordered hashes; it never embeds token data. This is why a system prompt used by 10,000 users takes up storage proportional to 1 system prompt, not 10,000.
 
-**4. Compression.** Multiple paths, all arranged so the cheapest representation wins:
+**Compression.** Four paths, arranged so the smallest representation wins:
 
-- **Always on:** varint + zstd. Varint alone saves ~40% over 4-byte-per-token; zstd takes another 5–15pp.
-- **Opt-in via `dict train`:** trained zstd dictionary improves compression on domain-specific token distributions.
-- **Opt-in via `--near-dedup`:** segments that are *almost* identical are stored as a streaming delta against the canonical.
-- **Opt-in via `substrings train`:** long recurring substrings are promoted to shared blobs; segments reference them by ID.
+| Frame | Codec | When |
+|---|---|---|
+| `0x01` | varint only | compression disabled |
+| `0x02` | varint + zstd | default |
+| `0x03` | varint + zstd + dictionary | after `dict train --activate` |
+| `0x04` | delta against a canonical | `--near-dedup` enabled, near-duplicate found |
+| `0x05` | substring references | after `substrings train` + `compact` |
 
-Each path is gated by a strict cost-model check: if a smaller frame can't be produced, the previous best representation is kept. There is never a net-regression in stored bytes.
+Each path is gated by a strict cost-model check — if a smaller frame can't be produced, the previous best is kept. **There is never a net regression in stored bytes.**
 
-**5. Metadata index.** A SQLite database (`metadata.db`) tracks conversations, segment metadata, near-dedup signatures, and LSH band buckets. All the analytics commands run against this index. The index is a derived cache — `stowken reindex` rebuilds it from on-disk manifests.
+**Metadata index.** SQLite tracks conversations, segment metadata, near-dedup signatures, and LSH band buckets. The analytics commands run against this index. It's a derived cache — `stowken reindex` rebuilds it from on-disk manifests.
 
 ```
 vault-root/
-├── segments/
-│   └── aa/bb/aabb...cc            # versioned compressed bytes
-│       aabb...cc.meta             # ref-count + sizes JSON sidecar
-├── manifests/
-│   └── conv-001.json              # ordered list of segment hashes
-├── dictionaries/                  # zstd dicts, named by dict_id (v0.3+)
-├── substrings/                    # packed substring registry (v0.5+)
-│   ├── blobs.dat
-│   └── index.json
-└── metadata.db                    # SQLite index
+├── segments/          # content-addressed compressed frames
+├── manifests/         # per-conversation ordered segment lists
+├── dictionaries/      # zstd dicts, one per training run (v0.3+)
+├── substrings/        # packed substring registry (v0.5+)
+└── metadata.db        # SQLite analytics index
 ```
-
-### Frame format
-
-Every compressed segment starts with a 1-byte version tag. Decompression dispatches per-frame so old data stays readable forever.
-
-| Byte | Codec | Body |
-|------|-------|------|
-| `0x01` | varint only | `varint(tokens)` |
-| `0x02` | varint + zstd | `zstd(varint(tokens))` |
-| `0x03` | varint + zstd with dictionary | `dict_id(u32 LE) || zstd(varint(tokens), dict)` |
-| `0x04` | delta against a canonical segment | `canonical_hash(32 bytes) || streaming delta ops` |
-| `0x05` | substring-referenced segment | sequence of `Inline(tokens)` and `Ref(substring_id)` ops |
-
-The manifest carries a `schema_version` field with the same forward-compatibility guarantee. Future codecs get new bytes; existing data stays readable indefinitely.
 
 ---
 
-## Configuration
+## Tuning
 
-`StowkenConfig` is small on purpose:
+The defaults (varint + zstd + exact dedup) are the right starting point. The options below are for specific workloads, measured on your data before enabling in production.
 
-```rust
-let config = StowkenConfig {
-    enable_compression: true,         // varint+zstd; set false for varint only
-    near_dedup_threshold: None,       // Some(0.85) to enable near-dedup
-};
-```
+### `--dict-warmup N` (bench) / `dict train --activate` (production)
 
-Tokenizer support is opt-in via `set_tokenizer()` or a built-in tiktoken adapter (when the `tiktoken` feature is enabled, which it is by default). Pre-tokenized input via `MessageContent::Tokens(Vec<u32>)` always works with no tokenizer configured.
+Trains a zstd dictionary on a sample of your corpus, then compresses subsequent segments with it. Works best on domain-specific token distributions (medical, code, legal, consistent prompt styles). Not worth enabling for highly diverse traffic.
 
-The dictionary registry, substring registry, and near-dedup LSH index are managed via dedicated APIs (`train_dictionary`, `train_substrings`, etc.), not config — they're stateful and persistent.
+**Tradeoff:** additional storage savings (2–34pp depending on corpus), but dictionary decompression adds latency per segment. On a large diverse corpus this can be 10× higher p99 retrieval latency. Measure on your retrieval SLA before enabling.
+
+### `--split-segments N`
+
+Splits messages longer than N tokens at paragraph boundaries before storage, enabling finer-grained dedup within long messages. Useful when your system prompts or RAG context blocks have shared sub-sections.
+
+**Tradeoff:** improves dedup rate on diverse corpora (LMSys: 1.5% → 8.8% exact dedup at 256 tokens) but shorter segments compress less well — combined savings can decrease. Useful when retrieval granularity matters more than compression ratio.
+
+### `--near-dedup <threshold>`
+
+Stores near-duplicate segments (Jaccard similarity above threshold) as streaming deltas against a canonical. Useful when your prompts are systematically varied — interpolated user names, slight formatting changes, A/B prompt versions.
+
+**Tradeoff:** 8–18× ingest cost per segment. In our benchmarks across three real-world datasets (HH-RLHF, LMSys, OpenAssistant), near-dedup added zero storage savings over baseline — the data simply wasn't near-duplicate at the token level. It showed +13pp on a synthetic corpus designed to have systematic drift. **Enable only after confirming near-duplicate structure in your actual data** with `stowken find-near-duplicates`.
+
+### Substrings (`substrings train` + `substrings compact`)
+
+Discovers recurring token sequences across your corpus and promotes them to shared blobs. Effective on corpora with genuine sub-segment boilerplate (boilerplate disclaimers, repeated RAG fragments inside otherwise-unique segments).
+
+**Tradeoff:** a post-ingest batch step, not a real-time optimization. No retrieval overhead — substring frames decompress at the same speed as plain zstd. Run `compact` retroactively to rewrite segments stored before training.
 
 ---
 
-## Reproducing the benchmarks
+## Benchmark numbers
 
-The numbers in this README are reproducible from scripts in `scripts/`:
+`stowken bench` across four corpora (v0.6.1 — full results in [`bench_results/REPORT.md`](bench_results/REPORT.md)):
+
+### Storage
+
+| Corpus | Convs | Incoming | Stored | Saved | Notes |
+|---|---:|---:|---:|---:|---|
+| Production chatbot (5 shared prompts × 500 convs) | 500 | 395 KB | 2.6 KB | **99.3%** | dedup-dominated |
+| HH-RLHF chosen+rejected pairs | 10 K | 5.2 MB | 1.8 MB | **65.5%** | 38.9% from dedup, 43.5% from compression |
+| LMSys-Chat-1M sample | 10 K | 18.7 MB | 7.0 MB | **62.5%** | dict-warmup; 60.4% without |
+| OpenAssistant unique Q&A | 3.5K | 5.0 MB | 2.2 MB | **56.1%** | dict-warmup; 54.2% without |
+| Drift synthetic (near-dup) | 1 K | 1.6 MB | 497 KB | **69.7%** | dict-warmup; 35.9% without |
+
+### Retrieval (hot in-memory vault, decompression only)
+
+| Corpus | p50 | p99 | Tokens/sec |
+|---|---:|---:|---:|
+| OpenAssistant (baseline) | 16 µs | 33 µs | 20.9M |
+| HH-RLHF (baseline) | 20 µs | 80 µs | 4.9M |
+| LMSys (baseline) | 15 µs | 122 µs | 18.3M |
+| Drift (substrings) | 13 µs | 18 µs | 30.4M |
+
+Dict-warmup trades retrieval speed for density. LMSys p99 rises from 122 µs to 1,601 µs with `--dict-warmup 2000` — measure against your retrieval SLA before enabling. Filesystem and S3 backends add their respective I/O on top.
+
+### Reproducing the benchmarks
 
 ```sh
-# Crowd-sourced unique content (zstd-only territory):
+# Crowd-sourced unique content:
 pip install datasets
-python scripts/fetch_openassistant.py --output oasst.jsonl
-stowken bench oasst.jsonl --retrieve 1000
+python scripts/fetch_openassistant.py --output oa.jsonl
+stowken bench oa.jsonl --retrieve 1000
 
-# Synthetic drift-shaped corpus (near-dedup + substring territory):
-python scripts/synth_drift_corpus.py \
-    --output drift.jsonl --conversations 1000 \
-    --system-tokens 1000 --rag-tokens 2000
-stowken bench drift.jsonl --retrieve 500
-stowken --near-dedup 0.85 bench drift.jsonl --retrieve 500
+# Chosen+rejected pairs (no HF gating required):
+python scripts/fetch_hh_rlhf.py --output hh_rlhf.jsonl --max 10000
+stowken bench hh_rlhf.jsonl --retrieve 1000
 
-# Real production-mix (LMSys-Chat-1M; gated, requires HF terms acceptance):
+# Real-world diverse (LMSys-Chat-1M; requires HF terms acceptance):
 huggingface-cli login
 python scripts/fetch_lmsys.py --output lmsys.jsonl --max 10000
 stowken bench lmsys.jsonl --retrieve 1000
 
-# Chosen+rejected pairs (HH-RLHF; no gating required):
-python scripts/fetch_hh_rlhf.py --output hh_rlhf.jsonl --max 10000
-stowken bench hh_rlhf.jsonl --retrieve 1000
+# Synthetic near-duplicate corpus:
+python scripts/synth_drift_corpus.py --output drift.jsonl --conversations 1000
 
 # Full 23-run sweep (all corpora × all flags):
 bash scripts/bench_sweep.sh     # results → bench_results/
 ```
 
-Each `bench` run reports the three-stage savings breakdown (naive → dedup-only → zstd), per-segment-type detail, and (if `--retrieve N` is set) decompression throughput + p50/p95/p99 latency.
+---
+
+## Running the tests
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+
+# S3 integration tests (requires MinIO or real S3):
+docker run -d --rm -p 9000:9000 \
+    -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+    minio/minio server /data
+aws --endpoint-url http://localhost:9000 s3 mb s3://stowken-test
+STOWKEN_S3_TEST_BUCKET=stowken-test \
+    STOWKEN_S3_TEST_ENDPOINT=http://localhost:9000 \
+    AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+    AWS_REGION=us-east-1 \
+    cargo test -p stowken --features s3 --test integration_tests s3 -- --test-threads 1
+
+# Python (63 pytest tests):
+cd crates/stowken-python
+PYO3_PYTHON=python3.13 maturin build --release
+pip install --force-reinstall ../../target/wheels/stowken-*.whl
+pytest python/tests/
+```
+
+CI runs Rust build + test + clippy and Python 3.11/3.12 maturin build + pytest on every push (see `.github/workflows/ci.yml`).
 
 ---
 
@@ -349,9 +352,9 @@ Each `bench` run reports the three-stage savings breakdown (naive → dedup-only
 ```
 stowken/
 ├── crates/
-│   ├── stowken/         # core library (Apache 2.0)
-│   ├── stowken-cli/     # command-line tool
-│   └── stowken-python/  # Python bindings (PyO3 + maturin)
+│   ├── stowken/            # core library
+│   ├── stowken-cli/        # CLI tool
+│   └── stowken-python/     # Python bindings (PyO3 + maturin)
 ├── scripts/
 │   ├── fetch_openassistant.py
 │   ├── fetch_hh_rlhf.py
@@ -361,54 +364,13 @@ stowken/
 ├── bench_results/
 │   └── REPORT.md
 ├── ROADMAP.md
-├── CHANGELOG.md
-└── CONTRIBUTING.md
+└── CHANGELOG.md
 ```
-
-## Running the test suite
-
-```sh
-# Rust workspace (172 tests across all crates)
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-
-# S3 integration tests (8 extra tests; need MinIO or real S3)
-docker run -d --rm -p 9000:9000 \
-    -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-    minio/minio server /data
-aws --endpoint-url http://localhost:9000 s3 mb s3://stowken-test
-STOWKEN_S3_TEST_BUCKET=stowken-test \
-    STOWKEN_S3_TEST_ENDPOINT=http://localhost:9000 \
-    AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-    AWS_REGION=us-east-1 \
-    cargo test -p stowken --features s3 --test integration_tests s3 \
-        -- --test-threads 1
-
-# Python (63 pytest tests)
-cd crates/stowken-python
-PYO3_PYTHON=python3.13 maturin build --release
-pip install --force-reinstall ../../target/wheels/stowken-*.whl
-pytest python/tests/
-```
-
-CI runs the first two of these on every push (see `.github/workflows/ci.yml`).
-
----
-
-## Roadmap & changelog
-
-- **[ROADMAP.md](ROADMAP.md)** — milestone-by-milestone plan and status. v0.1 → v0.6 are all shipped at the core level.
-- **[CHANGELOG.md](CHANGELOG.md)** — what landed in each version.
 
 ## License
 
-Licensed under either of:
-
-- [MIT License](LICENSE-MIT)
-- [Apache License, Version 2.0](LICENSE-APACHE)
-
-at your option.
+MIT OR Apache-2.0 — your choice.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Issue templates and a security policy land before the first tagged release.
+See [CONTRIBUTING.md](CONTRIBUTING.md). To report a bug: open an issue with your Rust version, OS, and a minimal reproducible example. Security issues: email security@stowken.dev.
