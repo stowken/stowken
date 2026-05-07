@@ -658,6 +658,375 @@ impl MetadataIndex {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    // ── Semantic search: segment-level embeddings ─────────────────────────
+
+    #[cfg(feature = "semantic-search")]
+    /// Insert or replace a normalized embedding for a segment.
+    pub fn upsert_segment_embedding(
+        &self,
+        hash: &SegmentHash,
+        embedding_model: &str,
+        embedding: &[f32],
+    ) -> MetadataResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let bytes = f32_slice_to_bytes(embedding);
+        conn.execute(
+            "INSERT OR REPLACE INTO segment_embeddings \
+             (segment_hash, embedding_model, dimension, embedding, embedded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                hash.0,
+                embedding_model,
+                embedding.len() as i64,
+                bytes,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "semantic-search")]
+    /// Load every (segment_hash, embedding) pair for a model. Used for the
+    /// brute-force cosine scan during semantic search.
+    pub fn load_all_segment_embeddings(
+        &self,
+        embedding_model: &str,
+    ) -> MetadataResult<Vec<(SegmentHash, Vec<f32>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT segment_hash, embedding FROM segment_embeddings \
+             WHERE embedding_model = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![embedding_model], |r| {
+                let hash: String = r.get(0)?;
+                let bytes: Vec<u8> = r.get(1)?;
+                Ok((SegmentHash(hash), bytes_to_f32_vec(&bytes)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    /// List segment hashes that have NOT been embedded for the given model.
+    pub fn unembedded_segment_hashes(
+        &self,
+        embedding_model: &str,
+        limit: u64,
+    ) -> MetadataResult<Vec<SegmentHash>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT sm.hash FROM segments_meta sm \
+             LEFT JOIN segment_embeddings se \
+               ON sm.hash = se.segment_hash AND se.embedding_model = ?1 \
+             WHERE se.segment_hash IS NULL \
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![embedding_model, limit as i64], |r| {
+                Ok(SegmentHash(r.get::<_, String>(0)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    /// Of the given hashes, return the subset that already have embeddings
+    /// for the given model. Used to skip work after a crash-restart.
+    pub fn embedded_segment_hashes(
+        &self,
+        hashes: &[SegmentHash],
+        embedding_model: &str,
+    ) -> MetadataResult<std::collections::HashSet<SegmentHash>> {
+        if hashes.is_empty() {
+            return Ok(Default::default());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders: Vec<String> = (0..hashes.len()).map(|_| "?".to_owned()).collect();
+        let sql = format!(
+            "SELECT segment_hash FROM segment_embeddings \
+             WHERE embedding_model = ? AND segment_hash IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + hashes.len());
+        params_vec.push(&embedding_model);
+        for h in hashes {
+            params_vec.push(&h.0);
+        }
+        let rows: Vec<SegmentHash> = stmt
+            .query_map(rusqlite::params_from_iter(params_vec), |r| {
+                Ok(SegmentHash(r.get::<_, String>(0)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().collect())
+    }
+
+    #[cfg(feature = "semantic-search")]
+    /// Count segments that don't yet have an embedding for the given model.
+    pub fn count_unembedded_segments(&self, embedding_model: &str) -> MetadataResult<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM segments_meta sm \
+             LEFT JOIN segment_embeddings se \
+               ON sm.hash = se.segment_hash AND se.embedding_model = ?1 \
+             WHERE se.segment_hash IS NULL",
+            params![embedding_model],
+            |r| r.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    /// Resolve segment hashes to (conversation, segment) rows with optional
+    /// structural filters. Used after the cosine scan identifies top-K
+    /// segments to map them back to conversations.
+    pub fn conversations_for_segments_filtered(
+        &self,
+        hashes: &[SegmentHash],
+        filter_model: Option<&str>,
+        filter_application: Option<&str>,
+        filter_segment_type: Option<&SegmentType>,
+        filter_date_from: Option<chrono::DateTime<chrono::Utc>>,
+        filter_date_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> MetadataResult<Vec<ConversationSegmentRow>> {
+        if hashes.is_empty() {
+            return Ok(vec![]);
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders: Vec<String> = (0..hashes.len()).map(|_| "?".to_owned()).collect();
+        let mut sql = format!(
+            "SELECT sr.conversation_id, sr.segment_hash, sr.segment_type, \
+                    c.application, c.model, c.created_at \
+             FROM segment_refs sr \
+             JOIN conversations c ON c.id = sr.conversation_id \
+             WHERE sr.segment_hash IN ({})",
+            placeholders.join(",")
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+            hashes.iter().map(|h| Box::new(h.0.clone()) as Box<dyn rusqlite::ToSql>).collect();
+        if let Some(m) = filter_model {
+            sql.push_str(" AND c.model = ?");
+            params_vec.push(Box::new(m.to_owned()));
+        }
+        if let Some(a) = filter_application {
+            sql.push_str(" AND c.application = ?");
+            params_vec.push(Box::new(a.to_owned()));
+        }
+        if let Some(st) = filter_segment_type {
+            sql.push_str(" AND sr.segment_type = ?");
+            params_vec.push(Box::new(st.to_string()));
+        }
+        if let Some(from) = filter_date_from {
+            sql.push_str(" AND c.created_at >= ?");
+            params_vec.push(Box::new(from.to_rfc3339()));
+        }
+        if let Some(to) = filter_date_to {
+            sql.push_str(" AND c.created_at <= ?");
+            params_vec.push(Box::new(to.to_rfc3339()));
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(param_refs), |r| {
+                let st_str: String = r.get(2)?;
+                let created: String = r.get(5)?;
+                Ok(ConversationSegmentRow {
+                    conversation_id: r.get(0)?,
+                    segment_hash: SegmentHash(r.get::<_, String>(1)?),
+                    segment_type: st_str.parse().unwrap_or(SegmentType::UserTurn),
+                    application: r.get(3)?,
+                    model: r.get(4)?,
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created)
+                        .map(|d| d.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now()),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    // ── Semantic search: conversation-level embeddings ────────────────────
+
+    #[cfg(feature = "semantic-search")]
+    /// Insert or replace a normalized embedding for a conversation summary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_conversation_embedding(
+        &self,
+        conversation_id: &str,
+        embedding_model: &str,
+        summary_strategy: &str,
+        embedding: &[f32],
+        summary_text: Option<&str>,
+    ) -> MetadataResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let bytes = f32_slice_to_bytes(embedding);
+        conn.execute(
+            "INSERT OR REPLACE INTO conversation_embeddings \
+             (conversation_id, embedding_model, summary_strategy, dimension, \
+              embedding, summary_text, embedded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                conversation_id,
+                embedding_model,
+                summary_strategy,
+                embedding.len() as i64,
+                bytes,
+                summary_text,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "semantic-search")]
+    /// Load every (conversation_id, embedding) pair for a (model, strategy).
+    pub fn load_all_conversation_embeddings(
+        &self,
+        embedding_model: &str,
+        summary_strategy: &str,
+    ) -> MetadataResult<Vec<(String, Vec<f32>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, embedding FROM conversation_embeddings \
+             WHERE embedding_model = ?1 AND summary_strategy = ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![embedding_model, summary_strategy], |r| {
+                let id: String = r.get(0)?;
+                let bytes: Vec<u8> = r.get(1)?;
+                Ok((id, bytes_to_f32_vec(&bytes)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    /// List conversation IDs that have NOT been embedded for the given
+    /// (model, strategy) pair.
+    pub fn unembedded_conversation_ids(
+        &self,
+        embedding_model: &str,
+        summary_strategy: &str,
+        limit: u64,
+    ) -> MetadataResult<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.id FROM conversations c \
+             LEFT JOIN conversation_embeddings ce \
+               ON c.id = ce.conversation_id \
+                  AND ce.embedding_model = ?1 \
+                  AND ce.summary_strategy = ?2 \
+             WHERE ce.conversation_id IS NULL \
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![embedding_model, summary_strategy, limit as i64],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    /// Resolve conversation IDs to metadata rows with optional structural filters.
+    pub fn conversation_meta_filtered(
+        &self,
+        ids: &[String],
+        filter_model: Option<&str>,
+        filter_application: Option<&str>,
+        filter_date_from: Option<chrono::DateTime<chrono::Utc>>,
+        filter_date_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> MetadataResult<Vec<ConversationMetaRow>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders: Vec<String> = (0..ids.len()).map(|_| "?".to_owned()).collect();
+        let mut sql = format!(
+            "SELECT id, application, model, created_at FROM conversations \
+             WHERE id IN ({})",
+            placeholders.join(",")
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+            ids.iter().map(|i| Box::new(i.clone()) as Box<dyn rusqlite::ToSql>).collect();
+        if let Some(m) = filter_model {
+            sql.push_str(" AND model = ?");
+            params_vec.push(Box::new(m.to_owned()));
+        }
+        if let Some(a) = filter_application {
+            sql.push_str(" AND application = ?");
+            params_vec.push(Box::new(a.to_owned()));
+        }
+        if let Some(from) = filter_date_from {
+            sql.push_str(" AND created_at >= ?");
+            params_vec.push(Box::new(from.to_rfc3339()));
+        }
+        if let Some(to) = filter_date_to {
+            sql.push_str(" AND created_at <= ?");
+            params_vec.push(Box::new(to.to_rfc3339()));
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(param_refs), |r| {
+                let created: String = r.get(3)?;
+                Ok(ConversationMetaRow {
+                    conversation_id: r.get(0)?,
+                    application: r.get(1)?,
+                    model: r.get(2)?,
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created)
+                        .map(|d| d.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now()),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
+// ── Helpers and row types for semantic search ────────────────────────────────
+
+#[cfg(feature = "semantic-search")]
+fn f32_slice_to_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+#[cfg(feature = "semantic-search")]
+fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(b.len() / 4);
+    for chunk in b.chunks_exact(4) {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    out
+}
+
+#[cfg(feature = "semantic-search")]
+#[derive(Debug, Clone)]
+pub struct ConversationSegmentRow {
+    pub conversation_id: String,
+    pub segment_hash: SegmentHash,
+    pub segment_type: SegmentType,
+    pub application: Option<String>,
+    pub model: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(feature = "semantic-search")]
+#[derive(Debug, Clone)]
+pub struct ConversationMetaRow {
+    pub conversation_id: String,
+    pub application: Option<String>,
+    pub model: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 const SCHEMA_SQL: &str = "
@@ -721,6 +1090,36 @@ CREATE INDEX IF NOT EXISTS idx_neardup_bands_lookup
     ON near_dedup_bands(band_index, band_hash);
 CREATE INDEX IF NOT EXISTS idx_neardup_bands_segment
     ON near_dedup_bands(segment_hash);
+
+-- Per-unique-segment embeddings for semantic search.
+-- One row per unique segment per embedding model. Embeddings are stored
+-- L2-normalized so cosine similarity reduces to a dot product at query time.
+CREATE TABLE IF NOT EXISTS segment_embeddings (
+    segment_hash    TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    dimension       INTEGER NOT NULL,
+    embedding       BLOB NOT NULL,
+    embedded_at     TEXT NOT NULL,
+    PRIMARY KEY (segment_hash, embedding_model),
+    FOREIGN KEY (segment_hash) REFERENCES segments_meta(hash)
+);
+CREATE INDEX IF NOT EXISTS idx_seg_emb_model ON segment_embeddings(embedding_model);
+
+-- Per-conversation summary embeddings. The summary_strategy column allows
+-- multiple summary approaches (concat-truncate, llm-generated) to coexist
+-- for the same (conversation, embedding_model) pair.
+CREATE TABLE IF NOT EXISTS conversation_embeddings (
+    conversation_id  TEXT NOT NULL,
+    embedding_model  TEXT NOT NULL,
+    summary_strategy TEXT NOT NULL,
+    dimension        INTEGER NOT NULL,
+    embedding        BLOB NOT NULL,
+    summary_text     TEXT,
+    embedded_at      TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, embedding_model, summary_strategy),
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+);
+CREATE INDEX IF NOT EXISTS idx_conv_emb_model ON conversation_embeddings(embedding_model);
 ";
 
 #[cfg(test)]

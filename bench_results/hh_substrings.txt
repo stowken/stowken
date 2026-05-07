@@ -1,13 +1,13 @@
 Stowken Benchmark
 ============================================================
-Source        : hh_rlhf.jsonl
+Source        : data/hh_rlhf.jsonl
 
 Ingest
 ------------------------------------------------------------
   Conversations : 10000  (0 failed)
   Tokens        : 1350353
-  Time          : 3726ms  (372µs/conv, 362332 tok/s)
-  Substrings    : 8ms — 0 segs rewritten, 0 bytes saved
+  Time          : 4015ms  (401µs/conv, 336318 tok/s)
+  Substrings    : 9ms — 0 segs rewritten, 0 bytes saved
 
 Storage layers
 ------------------------------------------------------------
@@ -30,5 +30,5 @@ Per-segment-type breakdown
 Retrieval (decompression-only, MemoryBackend)
 ------------------------------------------------------------
   Sampled       : 1000 conversations
-  Time          : 23ms  (5399120 tok/s, 41836 conv/s)
-  Latency p50/p95/p99: 19µs / 41µs / 64µs per conversation
+  Time          : 24ms  (5290366 tok/s, 40993 conv/s)
+  Latency p50/p95/p99: 19µs / 43µs / 68µs per conversation

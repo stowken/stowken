@@ -9,3 +9,6 @@ pub mod substrings;
 
 #[cfg(feature = "s3")]
 pub mod s3;
+
+#[cfg(feature = "semantic-search")]
+pub mod semantic_search;

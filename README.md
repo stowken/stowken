@@ -6,6 +6,18 @@ Stowken is a storage library that fixes this. It stores LLM conversations as con
 
 ---
 
+## Documentation
+
+| Guide | What it covers |
+|---|---|
+| [Getting Started](docs/getting-started.md) | Install, store, retrieve, first semantic search |
+| [Semantic Search](docs/semantic-search.md) | Granularity, typed filters, summary strategies, custom adapters |
+| [Analytics](docs/analytics.md) | Clustering, outlier detection, retrieve_batch workflows |
+| [Python Cookbook](docs/python-cookbook.md) | DataFrame integration, async usage, fine-tuning export |
+| [Architecture](docs/architecture.md) | How dedup, compression, and embedding interact end-to-end |
+
+---
+
 ## What you get
 
 **Storage efficiency.** Repeated system prompts collapse to a single copy. RAG context that overlaps across users is stored once. Everything else is varint+zstd compressed. On corpora with shared prompts across users, savings are dominated by dedup (99%+ on fully-shared prompts). On diverse corpora, you still get 54–65% from compression alone — better than uncompressed JSON without any configuration.
@@ -20,6 +32,10 @@ stowken segment-stats                 # per-role token distribution across your 
 ```
 
 **Retrieval, not just archival.** Stored conversations can be retrieved and decompressed in microseconds — 15–30µs p99 on a hot vault. This isn't a write-only log; it's a queryable store.
+
+**Semantic search across compressed data** *(feature: `semantic-search`)*. Find conversations by meaning, not keywords. "Find me sessions where the agent struggled with authentication errors" works even though those words may never appear verbatim. Two-level embeddings cover both individual segments (system prompts, user turns, assistant responses, tool calls) and whole-conversation summaries. Plug in any embedding model; OpenAI adapters are built in.
+
+**Behavioral analytics.** `cluster_conversations(k=10)` groups your archive by topic using in-process k-means on conversation embeddings. `find_outliers()` surfaces conversations that don't fit any cluster — usually the most interesting ones. Typed search wrappers let you ask "which system prompts mention payment processing?" against only the system-prompt embedding index, not the full table.
 
 ---
 
@@ -58,11 +74,17 @@ pip install ../../target/wheels/stowken-*.whl
 # Cargo.toml
 [dependencies]
 stowken = "0.6"
-stowken = { version = "0.6", features = ["s3"] }  # S3 backend
+stowken = { version = "0.6", features = ["s3"] }             # S3 backend
+stowken = { version = "0.6", features = ["semantic-search"] } # semantic search
 ```
 
 ```sh
 pip install stowken
+```
+
+```sh
+# CLI with semantic search + built-in OpenAI adapters
+cargo install --path crates/stowken-cli --features semantic-search
 ```
 
 ---
@@ -124,13 +146,21 @@ Available pairs: `store`, `retrieve`, `delete`, `stats`, `segment_stats`, `gc`, 
 ```sh
 # Data dir defaults to ~/.local/share/stowken (override: --data-dir or $STOWKEN_DATA_DIR)
 
-# Ingest
+# Ingest — single conversation
 stowken store conversation.json --id conv-001 --application my-app
 echo '{"model":"gpt-4","messages":[...]}' | stowken store -
+
+# Ingest — bulk (JSONL file or directory of JSON/JSONL files)
+stowken ingest conversations.jsonl --application my-app
+stowken ingest ./export-dir/ --application my-app --max 10000
 
 # Retrieve
 stowken retrieve conv-001
 stowken retrieve conv-001 --segments       # raw token arrays
+
+# Retrieve multiple conversations at once (pairs naturally with search results)
+stowken retrieve-batch conv-001 conv-002 conv-003
+echo -e "conv-001\nconv-002" | stowken retrieve-batch --stdin
 
 # Analytics (the useful part)
 stowken audit-system-prompts               # prompt inventory by ref count
@@ -238,6 +268,178 @@ vault-root/
 
 ---
 
+## Semantic search *(feature: `semantic-search`)*
+
+Stowken stores conversations as deduplicated token segments. The semantic search layer sits on top of that structure — it embeds the same unique blobs your dedup logic already identified, so you never embed the same system prompt twice no matter how many conversations reference it.
+
+### How it works
+
+**Two-level embeddings.** Every unique segment gets one embedding (stored once, regardless of how many conversations share it). Every conversation also gets an embedding of its full summary (using a concat-and-truncate strategy by default, or an LLM-generated summary if you opt in). Searches can scan either level or both.
+
+**Pluggable adapters.** Provide any embedding model via the `EmbeddingAdapter` trait. The built-in `OpenAiEmbeddingAdapter` calls `POST /v1/embeddings`; swap it for a local model with zero code changes.
+
+**Embed-on-store.** By default, embeddings are written immediately when you call `store()`. Pass `set_embed_on_store(false)` for bulk ingest and run `embed_all()` afterward.
+
+**Cosine similarity.** Embeddings are L2-normalized at write time, so retrieval is a dot-product scan — no ANN index needed for realistic vault sizes.
+
+### Python quickstart
+
+```python
+import stowken
+
+vault = stowken.Stowken.open("/var/lib/stowken")
+
+# One-line setup with built-in OpenAI adapters
+vault.use_openai_embeddings(api_key="sk-...", model="text-embedding-3-small")
+
+# Optional: richer conversation-level summaries via LLM
+vault.use_openai_summarizer(api_key="sk-...", model="gpt-4o-mini")
+# Or keep the default (fast, free): vault.use_concat_summary(max_chars=24_000)
+
+# Retroactively embed an existing vault
+stats = vault.embed_all()
+print(f"embedded {stats['conversations_embedded']} conversations, "
+      f"{stats['segments_embedded']} unique segments")
+
+# Semantic search across both levels (default)
+results = vault.semantic_search("production failures", limit=5)
+# [{"conversation_id": "...", "score": 0.91, "matched_via": {...}, ...}, ...]
+
+# Read the matching conversations (closes the search → read loop)
+convs = vault.retrieve_batch([r["conversation_id"] for r in results])
+for conv in convs:
+    print(conv["text"][:500])   # full conversation with [role] markers
+
+# Typed search against specific segment roles only
+system_hits  = vault.search_prompts("billing system instructions", limit=10)
+reply_hits   = vault.search_responses("I cannot help with that", limit=10)
+user_hits    = vault.search_user_questions("this isn't working", limit=10)
+tool_hits    = vault.search_tool_uses("database query", limit=10)
+conv_hits    = vault.search_conversations("debugging session with tool failures", limit=10)
+```
+
+**Async equivalents** are available for all methods: `embed_all_async`, `semantic_search_async`, etc.
+
+### Clustering and outlier detection
+
+```python
+# Group conversations into k topic clusters
+clusters = vault.cluster_conversations(k=12, representative_count=3)
+# [{"cluster_id": 0, "size": 87, "representative_ids": [...], "members": [...]}, ...]
+
+# Conversations that don't fit any cluster — often the most revealing
+outliers = vault.find_outliers(k=12, threshold=0.4, limit=20)
+# [{"conversation_id": "...", "isolation_score": 0.78, "model": "gpt-4", ...}, ...]
+```
+
+Clustering uses in-process k-means++ on conversation-level embeddings. No external service required. Deterministic output via a configurable seed.
+
+### CLI commands
+
+```sh
+export OPENAI_API_KEY=sk-...
+
+# Bulk ingest without per-conversation embedding (faster for large files)
+stowken ingest conversations.jsonl --no-embed
+
+# Embed all stored conversations (run once on an existing vault)
+# Embed all stored conversations
+# The default (concat) is free — detokenizes and truncates the conversation text.
+# Use --summary-strategy llm only for behavioral queries; it costs one GPT call per conversation.
+stowken embed-all --openai-key $OPENAI_API_KEY
+# With LLM-generated summaries (opt-in, richer for behavioral queries):
+stowken embed-all --openai-key $OPENAI_API_KEY --summary-strategy llm --summary-model gpt-4o-mini
+
+# Semantic search
+stowken semantic-search "production failures" --openai-key $OPENAI_API_KEY --limit 10
+stowken semantic-search "auth errors" --granularity segment --segment-type assistant_turn
+
+# Typed search wrappers
+stowken search-prompts      "billing system instructions"
+stowken search-responses    "I cannot help with that"
+stowken search-user-questions "this isn't working"
+stowken search-tool-uses    "database query"
+stowken search-conversations "debugging session"
+
+# Close the loop: search → read the matching conversations
+stowken semantic-search "payment errors" --limit 5 --json \
+  | jq -r '.[].conversation_id' \
+  | stowken retrieve-batch --stdin
+
+# Analytics
+stowken cluster --k 10 --representatives 3
+stowken outliers --k 10 --threshold 0.5 --limit 20
+```
+
+All CLI commands accept `--application`, `--model`, and date-range filters. Pass `--openai-key` or set `OPENAI_API_KEY`.
+
+### Rust API
+
+```rust
+use stowken::{
+    storage::FilesystemBackend,
+    types::{SemanticSearchQuery, SearchGranularity},
+    Stowken,
+};
+
+vault.set_embedding_adapter(my_adapter);        // anything implementing EmbeddingAdapter
+vault.use_concat_summary(24_000);               // ConcatTruncate strategy (default)
+// or:
+vault.set_summarizer(my_llm_summarizer);        // LlmGenerated strategy
+
+let stats = vault.embed_all().await?;
+
+let hits = vault.semantic_search(SemanticSearchQuery {
+    text: "production failures".into(),
+    granularity: SearchGranularity::Both,
+    limit: 10,
+    min_score: 0.5,
+    ..SemanticSearchQuery::new("production failures")
+}).await?;
+```
+
+### Summary strategies
+
+| Strategy | Cost | Quality | How to enable |
+|---|---|---|---|
+| `ConcatTruncate` (default) | Free — no API calls | Good for keyword-rich queries | `vault.use_concat_summary(max_chars)` |
+| `LlmGenerated` | One LLM call per conversation | Best for intent / behavioral queries | `vault.set_summarizer(adapter)` or `vault.use_openai_summarizer(...)` |
+
+`ConcatTruncate` detokenizes all segments with role markers (`[system] ... [user] ... [assistant] ...`) and truncates to `max_chars`. It works well for retrieving conversations that mention specific topics. `LlmGenerated` produces a one-paragraph summary capturing user intent, agent behavior, and tool usage — better for behavioral queries like "sessions where the agent gave up and apologized."
+
+### Custom embedding adapters
+
+Implement two traits to plug in any model:
+
+```rust
+use stowken::types::{EmbeddingAdapter, SummarizerAdapter};
+
+struct MyEmbedder { /* ... */ }
+
+impl EmbeddingAdapter for MyEmbedder {
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> { /* ... */ }
+    fn dimension(&self) -> usize { 1536 }
+    fn model_name(&self) -> &str { "my-model-v1" }
+}
+
+vault.set_embedding_adapter(MyEmbedder { /* ... */ });
+```
+
+```python
+# Python: pass a callable
+def my_embed(texts: list[str]) -> list[list[float]]:
+    return my_model.encode(texts).tolist()
+
+vault.set_embedding_adapter(my_embed, dimension=768, model_name="my-model-v1")
+
+def my_summarize(text: str) -> str:
+    return my_llm.summarize(text)
+
+vault.set_summarizer(my_summarize, model_name="my-llm-v1")
+```
+
+---
+
 ## Tuning
 
 The defaults (varint + zstd + exact dedup) are the right starting point. The options below are for specific workloads, measured on your data before enabling in production.
@@ -325,6 +527,9 @@ bash scripts/bench_sweep.sh     # results → bench_results/
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 
+# Semantic search integration tests (no network — deterministic mock embedder):
+cargo test -p stowken --features semantic-search
+
 # S3 integration tests (requires MinIO or real S3):
 docker run -d --rm -p 9000:9000 \
     -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
@@ -353,7 +558,12 @@ CI runs Rust build + test + clippy and Python 3.11/3.12 maturin build + pytest o
 stowken/
 ├── crates/
 │   ├── stowken/            # core library
+│   │   └── src/
+│   │       ├── semantic.rs     # semantic search methods (feature: semantic-search)
+│   │       └── clustering.rs   # k-means++ for cluster_conversations / find_outliers
 │   ├── stowken-cli/        # CLI tool
+│   │   └── src/
+│   │       └── openai_adapter.rs  # built-in OpenAI embedding + summarizer adapters
 │   └── stowken-python/     # Python bindings (PyO3 + maturin)
 ├── scripts/
 │   ├── fetch_openassistant.py

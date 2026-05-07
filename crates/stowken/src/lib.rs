@@ -74,5 +74,10 @@ pub mod tokenizer;
 pub mod types;
 pub mod vault;
 
+#[cfg(feature = "semantic-search")]
+pub mod clustering;
+#[cfg(feature = "semantic-search")]
+pub mod semantic;
+
 pub use tokenizer::get_tokenizer;
 pub use vault::{Stowken, StowkenError};

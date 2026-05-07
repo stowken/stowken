@@ -21,10 +21,11 @@ use crate::{
         hash_window, SubstringError, SubstringInfo, SubstringRegistry, MIN_LENGTH as SUBSTR_MIN_LEN,
     },
     types::{
-        AnalyticsQuery, Conversation, ConversationManifest, ExportConfig, ExportStats,
-        NearDuplicateCluster, NearDuplicateVariant, RetrievedConversation, RetrievedSegment,
-        SegmentRef, SegmentType, SegmentTypeStats, StoreResult, StoredSegment, SystemPromptInfo,
-        Token, TokenUsageStats, TokenizerAdapter, StowkenConfig,
+        AnalyticsQuery, Conversation, ConversationManifest, ConversationText, ConversationTurn,
+        ExportConfig, ExportStats, NearDuplicateCluster, NearDuplicateVariant,
+        RetrievedConversation, RetrievedSegment, SegmentRef, SegmentType, SegmentTypeStats,
+        StoreResult, StoredSegment, SystemPromptInfo, Token, TokenUsageStats, TokenizerAdapter,
+        StowkenConfig,
     },
 };
 
@@ -130,6 +131,12 @@ pub enum StowkenError {
     NotFound(String),
     #[error("internal error: {0}")]
     Internal(String),
+    #[cfg(feature = "semantic-search")]
+    #[error("embedding error: {0}")]
+    Embedding(String),
+    #[cfg(feature = "semantic-search")]
+    #[error("summarization error: {0}")]
+    Summarization(String),
 }
 
 /// `Stowken<B>` — the main entry point for all storage and retrieval operations.
@@ -150,6 +157,13 @@ pub struct Stowken<B: StorageBackend> {
     tokenizer: Option<Arc<dyn TokenizerAdapter>>,
     /// Cached from StowkenConfig — threshold for near-dedup. None disables.
     near_dedup_threshold: Option<f64>,
+    #[cfg(feature = "semantic-search")]
+    embedding_adapter:
+        Arc<std::sync::RwLock<Option<Arc<dyn crate::types::EmbeddingAdapter>>>>,
+    #[cfg(feature = "semantic-search")]
+    summary_strategy: Arc<std::sync::RwLock<crate::types::SummaryStrategy>>,
+    #[cfg(feature = "semantic-search")]
+    embed_on_store: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<B: StorageBackend + 'static> Stowken<B> {
@@ -173,6 +187,14 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             segmenter_config: SegmenterConfig::default(),
             tokenizer: None,
             near_dedup_threshold,
+            #[cfg(feature = "semantic-search")]
+            embedding_adapter: Arc::new(std::sync::RwLock::new(None)),
+            #[cfg(feature = "semantic-search")]
+            summary_strategy: Arc::new(std::sync::RwLock::new(
+                crate::types::SummaryStrategy::default(),
+            )),
+            #[cfg(feature = "semantic-search")]
+            embed_on_store: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -202,6 +224,14 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             segmenter_config: SegmenterConfig::default(),
             tokenizer: None,
             near_dedup_threshold,
+            #[cfg(feature = "semantic-search")]
+            embedding_adapter: Arc::new(std::sync::RwLock::new(None)),
+            #[cfg(feature = "semantic-search")]
+            summary_strategy: Arc::new(std::sync::RwLock::new(
+                crate::types::SummaryStrategy::default(),
+            )),
+            #[cfg(feature = "semantic-search")]
+            embed_on_store: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -213,6 +243,105 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     /// Set the segmenter configuration (e.g., context delimiter).
     pub fn set_segmenter_config(&mut self, cfg: SegmenterConfig) {
         self.segmenter_config = cfg;
+    }
+
+    // ── Semantic search configuration ─────────────────────────────────────
+
+    #[cfg(feature = "semantic-search")]
+    /// Set the embedding adapter used by `semantic_search`, embed-on-store,
+    /// and `embed_all`. Takes `&self` (interior mutability via `RwLock`).
+    pub fn set_embedding_adapter(
+        &self,
+        adapter: impl crate::types::EmbeddingAdapter + 'static,
+    ) {
+        *self.embedding_adapter.write().unwrap() = Some(Arc::new(adapter));
+    }
+
+    #[cfg(feature = "semantic-search")]
+    /// Switch the conversation summary strategy (concat-truncate or LLM-generated).
+    pub fn set_summary_strategy(&self, strategy: crate::types::SummaryStrategy) {
+        *self.summary_strategy.write().unwrap() = strategy;
+    }
+
+    #[cfg(feature = "semantic-search")]
+    /// Sugar: install an LLM summarizer. Equivalent to
+    /// `set_summary_strategy(SummaryStrategy::LlmGenerated(Arc::new(s)))`.
+    pub fn set_summarizer(&self, summarizer: impl crate::types::SummarizerAdapter + 'static) {
+        self.set_summary_strategy(crate::types::SummaryStrategy::LlmGenerated(Arc::new(
+            summarizer,
+        )));
+    }
+
+    #[cfg(feature = "semantic-search")]
+    /// Sugar: use concat-and-truncate summaries with the given character limit.
+    pub fn use_concat_summary(&self, max_chars: usize) {
+        self.set_summary_strategy(crate::types::SummaryStrategy::ConcatTruncate { max_chars });
+    }
+
+    #[cfg(feature = "semantic-search")]
+    /// Toggle whether `store()` automatically embeds new segments and a
+    /// conversation summary. Default: true (when an adapter is configured).
+    pub fn set_embed_on_store(&self, enabled: bool) {
+        self.embed_on_store
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // ── Internal accessors used by the `semantic` module ──────────────────
+    //
+    // These exist purely so `crate::semantic` can read private fields
+    // without exposing them through the public API. Each is a one-liner.
+
+    #[cfg(feature = "semantic-search")]
+    pub(crate) fn embedding_adapter_internal(
+        &self,
+    ) -> Option<Arc<dyn crate::types::EmbeddingAdapter>> {
+        self.embedding_adapter.read().unwrap().clone()
+    }
+    #[cfg(feature = "semantic-search")]
+    pub(crate) fn summary_strategy_internal(&self) -> crate::types::SummaryStrategy {
+        self.summary_strategy.read().unwrap().clone()
+    }
+    #[cfg(feature = "semantic-search")]
+    pub(crate) fn embed_on_store_internal(&self) -> bool {
+        self.embed_on_store
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(feature = "semantic-search")]
+    pub(crate) fn index_internal(&self) -> MetadataIndex {
+        self.index.clone()
+    }
+    #[cfg(feature = "semantic-search")]
+    pub(crate) fn tokenizer_internal(&self) -> Option<Arc<dyn TokenizerAdapter>> {
+        self.tokenizer.clone()
+    }
+    pub(crate) fn default_tokenizer_name_internal(&self) -> String {  // used by retrieve_batch + semantic
+        self.tokenizer
+            .as_ref()
+            .map(|t| t.name().to_owned())
+            .unwrap_or_else(|| "cl100k_base".to_owned())
+    }
+
+    /// Detokenize a token slice using the vault's tokenizer or a built-in
+    /// fallback for the given tokenizer name.
+    pub(crate) fn detokenize_segment_tokens_internal(
+        &self,
+        tokens: &[Token],
+        tokenizer_name: &str,
+    ) -> String {
+        if let Some(t) = &self.tokenizer {
+            t.detokenize(tokens)
+        } else if let Some(t) = crate::tokenizer::get_tokenizer(tokenizer_name) {
+            t.detokenize(tokens)
+        } else {
+            tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ")
+        }
+    }
+    #[cfg(feature = "semantic-search")]
+    pub(crate) async fn backend_get_segment_internal(
+        &self,
+        hash: &SegmentHash,
+    ) -> Result<StoredSegment, StowkenError> {
+        Ok(self.backend.get_segment(hash).await?)
     }
 
     // ── Core Operations ───────────────────────────────────────────────────
@@ -337,11 +466,32 @@ impl<B: StorageBackend + 'static> Stowken<B> {
 
         self.backend.put_manifest(&manifest).await?;
 
+        // Snapshot new-segment hashes for the embed-on-store hook (below)
+        // before `index_ops` is consumed by the SQLite batch writer.
+        #[cfg(feature = "semantic-search")]
+        let new_segment_hashes = crate::semantic::collect_new_hashes(&index_ops);
+
         let index = self.index.clone();
         let manifest_clone = manifest.clone();
         task::spawn_blocking(move || index.store_conversation_batch(&index_ops, &manifest_clone))
             .await
             .map_err(|e| StowkenError::Internal(e.to_string()))??;
+
+        // Embed-on-store: when an `EmbeddingAdapter` is configured and
+        // `embed_on_store` is true (default), embed both the new segments
+        // and a per-conversation summary. Idempotent — already-embedded
+        // segments are skipped.
+        #[cfg(feature = "semantic-search")]
+        if let Err(e) = self
+            .run_embed_on_store(new_segment_hashes, &id, &conversation.tokenizer)
+            .await
+        {
+            // Don't fail the store on embedding errors — the conversation
+            // is already persisted. Log and continue. Callers needing
+            // exact-once semantics should set_embed_on_store(false) and
+            // run embed_all() explicitly.
+            tracing::warn!(id = %id, error = %e, "embed-on-store failed; segment is stored, embedding will be retried by embed_all");
+        }
 
         let compression_ratio = if total_raw == 0 {
             1.0
@@ -396,6 +546,67 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             manifest,
             segments: retrieved_segments,
         })
+    }
+
+    /// Retrieve multiple conversations by ID and return them as flat,
+    /// human-readable `ConversationText` objects — tokens detokenized and
+    /// joined with role markers. Designed to close the search → read loop:
+    /// pass the `conversation_id` values from `semantic_search` hits directly.
+    ///
+    /// IDs that are not found are silently skipped; check the returned length
+    /// if you need to detect missing conversations.
+    pub async fn retrieve_batch(
+        &self,
+        ids: &[&str],
+    ) -> Result<Vec<ConversationText>, StowkenError> {
+        let tokenizer_name = self.default_tokenizer_name_internal();
+        let mut results = Vec::with_capacity(ids.len());
+        for id in ids {
+            let conv = match self.retrieve(id).await {
+                Ok(c) => c,
+                Err(StowkenError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            let role_for = |seg_type: &SegmentType| -> &'static str {
+                match seg_type {
+                    SegmentType::SystemPrompt  => "system",
+                    SegmentType::UserTurn      => "user",
+                    SegmentType::AssistantTurn => "assistant",
+                    SegmentType::ToolCall      => "tool_call",
+                    SegmentType::ToolResult    => "tool_result",
+                    SegmentType::Context       => "context",
+                    SegmentType::Continuation  => "continuation",
+                }
+            };
+            let mut turns: Vec<ConversationTurn> = Vec::new();
+            for seg in &conv.segments {
+                let text = self.detokenize_segment_tokens_internal(&seg.tokens, &tokenizer_name);
+                let role = role_for(&seg.segment_type).to_string();
+                // Merge consecutive continuation segments into the preceding turn.
+                if seg.segment_type == SegmentType::Continuation {
+                    if let Some(last) = turns.last_mut() {
+                        last.text.push(' ');
+                        last.text.push_str(&text);
+                        continue;
+                    }
+                }
+                turns.push(ConversationTurn { role, text });
+            }
+            let full_text = turns
+                .iter()
+                .map(|t| format!("[{}] {}", t.role, t.text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            results.push(ConversationText {
+                conversation_id: conv.manifest.id.clone(),
+                model: conv.manifest.model.clone(),
+                application: conv.manifest.application.clone(),
+                text: full_text,
+                turns,
+                created_at: conv.manifest.created_at,
+            });
+        }
+        Ok(results)
     }
 
     /// Retrieve a filtered subset of segments from a conversation.

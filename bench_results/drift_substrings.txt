@@ -1,36 +1,36 @@
 Stowken Benchmark
 ============================================================
-Source        : drift.jsonl
+Source        : data/drift.jsonl
 
 Ingest
 ------------------------------------------------------------
   Conversations : 1000  (0 failed)
   Tokens        : 420000
-  Time          : 246ms  (246µs/conv, 1706147 tok/s)
-  Substrings    : 91ms — 2099 segs rewritten, 543155 bytes saved
+  Time          : 300ms  (300µs/conv, 1398797 tok/s)
+  Substrings    : 117ms — 2154 segs rewritten, 547907 bytes saved
 
 Storage layers
 ------------------------------------------------------------
   Incoming (u32):     1.6 MB   (ingested tokens × 4)
   After dedup   :     1.6 MB     0.0% saved by dedup alone (refs × raw → unique × raw)
-  After zstd    :   521.7 KB    68.2% saved on top of dedup
+  After zstd    :   517.0 KB    68.5% saved on top of dedup
 
-  Combined      : 68.2% smaller than incoming  (1.6 MB → 521.7 KB)
+  Combined      : 68.5% smaller than incoming  (1.6 MB → 517.0 KB)
 
 Per-segment-type breakdown
 ------------------------------------------------------------
 +----------------+--------+------+--------+--------+------------+
 | Type           | Unique | Refs | Dedup% | Tokens | Compressed |
 +----------------+--------+------+--------+--------+------------+
-| assistant_turn | 1000   | 1000 | 0.0%   | 80000  | 167.6 KB   |
+| assistant_turn | 1000   | 1000 | 0.0%   | 80000  | 162.8 KB   |
 +----------------+--------+------+--------+--------+------------+
 | system_prompt  | 1000   | 1000 | 0.0%   | 100000 | 102.2 KB   |
 +----------------+--------+------+--------+--------+------------+
-| user_turn      | 1000   | 1000 | 0.0%   | 240000 | 251.9 KB   |
+| user_turn      | 1000   | 1000 | 0.0%   | 240000 | 252.1 KB   |
 +----------------+--------+------+--------+--------+------------+
 
 Retrieval (decompression-only, MemoryBackend)
 ------------------------------------------------------------
   Sampled       : 1000 conversations
-  Time          : 13ms  (30354339 tok/s, 72272 conv/s)
-  Latency p50/p95/p99: 13µs / 14µs / 18µs per conversation
+  Time          : 15ms  (26286655 tok/s, 62587 conv/s)
+  Latency p50/p95/p99: 14µs / 16µs / 34µs per conversation

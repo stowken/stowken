@@ -341,7 +341,10 @@ mod tests {
     #[test]
     fn context_delimiter_splits_user_turn() {
         let delimiter = vec![999u32, 998];
-        let config = SegmenterConfig { context_delimiter: Some(delimiter.clone()) };
+        let config = SegmenterConfig {
+            context_delimiter: Some(delimiter.clone()),
+            ..SegmenterConfig::default()
+        };
         let segmenter = Segmenter::new(config);
 
         // Tokens: context [100, 200] ++ delimiter ++ user_query [300, 400]
@@ -359,7 +362,10 @@ mod tests {
     #[test]
     fn no_delimiter_match_keeps_user_turn() {
         let delimiter = vec![999u32, 998];
-        let config = SegmenterConfig { context_delimiter: Some(delimiter) };
+        let config = SegmenterConfig {
+            context_delimiter: Some(delimiter),
+            ..SegmenterConfig::default()
+        };
         let segmenter = Segmenter::new(config);
         let tokens = vec![100u32, 200, 300];
         let conv = make_conversation(vec![make_msg("user", tokens.clone())]);

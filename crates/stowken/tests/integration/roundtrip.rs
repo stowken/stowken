@@ -142,3 +142,73 @@ async fn roundtrip_with_filesystem_backend() {
     let retrieved = vault.retrieve(&result.id).await.unwrap();
     assert_eq!(retrieved.segments[0].tokens, tokens);
 }
+
+#[tokio::test]
+async fn retrieve_batch_returns_all_stored_conversations() {
+    let vault = Stowken::new(MemoryBackend::new(), StowkenConfig::default())
+        .await
+        .unwrap();
+
+    let mut ids: Vec<String> = Vec::new();
+    for i in 0..4u32 {
+        let conv = make_conversation(&format!("batch-{i}"), vec![vec![i + 1, 10, 20]]);
+        ids.push(vault.store(conv).await.unwrap().id);
+    }
+
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let results = vault.retrieve_batch(&id_refs).await.unwrap();
+
+    assert_eq!(results.len(), 4, "should return one entry per stored id");
+    for r in &results {
+        assert!(ids.contains(&r.conversation_id), "returned id should be one we stored");
+        assert!(!r.text.is_empty(), "text should be non-empty");
+        assert!(!r.turns.is_empty(), "turns should be non-empty");
+    }
+}
+
+#[tokio::test]
+async fn retrieve_batch_skips_missing_ids_silently() {
+    let vault = Stowken::new(MemoryBackend::new(), StowkenConfig::default())
+        .await
+        .unwrap();
+
+    let conv = make_conversation("present", vec![vec![1u32, 2, 3]]);
+    vault.store(conv).await.unwrap();
+
+    let results = vault
+        .retrieve_batch(&["present", "does-not-exist"])
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1, "missing id should be silently skipped");
+    assert_eq!(results[0].conversation_id, "present");
+}
+
+#[tokio::test]
+async fn retrieve_batch_text_contains_role_markers() {
+    let vault = Stowken::new(MemoryBackend::new(), StowkenConfig::default())
+        .await
+        .unwrap();
+
+    // Store a minimal conversation with known structure
+    let conv = make_conversation("markers", vec![
+        vec![1u32, 2],   // system
+        vec![3u32, 4],   // user
+        vec![5u32, 6],   // assistant
+    ]);
+    vault.store(conv).await.unwrap();
+
+    let results = vault.retrieve_batch(&["markers"]).await.unwrap();
+    assert_eq!(results.len(), 1);
+
+    let text = &results[0].text;
+    assert!(text.contains("[system]"),    "text should contain [system] marker");
+    assert!(text.contains("[user]"),      "text should contain [user] marker");
+    assert!(text.contains("[assistant]"), "text should contain [assistant] marker");
+
+    let turns = &results[0].turns;
+    assert_eq!(turns.len(), 3, "should have 3 turns");
+    assert_eq!(turns[0].role, "system");
+    assert_eq!(turns[1].role, "user");
+    assert_eq!(turns[2].role, "assistant");
+}

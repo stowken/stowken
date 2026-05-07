@@ -1,12 +1,12 @@
 Stowken Benchmark
 ============================================================
-Source        : lmsys.jsonl
+Source        : data/lmsys.jsonl
 
 Ingest
 ------------------------------------------------------------
   Conversations : 10000  (0 failed)
   Tokens        : 4896734
-  Time          : 6470ms  (647µs/conv, 756785 tok/s)
+  Time          : 6801ms  (680µs/conv, 719994 tok/s)
 
 Storage layers
 ------------------------------------------------------------
@@ -29,5 +29,5 @@ Per-segment-type breakdown
 Retrieval (decompression-only, MemoryBackend)
 ------------------------------------------------------------
   Sampled       : 1000 conversations
-  Time          : 25ms  (18307224 tok/s, 38622 conv/s)
-  Latency p50/p95/p99: 15µs / 72µs / 122µs per conversation
+  Time          : 27ms  (17330113 tok/s, 36561 conv/s)
+  Latency p50/p95/p99: 16µs / 76µs / 140µs per conversation

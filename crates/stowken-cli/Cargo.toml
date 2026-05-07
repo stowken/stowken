@@ -21,7 +21,12 @@ anyhow = "1"
 indicatif = "0.17"
 tabled = "0.15"
 directories = "5"
+reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 serde_json = { workspace = true }
+
+[features]
+default = ["semantic-search"]
+semantic-search = ["stowken/semantic-search", "dep:reqwest"]

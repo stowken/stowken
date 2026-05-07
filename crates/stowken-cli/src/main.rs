@@ -20,6 +20,9 @@ use stowken::{
     Stowken,
 };
 
+#[cfg(feature = "semantic-search")]
+mod openai_adapter;
+
 // ── CLI structure ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -125,6 +128,27 @@ enum Command {
         id: Option<String>,
     },
 
+    /// Bulk-store conversations from a JSONL file or a directory of JSON/JSONL
+    /// files into the real vault (unlike `bench`, which uses an in-memory vault).
+    /// One conversation per line for JSONL; one conversation per file for JSON.
+    Ingest {
+        /// JSONL file, single JSON file, or directory of JSON/JSONL files.
+        input: PathBuf,
+
+        /// Tag every ingested conversation with an application name.
+        #[arg(long)]
+        application: Option<String>,
+
+        /// Cap on conversations ingested. Default: no cap.
+        #[arg(long)]
+        max: Option<u64>,
+
+        /// Skip embedding after ingest (useful for bulk loads; run `embed-all` afterward).
+        #[cfg(feature = "semantic-search")]
+        #[arg(long)]
+        no_embed: bool,
+    },
+
     /// Retrieve a conversation by ID and print it as JSON.
     Retrieve {
         /// Conversation ID.
@@ -133,6 +157,19 @@ enum Command {
         /// Print raw segment token arrays instead of the manifest.
         #[arg(long)]
         segments: bool,
+    },
+
+    /// Retrieve multiple conversations by ID and print them as human-readable
+    /// text with role markers. Designed to pair with semantic-search: pipe hit
+    /// IDs in here to read the actual conversations.
+    RetrieveBatch {
+        /// Conversation IDs (space-separated). Alternatively, pass one ID per
+        /// line via stdin with `--stdin`.
+        ids: Vec<String>,
+
+        /// Read IDs from stdin (one per line) instead of positional args.
+        #[arg(long)]
+        stdin: bool,
     },
 
     /// Delete a conversation by ID.
@@ -309,6 +346,151 @@ enum Command {
 
     /// Print the resolved data directory and exit.
     DataDir,
+
+    /// Embed every stored segment + conversation summary that lacks an
+    /// embedding for the configured model. Run once after enabling
+    /// semantic search on an existing vault. Subsequent stores embed
+    /// incrementally via the embed-on-store hook.
+    ///
+    /// Summary strategy: "concat" (default) is free — it detokenizes and
+    /// concatenates the conversation text without any API call and works
+    /// well for the vast majority of queries. Use "llm" only when you need
+    /// rich behavioral summaries (e.g. "sessions where the agent gave up").
+    #[cfg(feature = "semantic-search")]
+    EmbedAll {
+        #[arg(long, env = "OPENAI_API_KEY")]
+        openai_key: Option<String>,
+        #[arg(long, default_value = "text-embedding-3-small")]
+        model: String,
+        /// Summary strategy: "concat" (default, free, recommended) or "llm"
+        /// (one GPT call per conversation — slower and costs tokens, but
+        /// captures intent and behavior rather than raw content).
+        #[arg(long, default_value = "concat")]
+        summary_strategy: String,
+        /// LLM model used when --summary-strategy=llm.
+        #[arg(long, default_value = "gpt-4o-mini")]
+        summary_model: String,
+    },
+
+    /// Search conversations by semantic meaning across both segment-level
+    /// and conversation-summary embeddings.
+    #[cfg(feature = "semantic-search")]
+    SemanticSearch {
+        /// Natural-language query.
+        query: String,
+        #[arg(long, env = "OPENAI_API_KEY")]
+        openai_key: Option<String>,
+        #[arg(long, default_value = "text-embedding-3-small")]
+        model: String,
+        /// "segment", "conversation", or "both".
+        #[arg(long, default_value = "both")]
+        granularity: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, default_value_t = 0.0)]
+        min_score: f32,
+        #[arg(long)]
+        application: Option<String>,
+        #[arg(long)]
+        filter_model: Option<String>,
+        /// Filter by segment type (system_prompt, user_turn, assistant_turn,
+        /// tool_call, tool_result, context). Only meaningful when
+        /// --granularity is segment or both.
+        #[arg(long)]
+        segment_type: Option<String>,
+    },
+
+    /// Search across system prompts only.
+    #[cfg(feature = "semantic-search")]
+    SearchPrompts {
+        query: String,
+        #[arg(long, env = "OPENAI_API_KEY")]
+        openai_key: Option<String>,
+        #[arg(long, default_value = "text-embedding-3-small")]
+        model: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+
+    /// Search across assistant responses only.
+    #[cfg(feature = "semantic-search")]
+    SearchResponses {
+        query: String,
+        #[arg(long, env = "OPENAI_API_KEY")]
+        openai_key: Option<String>,
+        #[arg(long, default_value = "text-embedding-3-small")]
+        model: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+
+    /// Search across user turns only.
+    #[cfg(feature = "semantic-search")]
+    SearchUserQuestions {
+        query: String,
+        #[arg(long, env = "OPENAI_API_KEY")]
+        openai_key: Option<String>,
+        #[arg(long, default_value = "text-embedding-3-small")]
+        model: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+
+    /// Search across tool calls only.
+    #[cfg(feature = "semantic-search")]
+    SearchToolUses {
+        query: String,
+        #[arg(long, env = "OPENAI_API_KEY")]
+        openai_key: Option<String>,
+        #[arg(long, default_value = "text-embedding-3-small")]
+        model: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+
+    /// Search across conversation summaries only.
+    #[cfg(feature = "semantic-search")]
+    SearchConversations {
+        query: String,
+        #[arg(long, env = "OPENAI_API_KEY")]
+        openai_key: Option<String>,
+        #[arg(long, default_value = "text-embedding-3-small")]
+        model: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+
+    /// Cluster all conversation summaries with k-means++.
+    #[cfg(feature = "semantic-search")]
+    Cluster {
+        #[arg(long, env = "OPENAI_API_KEY")]
+        openai_key: Option<String>,
+        #[arg(long, default_value = "text-embedding-3-small")]
+        model: String,
+        /// Number of clusters.
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Conversations per cluster to surface as representatives.
+        #[arg(long, default_value_t = 3)]
+        representatives: usize,
+    },
+
+    /// Surface conversations that are far from any cluster centroid —
+    /// candidates for "this conversation is unusual" review.
+    #[cfg(feature = "semantic-search")]
+    Outliers {
+        #[arg(long, env = "OPENAI_API_KEY")]
+        openai_key: Option<String>,
+        #[arg(long, default_value = "text-embedding-3-small")]
+        model: String,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Distance (1 - cosine) above which a conversation is flagged.
+        #[arg(long, default_value_t = 0.5)]
+        threshold: f32,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -332,8 +514,18 @@ async fn main() -> Result<()> {
         Command::Store { file, model, application, id } => {
             cmd_store(&data_dir, config, file, model, application, id, cli.json).await?;
         }
+        Command::Ingest { input, application, max, #[cfg(feature = "semantic-search")] no_embed } => {
+            #[cfg(feature = "semantic-search")]
+            let embed = !no_embed;
+            #[cfg(not(feature = "semantic-search"))]
+            let embed = false;
+            cmd_ingest(&data_dir, config, input, application, max, embed).await?;
+        }
         Command::Retrieve { id, segments } => {
             cmd_retrieve(&data_dir, config, id, segments, cli.json).await?;
+        }
+        Command::RetrieveBatch { ids, stdin } => {
+            cmd_retrieve_batch(&data_dir, config, ids, stdin, cli.json).await?;
         }
         Command::Delete { id, yes } => {
             cmd_delete(&data_dir, config, id, yes).await?;
@@ -409,6 +601,48 @@ async fn main() -> Result<()> {
         }
         Command::Bench { input, max, retrieve, dict_warmup, with_substrings } => {
             cmd_bench(config, split_segments, input, max, retrieve, dict_warmup, with_substrings, cli.json).await?;
+        }
+        #[cfg(feature = "semantic-search")]
+        Command::EmbedAll { openai_key, model, summary_strategy, summary_model } => {
+            cmd_embed_all(&data_dir, config, openai_key, model, summary_strategy, summary_model, cli.json).await?;
+        }
+        #[cfg(feature = "semantic-search")]
+        Command::SemanticSearch {
+            query, openai_key, model, granularity, limit, min_score,
+            application, filter_model, segment_type,
+        } => {
+            cmd_semantic_search(
+                &data_dir, config, query, openai_key, model, granularity, limit,
+                min_score, application, filter_model, segment_type, cli.json,
+            ).await?;
+        }
+        #[cfg(feature = "semantic-search")]
+        Command::SearchPrompts { query, openai_key, model, limit } => {
+            cmd_typed_search(&data_dir, config, query, openai_key, model, limit, "prompts", cli.json).await?;
+        }
+        #[cfg(feature = "semantic-search")]
+        Command::SearchResponses { query, openai_key, model, limit } => {
+            cmd_typed_search(&data_dir, config, query, openai_key, model, limit, "responses", cli.json).await?;
+        }
+        #[cfg(feature = "semantic-search")]
+        Command::SearchUserQuestions { query, openai_key, model, limit } => {
+            cmd_typed_search(&data_dir, config, query, openai_key, model, limit, "user_questions", cli.json).await?;
+        }
+        #[cfg(feature = "semantic-search")]
+        Command::SearchToolUses { query, openai_key, model, limit } => {
+            cmd_typed_search(&data_dir, config, query, openai_key, model, limit, "tool_uses", cli.json).await?;
+        }
+        #[cfg(feature = "semantic-search")]
+        Command::SearchConversations { query, openai_key, model, limit } => {
+            cmd_typed_search(&data_dir, config, query, openai_key, model, limit, "conversations", cli.json).await?;
+        }
+        #[cfg(feature = "semantic-search")]
+        Command::Cluster { openai_key, model, k, representatives } => {
+            cmd_cluster(&data_dir, config, openai_key, model, k, representatives, cli.json).await?;
+        }
+        #[cfg(feature = "semantic-search")]
+        Command::Outliers { openai_key, model, k, threshold, limit } => {
+            cmd_outliers(&data_dir, config, openai_key, model, k, threshold, limit, cli.json).await?;
         }
     }
 
@@ -533,6 +767,56 @@ async fn cmd_store(
     Ok(())
 }
 
+async fn cmd_ingest(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    input: PathBuf,
+    application: Option<String>,
+    max: Option<u64>,
+    _embed: bool,
+) -> Result<()> {
+    let conversations = collect_conversations(&input, max)?;
+    let total = conversations.len();
+    if total == 0 {
+        eprintln!("No conversations found in {}", input.display());
+        return Ok(());
+    }
+
+    let vault = open_vault(data_dir, config).await?;
+
+    let mut stored = 0u64;
+    let mut failed = 0u64;
+    let mut deduped_total = 0u64;
+    let mut bytes_saved_total = 0u64;
+
+    for mut conv in conversations {
+        if application.is_some() && conv.application.is_none() {
+            conv.application = application.clone();
+        }
+        match vault.store(conv).await {
+            Ok(r) => {
+                stored += 1;
+                deduped_total += r.deduped_segments as u64;
+                bytes_saved_total += r.bytes_saved;
+                if stored % 100 == 0 {
+                    eprintln!("  {stored}/{total} stored…");
+                }
+            }
+            Err(e) => {
+                eprintln!("  warning: store failed: {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "Ingested {stored}/{total} conversations ({failed} failed). \
+         {deduped_total} segments deduped, {} saved.",
+        format_bytes(bytes_saved_total)
+    );
+    Ok(())
+}
+
 async fn cmd_retrieve(
     data_dir: &PathBuf,
     config: StowkenConfig,
@@ -581,6 +865,46 @@ async fn cmd_retrieve(
         for s in &conv.segments {
             println!("{:<4}  {:<16}  {:<8}  {}", s.position, s.segment_type, s.token_count, s.hash);
         }
+    }
+    Ok(())
+}
+
+async fn cmd_retrieve_batch(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    mut ids: Vec<String>,
+    from_stdin: bool,
+    json: bool,
+) -> Result<()> {
+    if from_stdin {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(std::io::stdin()).lines() {
+            let line = line?;
+            let trimmed = line.trim().to_string();
+            if !trimmed.is_empty() {
+                ids.push(trimmed);
+            }
+        }
+    }
+    if ids.is_empty() {
+        anyhow::bail!("no conversation IDs provided");
+    }
+    let vault = open_vault(data_dir, config).await?;
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let convs = vault.retrieve_batch(&id_refs).await.context("retrieve_batch")?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&convs)?);
+    } else {
+        for conv in &convs {
+            println!("━━━ {} ({}) ━━━", conv.conversation_id, conv.model);
+            for turn in &conv.turns {
+                println!("[{}]", turn.role.to_uppercase());
+                println!("{}", turn.text);
+                println!();
+            }
+        }
+        eprintln!("Retrieved {} conversation(s).", convs.len());
     }
     Ok(())
 }
@@ -1634,4 +1958,272 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{val:.1} {}", UNITS[unit])
     }
+}
+
+// ── Semantic search commands ─────────────────────────────────────────────────
+
+#[cfg(feature = "semantic-search")]
+async fn open_vault_with_adapters(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    openai_key: Option<String>,
+    model: String,
+    summary_strategy: Option<(String, String)>, // (strategy_name, summary_model)
+) -> Result<Stowken<FilesystemBackend>> {
+    use openai_adapter::{
+        openai_dimension_for, require_openai_key, OpenAiEmbeddingAdapter, OpenAiSummarizerAdapter,
+    };
+
+    let key = require_openai_key(openai_key)?;
+    let dim = openai_dimension_for(&model).with_context(|| {
+        format!(
+            "unknown OpenAI embedding model '{model}'. \
+             Pass --model text-embedding-3-small or text-embedding-3-large."
+        )
+    })?;
+    let vault = open_vault(data_dir, config).await?;
+    vault.set_embedding_adapter(OpenAiEmbeddingAdapter::new(&key, &model, dim));
+    if let Some((strategy, summary_model)) = summary_strategy {
+        match strategy.as_str() {
+            "concat" => vault.use_concat_summary(24_000),
+            "llm" => vault.set_summarizer(OpenAiSummarizerAdapter::new(&key, &summary_model)),
+            other => anyhow::bail!(
+                "unknown --summary-strategy '{other}'; expected 'concat' or 'llm'"
+            ),
+        }
+    }
+    Ok(vault)
+}
+
+#[cfg(feature = "semantic-search")]
+async fn cmd_embed_all(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    openai_key: Option<String>,
+    model: String,
+    summary_strategy: String,
+    summary_model: String,
+    json: bool,
+) -> Result<()> {
+    let vault = open_vault_with_adapters(
+        data_dir,
+        config,
+        openai_key,
+        model,
+        Some((summary_strategy, summary_model)),
+    )
+    .await?;
+    eprintln!("Counting unembedded items…");
+    let pending = vault.embed_all_pending_counts().await.context("counting pending")?;
+    eprintln!(
+        "  {} unique segments to embed, {} conversations to embed",
+        pending.0, pending.1
+    );
+    if pending.0 == 0 && pending.1 == 0 {
+        eprintln!("Nothing to do — all items already embedded.");
+        return Ok(());
+    }
+    if pending.0 > 0 {
+        eprintln!("Embedding segments…");
+    }
+    let stats = vault.embed_all().await.context("embedding all segments")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+    } else {
+        println!(
+            "Done. Embedded {} segments and {} conversations (model={}, strategy={})",
+            stats.segments_embedded,
+            stats.conversations_embedded,
+            stats.embedding_model,
+            stats.summary_strategy
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "semantic-search")]
+#[allow(clippy::too_many_arguments)]
+async fn cmd_semantic_search(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    query: String,
+    openai_key: Option<String>,
+    model: String,
+    granularity: String,
+    limit: usize,
+    min_score: f32,
+    application: Option<String>,
+    filter_model: Option<String>,
+    segment_type: Option<String>,
+    json: bool,
+) -> Result<()> {
+    use stowken::types::{SearchGranularity, SegmentType, SemanticSearchQuery};
+    let vault = open_vault_with_adapters(data_dir, config, openai_key, model, None).await?;
+
+    let granularity: SearchGranularity = granularity
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+    let segment_type = match segment_type {
+        Some(s) => Some(s.parse::<SegmentType>().map_err(|e| anyhow::anyhow!(e))?),
+        None => None,
+    };
+
+    let q = SemanticSearchQuery {
+        text: query,
+        granularity,
+        model: filter_model,
+        application,
+        segment_type,
+        date_from: None,
+        date_to: None,
+        limit,
+        min_score,
+    };
+    let hits = vault
+        .semantic_search(q)
+        .await
+        .context("running semantic search")?;
+    print_hits(&hits, json)?;
+    Ok(())
+}
+
+#[cfg(feature = "semantic-search")]
+async fn cmd_typed_search(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    query: String,
+    openai_key: Option<String>,
+    model: String,
+    limit: usize,
+    kind: &str,
+    json: bool,
+) -> Result<()> {
+    let vault = open_vault_with_adapters(data_dir, config, openai_key, model, None).await?;
+    let hits = match kind {
+        "prompts" => vault.search_prompts(&query, limit).await,
+        "responses" => vault.search_responses(&query, limit).await,
+        "user_questions" => vault.search_user_questions(&query, limit).await,
+        "tool_uses" => vault.search_tool_uses(&query, limit).await,
+        "conversations" => vault.search_conversations(&query, limit).await,
+        other => anyhow::bail!("unknown typed search kind '{other}'"),
+    }
+    .with_context(|| format!("typed search ({kind})"))?;
+    print_hits(&hits, json)?;
+    Ok(())
+}
+
+#[cfg(feature = "semantic-search")]
+fn print_hits(hits: &[stowken::types::SemanticSearchHit], json: bool) -> Result<()> {
+    use stowken::types::MatchedVia;
+    if json {
+        println!("{}", serde_json::to_string_pretty(hits)?);
+        return Ok(());
+    }
+    if hits.is_empty() {
+        println!("No matching conversations.");
+        return Ok(());
+    }
+    #[derive(Tabled)]
+    struct Row {
+        score: String,
+        conversation_id: String,
+        matched_via: String,
+        application: String,
+        model: String,
+    }
+    let rows: Vec<Row> = hits
+        .iter()
+        .map(|h| Row {
+            score: format!("{:.3}", h.score),
+            conversation_id: h.conversation_id.clone(),
+            matched_via: match &h.matched_via {
+                MatchedVia::Segment { segment_type, .. } => format!("segment:{segment_type}"),
+                MatchedVia::Conversation => "conversation".to_owned(),
+            },
+            application: h.application.clone().unwrap_or_else(|| "-".to_owned()),
+            model: h.model.clone(),
+        })
+        .collect();
+    println!("{}", Table::new(rows));
+    Ok(())
+}
+
+#[cfg(feature = "semantic-search")]
+async fn cmd_cluster(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    openai_key: Option<String>,
+    model: String,
+    k: usize,
+    representatives: usize,
+    json: bool,
+) -> Result<()> {
+    let vault = open_vault_with_adapters(data_dir, config, openai_key, model, None).await?;
+    let clusters = vault
+        .cluster_conversations(k, representatives)
+        .await
+        .context("clustering")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&clusters)?);
+        return Ok(());
+    }
+    if clusters.is_empty() {
+        println!("No conversation embeddings found. Run `stowken embed-all` first.");
+        return Ok(());
+    }
+    for c in &clusters {
+        println!(
+            "─── Cluster {} ({} conversations) ───",
+            c.cluster_id, c.size
+        );
+        for id in &c.representative_ids {
+            println!("  rep: {id}");
+        }
+        println!();
+    }
+    Ok(())
+}
+
+#[cfg(feature = "semantic-search")]
+async fn cmd_outliers(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+    openai_key: Option<String>,
+    model: String,
+    k: usize,
+    threshold: f32,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let vault = open_vault_with_adapters(data_dir, config, openai_key, model, None).await?;
+    let outliers = vault
+        .find_outliers(k, threshold, limit)
+        .await
+        .context("finding outliers")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outliers)?);
+        return Ok(());
+    }
+    if outliers.is_empty() {
+        println!("No outliers above threshold {threshold}.");
+        return Ok(());
+    }
+    #[derive(Tabled)]
+    struct Row {
+        score: String,
+        conversation_id: String,
+        application: String,
+        model: String,
+    }
+    let rows: Vec<Row> = outliers
+        .iter()
+        .map(|o| Row {
+            score: format!("{:.3}", o.isolation_score),
+            conversation_id: o.conversation_id.clone(),
+            application: o.application.clone().unwrap_or_else(|| "-".to_owned()),
+            model: o.model.clone(),
+        })
+        .collect();
+    println!("{}", Table::new(rows));
+    Ok(())
 }

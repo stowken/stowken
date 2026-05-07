@@ -1,12 +1,12 @@
 Stowken Benchmark
 ============================================================
-Source        : drift.jsonl
+Source        : data/drift.jsonl
 
 Ingest
 ------------------------------------------------------------
   Conversations : 1000  (0 failed)
   Tokens        : 420000
-  Time          : 5612ms  (5612µs/conv, 74837 tok/s)
+  Time          : 5390ms  (5390µs/conv, 77909 tok/s)
 
 Storage layers
 ------------------------------------------------------------
@@ -32,5 +32,5 @@ Per-segment-type breakdown
 Retrieval (decompression-only, MemoryBackend)
 ------------------------------------------------------------
   Sampled       : 1000 conversations
-  Time          : 36ms  (11359450 tok/s, 27046 conv/s)
-  Latency p50/p95/p99: 33µs / 50µs / 88µs per conversation
+  Time          : 29ms  (14138155 tok/s, 33662 conv/s)
+  Latency p50/p95/p99: 26µs / 37µs / 41µs per conversation

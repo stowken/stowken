@@ -206,6 +206,27 @@ pub struct RetrievedConversation {
     pub segments: Vec<RetrievedSegment>,
 }
 
+/// A flat, human-readable view of a retrieved conversation — tokens detokenized
+/// to text and joined with role markers. Returned by `retrieve_batch`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationText {
+    pub conversation_id: String,
+    pub model: String,
+    pub application: Option<String>,
+    /// Full conversation text: `"[system] ...\n[user] ...\n[assistant] ..."`.
+    pub text: String,
+    /// Per-turn breakdown in order.
+    pub turns: Vec<ConversationTurn>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One turn within a `ConversationText`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurn {
+    pub role: String,
+    pub text: String,
+}
+
 /// A single retrieved and decompressed segment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievedSegment {
@@ -377,3 +398,212 @@ pub trait TokenizerAdapter: Send + Sync {
     fn vocab_size(&self) -> u32;
     fn name(&self) -> &str;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Semantic search types (feature: `semantic-search`)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "semantic-search")]
+mod semantic {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Trait for supplying an embedding backend to Stowken.
+    ///
+    /// Implement this to plug in any embedding model — local (e.g. fastembed,
+    /// candle) or remote (OpenAI, Cohere, Voyage). The trait is sync because
+    /// callers bridge to async via `tokio::task::spawn_blocking`.
+    ///
+    /// Every `Vec<f32>` returned by `embed_batch` must have length == `dimension()`.
+    pub trait EmbeddingAdapter: Send + Sync {
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String>;
+        fn dimension(&self) -> usize;
+        fn model_name(&self) -> &str;
+    }
+
+    /// Trait for supplying an LLM-based summarizer used to produce a short
+    /// natural-language summary of a conversation prior to embedding.
+    pub trait SummarizerAdapter: Send + Sync {
+        fn summarize(&self, conversation_text: &str) -> Result<String, String>;
+        fn model_name(&self) -> &str;
+    }
+
+    /// How a conversation is reduced to text before being embedded.
+    #[derive(Clone)]
+    pub enum SummaryStrategy {
+        /// Detokenize all segments, concatenate with role markers, truncate to
+        /// `max_chars`. Default: 24_000 chars (~6K tokens).
+        ConcatTruncate { max_chars: usize },
+        /// Use an LLM to generate a short paragraph, then embed it.
+        LlmGenerated(Arc<dyn SummarizerAdapter>),
+    }
+
+    impl Default for SummaryStrategy {
+        fn default() -> Self {
+            Self::ConcatTruncate { max_chars: 24_000 }
+        }
+    }
+
+    impl SummaryStrategy {
+        /// String identifier persisted alongside each conversation embedding.
+        /// Allows multiple strategies to coexist for the same `(conv, model)`.
+        pub fn id(&self) -> String {
+            match self {
+                Self::ConcatTruncate { .. } => "concat".to_owned(),
+                Self::LlmGenerated(s) => format!("llm:{}", s.model_name()),
+            }
+        }
+    }
+
+    impl std::fmt::Debug for SummaryStrategy {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ConcatTruncate { max_chars } => f
+                    .debug_struct("ConcatTruncate")
+                    .field("max_chars", max_chars)
+                    .finish(),
+                Self::LlmGenerated(s) => f
+                    .debug_struct("LlmGenerated")
+                    .field("model", &s.model_name())
+                    .finish(),
+            }
+        }
+    }
+
+    /// Which embeddings to scan during a semantic search.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SearchGranularity {
+        /// Per-unique-segment embeddings only.
+        Segment,
+        /// Per-conversation summary embeddings only.
+        Conversation,
+        /// Both — best score per conversation across granularities.
+        Both,
+    }
+
+    impl Default for SearchGranularity {
+        fn default() -> Self {
+            Self::Both
+        }
+    }
+
+    impl std::str::FromStr for SearchGranularity {
+        type Err = String;
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "segment" => Ok(Self::Segment),
+                "conversation" => Ok(Self::Conversation),
+                "both" => Ok(Self::Both),
+                other => Err(format!("unknown granularity: {other}")),
+            }
+        }
+    }
+
+    /// Query for `Stowken::semantic_search`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SemanticSearchQuery {
+        pub text: String,
+        #[serde(default)]
+        pub granularity: SearchGranularity,
+        pub model: Option<String>,
+        pub application: Option<String>,
+        pub segment_type: Option<SegmentType>,
+        pub date_from: Option<chrono::DateTime<chrono::Utc>>,
+        pub date_to: Option<chrono::DateTime<chrono::Utc>>,
+        pub limit: usize,
+        pub min_score: f32,
+    }
+
+    impl SemanticSearchQuery {
+        pub fn new(text: impl Into<String>) -> Self {
+            Self {
+                text: text.into(),
+                granularity: SearchGranularity::Both,
+                model: None,
+                application: None,
+                segment_type: None,
+                date_from: None,
+                date_to: None,
+                limit: 10,
+                min_score: 0.0,
+            }
+        }
+    }
+
+    impl Serialize for SearchGranularity {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            let v = match self {
+                Self::Segment => "segment",
+                Self::Conversation => "conversation",
+                Self::Both => "both",
+            };
+            s.serialize_str(v)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for SearchGranularity {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            let s = String::deserialize(d)?;
+            s.parse().map_err(serde::de::Error::custom)
+        }
+    }
+
+    /// One result row from a semantic search.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SemanticSearchHit {
+        pub conversation_id: String,
+        pub score: f32,
+        pub matched_via: MatchedVia,
+        pub application: Option<String>,
+        pub model: String,
+        pub created_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    /// How a conversation matched a semantic query.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum MatchedVia {
+        Segment {
+            hash: SegmentHash,
+            segment_type: SegmentType,
+        },
+        Conversation,
+    }
+
+    /// Summary stats from an embed pass.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct EmbedStats {
+        pub segments_embedded: u64,
+        pub segments_skipped: u64,
+        pub segments_already_done: u64,
+        pub conversations_embedded: u64,
+        pub conversations_already_done: u64,
+        pub embedding_model: String,
+        pub summary_strategy: String,
+    }
+
+    /// One cluster of conversations from `cluster_conversations`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ConversationCluster {
+        pub cluster_id: u32,
+        pub size: usize,
+        /// Conversation IDs closest to the cluster centroid (descending).
+        pub representative_ids: Vec<String>,
+        /// All member conversation IDs.
+        pub members: Vec<String>,
+    }
+
+    /// One outlier conversation from `find_outliers`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct OutlierConversation {
+        pub conversation_id: String,
+        /// Distance (1 - cosine) to the nearest centroid. Higher = more isolated.
+        pub isolation_score: f32,
+        pub application: Option<String>,
+        pub model: String,
+        pub created_at: chrono::DateTime<chrono::Utc>,
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+pub use semantic::*;

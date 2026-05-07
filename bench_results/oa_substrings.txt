@@ -1,13 +1,13 @@
 Stowken Benchmark
 ============================================================
-Source        : open_assistant.jsonl
+Source        : data/open_assistant.jsonl
 
 Ingest
 ------------------------------------------------------------
   Conversations : 3482  (0 failed)
   Tokens        : 1297767
-  Time          : 1806ms  (518µs/conv, 718545 tok/s)
-  Substrings    : 32ms — 0 segs rewritten, 0 bytes saved
+  Time          : 2027ms  (582µs/conv, 639937 tok/s)
+  Substrings    : 33ms — 0 segs rewritten, 0 bytes saved
 
 Storage layers
 ------------------------------------------------------------
@@ -30,5 +30,5 @@ Per-segment-type breakdown
 Retrieval (decompression-only, MemoryBackend)
 ------------------------------------------------------------
   Sampled       : 1000 conversations
-  Time          : 19ms  (18471908 tok/s, 50058 conv/s)
-  Latency p50/p95/p99: 18µs / 30µs / 35µs per conversation
+  Time          : 20ms  (17769715 tok/s, 48155 conv/s)
+  Latency p50/p95/p99: 18µs / 31µs / 38µs per conversation

@@ -220,6 +220,29 @@ fn build_retrieve_dict(
     Ok(dict.into())
 }
 
+fn build_conversation_text(
+    py: Python<'_>,
+    ct: &sk::types::ConversationText,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("conversation_id", &ct.conversation_id)?;
+    dict.set_item("model", &ct.model)?;
+    if let Some(app) = &ct.application {
+        dict.set_item("application", app)?;
+    }
+    dict.set_item("text", &ct.text)?;
+    dict.set_item("created_at", ct.created_at.to_rfc3339())?;
+    let turns = PyList::empty_bound(py);
+    for t in &ct.turns {
+        let td = PyDict::new_bound(py);
+        td.set_item("role", &t.role)?;
+        td.set_item("text", &t.text)?;
+        turns.append(td)?;
+    }
+    dict.set_item("turns", turns)?;
+    Ok(dict.into())
+}
+
 fn build_segment_stats_list(
     py: Python<'_>,
     stats: &[sk::types::SegmentTypeStats],
@@ -292,6 +315,17 @@ async fn vault_retrieve(
         VaultKind::Memory(v) => v.retrieve(id).await,
         VaultKind::Filesystem(v) => v.retrieve(id).await,
         VaultKind::S3(v) => v.retrieve(id).await,
+    }
+}
+
+async fn vault_retrieve_batch(
+    inner: &VaultKind,
+    ids: &[&str],
+) -> Result<Vec<sk::types::ConversationText>, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.retrieve_batch(ids).await,
+        VaultKind::Filesystem(v) => v.retrieve_batch(ids).await,
+        VaultKind::S3(v) => v.retrieve_batch(ids).await,
     }
 }
 
@@ -528,6 +562,303 @@ fn build_dict_info_list(
     Ok(list.into())
 }
 
+// ── Semantic search bridges (feature: semantic-search) ──────────────────────
+
+#[cfg(feature = "semantic-search")]
+mod semantic_bridge {
+    use super::*;
+
+    /// Bridges a Python callable (``Callable[[list[str]], list[list[float]]]``)
+    /// into Stowken's ``EmbeddingAdapter`` trait. The callable is invoked
+    /// inside ``Python::with_gil`` from the spawn_blocking thread that
+    /// `Stowken::semantic_search` uses, so this is safe even when called
+    /// from an async context.
+    pub struct PyEmbeddingAdapter {
+        pub callback: PyObject,
+        pub dim: usize,
+        pub model: String,
+    }
+
+    impl sk::types::EmbeddingAdapter for PyEmbeddingAdapter {
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+            Python::with_gil(|py| {
+                let list = PyList::new_bound(py, texts);
+                let result = self
+                    .callback
+                    .call1(py, (list,))
+                    .map_err(|e| format!("python embedding callback: {e}"))?;
+                let rows: Vec<Vec<f32>> = result
+                    .extract(py)
+                    .map_err(|e| format!("decoding embedding result: {e}"))?;
+                Ok(rows)
+            })
+        }
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+    }
+
+    /// Bridges a Python callable (``Callable[[str], str]``) into Stowken's
+    /// ``SummarizerAdapter`` trait.
+    pub struct PySummarizerAdapter {
+        pub callback: PyObject,
+        pub model: String,
+    }
+
+    impl sk::types::SummarizerAdapter for PySummarizerAdapter {
+        fn summarize(&self, text: &str) -> Result<String, String> {
+            Python::with_gil(|py| {
+                let result = self
+                    .callback
+                    .call1(py, (text,))
+                    .map_err(|e| format!("python summarizer callback: {e}"))?;
+                result
+                    .extract(py)
+                    .map_err(|e| format!("decoding summarizer result: {e}"))
+            })
+        }
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+fn vault_set_embedding_adapter(
+    inner: &VaultKind,
+    adapter: semantic_bridge::PyEmbeddingAdapter,
+) {
+    match inner {
+        VaultKind::Memory(v) => v.set_embedding_adapter(adapter),
+        VaultKind::Filesystem(v) => v.set_embedding_adapter(adapter),
+        VaultKind::S3(v) => v.set_embedding_adapter(adapter),
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+fn vault_set_summarizer(
+    inner: &VaultKind,
+    adapter: semantic_bridge::PySummarizerAdapter,
+) {
+    match inner {
+        VaultKind::Memory(v) => v.set_summarizer(adapter),
+        VaultKind::Filesystem(v) => v.set_summarizer(adapter),
+        VaultKind::S3(v) => v.set_summarizer(adapter),
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+fn vault_use_concat_summary(inner: &VaultKind, max_chars: usize) {
+    match inner {
+        VaultKind::Memory(v) => v.use_concat_summary(max_chars),
+        VaultKind::Filesystem(v) => v.use_concat_summary(max_chars),
+        VaultKind::S3(v) => v.use_concat_summary(max_chars),
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+fn vault_set_embed_on_store(inner: &VaultKind, enabled: bool) {
+    match inner {
+        VaultKind::Memory(v) => v.set_embed_on_store(enabled),
+        VaultKind::Filesystem(v) => v.set_embed_on_store(enabled),
+        VaultKind::S3(v) => v.set_embed_on_store(enabled),
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+async fn vault_embed_all(
+    inner: &VaultKind,
+) -> Result<sk::types::EmbedStats, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.embed_all().await,
+        VaultKind::Filesystem(v) => v.embed_all().await,
+        VaultKind::S3(v) => v.embed_all().await,
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+async fn vault_semantic_search(
+    inner: &VaultKind,
+    q: sk::types::SemanticSearchQuery,
+) -> Result<Vec<sk::types::SemanticSearchHit>, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.semantic_search(q).await,
+        VaultKind::Filesystem(v) => v.semantic_search(q).await,
+        VaultKind::S3(v) => v.semantic_search(q).await,
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+async fn vault_typed_search(
+    inner: &VaultKind,
+    kind: &str,
+    text: &str,
+    limit: usize,
+) -> Result<Vec<sk::types::SemanticSearchHit>, sk::vault::StowkenError> {
+    match (inner, kind) {
+        (VaultKind::Memory(v), "prompts") => v.search_prompts(text, limit).await,
+        (VaultKind::Memory(v), "responses") => v.search_responses(text, limit).await,
+        (VaultKind::Memory(v), "user_questions") => v.search_user_questions(text, limit).await,
+        (VaultKind::Memory(v), "tool_uses") => v.search_tool_uses(text, limit).await,
+        (VaultKind::Memory(v), "conversations") => v.search_conversations(text, limit).await,
+        (VaultKind::Filesystem(v), "prompts") => v.search_prompts(text, limit).await,
+        (VaultKind::Filesystem(v), "responses") => v.search_responses(text, limit).await,
+        (VaultKind::Filesystem(v), "user_questions") => v.search_user_questions(text, limit).await,
+        (VaultKind::Filesystem(v), "tool_uses") => v.search_tool_uses(text, limit).await,
+        (VaultKind::Filesystem(v), "conversations") => v.search_conversations(text, limit).await,
+        (VaultKind::S3(v), "prompts") => v.search_prompts(text, limit).await,
+        (VaultKind::S3(v), "responses") => v.search_responses(text, limit).await,
+        (VaultKind::S3(v), "user_questions") => v.search_user_questions(text, limit).await,
+        (VaultKind::S3(v), "tool_uses") => v.search_tool_uses(text, limit).await,
+        (VaultKind::S3(v), "conversations") => v.search_conversations(text, limit).await,
+        _ => Err(sk::vault::StowkenError::Internal(format!(
+            "unknown typed search kind '{kind}'"
+        ))),
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+async fn vault_cluster(
+    inner: &VaultKind,
+    k: usize,
+    representatives: usize,
+) -> Result<Vec<sk::types::ConversationCluster>, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.cluster_conversations(k, representatives).await,
+        VaultKind::Filesystem(v) => v.cluster_conversations(k, representatives).await,
+        VaultKind::S3(v) => v.cluster_conversations(k, representatives).await,
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+async fn vault_outliers(
+    inner: &VaultKind,
+    k: usize,
+    threshold: f32,
+    limit: usize,
+) -> Result<Vec<sk::types::OutlierConversation>, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.find_outliers(k, threshold, limit).await,
+        VaultKind::Filesystem(v) => v.find_outliers(k, threshold, limit).await,
+        VaultKind::S3(v) => v.find_outliers(k, threshold, limit).await,
+    }
+}
+
+#[cfg(feature = "semantic-search")]
+fn shape_hit(py: Python<'_>, h: &sk::types::SemanticSearchHit) -> PyResult<PyObject> {
+    use sk::types::MatchedVia;
+    let d = PyDict::new_bound(py);
+    d.set_item("conversation_id", &h.conversation_id)?;
+    d.set_item("score", h.score)?;
+    d.set_item("application", &h.application)?;
+    d.set_item("model", &h.model)?;
+    d.set_item("created_at", h.created_at.to_rfc3339())?;
+    let m = PyDict::new_bound(py);
+    match &h.matched_via {
+        MatchedVia::Segment { hash, segment_type } => {
+            m.set_item("kind", "segment")?;
+            m.set_item("hash", &hash.0)?;
+            m.set_item("segment_type", segment_type.to_string())?;
+        }
+        MatchedVia::Conversation => {
+            m.set_item("kind", "conversation")?;
+        }
+    }
+    d.set_item("matched_via", m)?;
+    Ok(d.into())
+}
+
+#[cfg(feature = "semantic-search")]
+fn shape_hits(py: Python<'_>, hits: &[sk::types::SemanticSearchHit]) -> PyResult<PyObject> {
+    let list = PyList::empty_bound(py);
+    for h in hits {
+        list.append(shape_hit(py, h)?)?;
+    }
+    Ok(list.into())
+}
+
+#[cfg(feature = "semantic-search")]
+fn shape_embed_stats(py: Python<'_>, s: &sk::types::EmbedStats) -> PyResult<PyObject> {
+    let d = PyDict::new_bound(py);
+    d.set_item("segments_embedded", s.segments_embedded)?;
+    d.set_item("segments_skipped", s.segments_skipped)?;
+    d.set_item("segments_already_done", s.segments_already_done)?;
+    d.set_item("conversations_embedded", s.conversations_embedded)?;
+    d.set_item("conversations_already_done", s.conversations_already_done)?;
+    d.set_item("embedding_model", &s.embedding_model)?;
+    d.set_item("summary_strategy", &s.summary_strategy)?;
+    Ok(d.into())
+}
+
+#[cfg(feature = "semantic-search")]
+fn shape_clusters(
+    py: Python<'_>,
+    cs: &[sk::types::ConversationCluster],
+) -> PyResult<PyObject> {
+    let list = PyList::empty_bound(py);
+    for c in cs {
+        let d = PyDict::new_bound(py);
+        d.set_item("cluster_id", c.cluster_id)?;
+        d.set_item("size", c.size)?;
+        d.set_item("representative_ids", c.representative_ids.clone())?;
+        d.set_item("members", c.members.clone())?;
+        list.append(d)?;
+    }
+    Ok(list.into())
+}
+
+#[cfg(feature = "semantic-search")]
+fn shape_outliers(
+    py: Python<'_>,
+    os: &[sk::types::OutlierConversation],
+) -> PyResult<PyObject> {
+    let list = PyList::empty_bound(py);
+    for o in os {
+        let d = PyDict::new_bound(py);
+        d.set_item("conversation_id", &o.conversation_id)?;
+        d.set_item("isolation_score", o.isolation_score)?;
+        d.set_item("application", &o.application)?;
+        d.set_item("model", &o.model)?;
+        d.set_item("created_at", o.created_at.to_rfc3339())?;
+        list.append(d)?;
+    }
+    Ok(list.into())
+}
+
+#[cfg(feature = "semantic-search")]
+fn parse_semantic_query(
+    text: String,
+    granularity: String,
+    limit: usize,
+    min_score: f32,
+    model: Option<String>,
+    application: Option<String>,
+    segment_type: Option<String>,
+) -> PyResult<sk::types::SemanticSearchQuery> {
+    use sk::types::{SearchGranularity, SegmentType};
+    let granularity: SearchGranularity = granularity
+        .parse()
+        .map_err(|e: String| PyRuntimeError::new_err(e))?;
+    let segment_type = match segment_type {
+        Some(s) => Some(s.parse::<SegmentType>().map_err(PyRuntimeError::new_err)?),
+        None => None,
+    };
+    Ok(sk::types::SemanticSearchQuery {
+        text,
+        granularity,
+        model,
+        application,
+        segment_type,
+        date_from: None,
+        date_to: None,
+        limit,
+        min_score,
+    })
+}
+
 // ── Main Python class ─────────────────────────────────────────────────────────
 
 /// Compressed, deduplicated storage for LLM token sequences.
@@ -715,6 +1046,41 @@ impl PyStowken {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let retrieved = vault_retrieve(&inner, &id).await.map_err(py_err)?;
             Python::with_gil(|py| build_retrieve_dict(py, &retrieved))
+        })
+    }
+
+    /// Retrieve multiple conversations by ID and return them as flat dicts with
+    /// `conversation_id`, `model`, `application`, `text`, `turns`, `created_at`.
+    /// `turns` is a list of `{"role": str, "text": str}` dicts in order.
+    /// Missing IDs are silently skipped.
+    fn retrieve_batch(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<PyObject> {
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let results = runtime()
+            .block_on(vault_retrieve_batch(&self.inner, &id_refs))
+            .map_err(py_err)?;
+        let list = PyList::empty_bound(py);
+        for ct in &results {
+            list.append(build_conversation_text(py, ct)?)?;
+        }
+        Ok(list.into())
+    }
+
+    fn retrieve_batch_async<'py>(
+        &self,
+        py: Python<'py>,
+        ids: Vec<String>,
+    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let results = vault_retrieve_batch(&inner, &id_refs).await.map_err(py_err)?;
+            Python::with_gil(|py| {
+                let list = PyList::empty_bound(py);
+                for ct in &results {
+                    list.append(build_conversation_text(py, ct)?)?;
+                }
+                Ok::<PyObject, PyErr>(list.into())
+            })
         })
     }
 
@@ -1058,6 +1424,255 @@ impl PyStowken {
             let infos = vault_list_dicts(&inner);
             Python::with_gil(|py| build_dict_info_list(py, &infos))
         })
+    }
+
+    // ── Semantic search (feature: semantic-search) ──────────────────────────
+
+    /// Configure the embedding adapter.
+    ///
+    /// Args:
+    ///     embed_fn: ``Callable[[list[str]], list[list[float]]]``. Each
+    ///         returned vector must have length ``dimension``.
+    ///     dimension: Embedding vector size.
+    ///     model_name: Identifier persisted alongside each embedding.
+    ///         Changing this means previously embedded segments won't match.
+    #[cfg(feature = "semantic-search")]
+    #[pyo3(signature = (embed_fn, *, dimension, model_name))]
+    fn set_embedding_adapter(
+        &self,
+        _py: Python<'_>,
+        embed_fn: PyObject,
+        dimension: usize,
+        model_name: String,
+    ) -> PyResult<()> {
+        let adapter = semantic_bridge::PyEmbeddingAdapter {
+            callback: embed_fn,
+            dim: dimension,
+            model: model_name,
+        };
+        vault_set_embedding_adapter(&self.inner, adapter);
+        Ok(())
+    }
+
+    /// Configure an LLM-based summarizer for conversation embeddings.
+    ///
+    /// Args:
+    ///     summarize_fn: ``Callable[[str], str]``.
+    ///     model_name: Persisted as part of the summary strategy ID.
+    #[cfg(feature = "semantic-search")]
+    #[pyo3(signature = (summarize_fn, *, model_name))]
+    fn set_summarizer(
+        &self,
+        _py: Python<'_>,
+        summarize_fn: PyObject,
+        model_name: String,
+    ) -> PyResult<()> {
+        let adapter = semantic_bridge::PySummarizerAdapter {
+            callback: summarize_fn,
+            model: model_name,
+        };
+        vault_set_summarizer(&self.inner, adapter);
+        Ok(())
+    }
+
+    /// Use the cheap "concat-and-truncate" summary strategy. Default after
+    /// `set_embedding_adapter`. ``max_chars`` defaults to 24_000 (~6K tokens).
+    #[cfg(feature = "semantic-search")]
+    #[pyo3(signature = (max_chars=24_000))]
+    fn use_concat_summary(&self, _py: Python<'_>, max_chars: usize) {
+        vault_use_concat_summary(&self.inner, max_chars);
+    }
+
+    /// Toggle whether ``store()`` automatically embeds new segments and a
+    /// conversation summary. Default ``True``. Disable for bulk loads, then
+    /// run ``embed_all`` once afterwards.
+    #[cfg(feature = "semantic-search")]
+    fn set_embed_on_store(&self, _py: Python<'_>, enabled: bool) {
+        vault_set_embed_on_store(&self.inner, enabled);
+    }
+
+    /// Embed every stored segment + conversation summary that lacks an
+    /// embedding for the configured model.
+    #[cfg(feature = "semantic-search")]
+    fn embed_all(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let stats = runtime()
+            .block_on(vault_embed_all(&self.inner))
+            .map_err(py_err)?;
+        shape_embed_stats(py, &stats)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    fn embed_all_async<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let stats = vault_embed_all(&inner).await.map_err(py_err)?;
+            Python::with_gil(|py| shape_embed_stats(py, &stats))
+        })
+    }
+
+    /// Search conversations by semantic meaning.
+    ///
+    /// Returns a list of dicts: ``{conversation_id, score, matched_via,
+    /// application, model, created_at}``, sorted by score descending.
+    #[cfg(feature = "semantic-search")]
+    #[pyo3(signature = (
+        text,
+        *,
+        granularity = "both".to_owned(),
+        limit = 10,
+        min_score = 0.0,
+        model = None,
+        application = None,
+        segment_type = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn semantic_search(
+        &self,
+        py: Python<'_>,
+        text: String,
+        granularity: String,
+        limit: usize,
+        min_score: f32,
+        model: Option<String>,
+        application: Option<String>,
+        segment_type: Option<String>,
+    ) -> PyResult<PyObject> {
+        let q = parse_semantic_query(
+            text,
+            granularity,
+            limit,
+            min_score,
+            model,
+            application,
+            segment_type,
+        )?;
+        let hits = runtime()
+            .block_on(vault_semantic_search(&self.inner, q))
+            .map_err(py_err)?;
+        shape_hits(py, &hits)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[pyo3(signature = (
+        text,
+        *,
+        granularity = "both".to_owned(),
+        limit = 10,
+        min_score = 0.0,
+        model = None,
+        application = None,
+        segment_type = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn semantic_search_async<'py>(
+        &self,
+        py: Python<'py>,
+        text: String,
+        granularity: String,
+        limit: usize,
+        min_score: f32,
+        model: Option<String>,
+        application: Option<String>,
+        segment_type: Option<String>,
+    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+        let q = parse_semantic_query(
+            text,
+            granularity,
+            limit,
+            min_score,
+            model,
+            application,
+            segment_type,
+        )?;
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let hits = vault_semantic_search(&inner, q).await.map_err(py_err)?;
+            Python::with_gil(|py| shape_hits(py, &hits))
+        })
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[pyo3(signature = (text, *, limit = 10))]
+    fn search_prompts(&self, py: Python<'_>, text: String, limit: usize) -> PyResult<PyObject> {
+        let hits = runtime()
+            .block_on(vault_typed_search(&self.inner, "prompts", &text, limit))
+            .map_err(py_err)?;
+        shape_hits(py, &hits)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[pyo3(signature = (text, *, limit = 10))]
+    fn search_responses(&self, py: Python<'_>, text: String, limit: usize) -> PyResult<PyObject> {
+        let hits = runtime()
+            .block_on(vault_typed_search(&self.inner, "responses", &text, limit))
+            .map_err(py_err)?;
+        shape_hits(py, &hits)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[pyo3(signature = (text, *, limit = 10))]
+    fn search_user_questions(
+        &self,
+        py: Python<'_>,
+        text: String,
+        limit: usize,
+    ) -> PyResult<PyObject> {
+        let hits = runtime()
+            .block_on(vault_typed_search(&self.inner, "user_questions", &text, limit))
+            .map_err(py_err)?;
+        shape_hits(py, &hits)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[pyo3(signature = (text, *, limit = 10))]
+    fn search_tool_uses(&self, py: Python<'_>, text: String, limit: usize) -> PyResult<PyObject> {
+        let hits = runtime()
+            .block_on(vault_typed_search(&self.inner, "tool_uses", &text, limit))
+            .map_err(py_err)?;
+        shape_hits(py, &hits)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[pyo3(signature = (text, *, limit = 10))]
+    fn search_conversations(
+        &self,
+        py: Python<'_>,
+        text: String,
+        limit: usize,
+    ) -> PyResult<PyObject> {
+        let hits = runtime()
+            .block_on(vault_typed_search(&self.inner, "conversations", &text, limit))
+            .map_err(py_err)?;
+        shape_hits(py, &hits)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[pyo3(signature = (k = 10, *, representative_count = 3))]
+    fn cluster_conversations(
+        &self,
+        py: Python<'_>,
+        k: usize,
+        representative_count: usize,
+    ) -> PyResult<PyObject> {
+        let clusters = runtime()
+            .block_on(vault_cluster(&self.inner, k, representative_count))
+            .map_err(py_err)?;
+        shape_clusters(py, &clusters)
+    }
+
+    #[cfg(feature = "semantic-search")]
+    #[pyo3(signature = (k = 10, *, threshold = 0.5, limit = 20))]
+    fn find_outliers(
+        &self,
+        py: Python<'_>,
+        k: usize,
+        threshold: f32,
+        limit: usize,
+    ) -> PyResult<PyObject> {
+        let outliers = runtime()
+            .block_on(vault_outliers(&self.inner, k, threshold, limit))
+            .map_err(py_err)?;
+        shape_outliers(py, &outliers)
     }
 
     // ── repr ─────────────────────────────────────────────────────────────────

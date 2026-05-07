@@ -35,7 +35,7 @@ tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [features]
-default = ["tiktoken"]
+default = ["tiktoken", "semantic-search"]
 tiktoken = ["dep:tiktoken-rs"]
 s3 = [
     "dep:aws-config",
@@ -44,6 +44,7 @@ s3 = [
     "dep:aws-smithy-types",
     "dep:futures",
 ]
+semantic-search = ["dep:futures"]
 
 [[bench]]
 name = "compression"
