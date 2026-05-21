@@ -54,9 +54,9 @@ impl MockEmbedder {
             h = h.wrapping_mul(0x100000001B3) ^ (b as u64);
         }
         let mut out = vec![0.0_f32; DIM];
-        for i in 0..DIM {
+        for (i, slot) in out.iter_mut().enumerate() {
             let chunk = ((h >> (i * 16)) & 0xFFFF) as u32;
-            out[i] = chunk as f32 / 65_535.0;
+            *slot = chunk as f32 / 65_535.0;
         }
         out
     }

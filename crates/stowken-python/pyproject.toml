@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "stowken"
 version = "0.6.1"
 description = "Compressed, deduplicated, queryable storage for LLM conversations"
-readme = "../../README.md"
+readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.8"
 authors = [{ name = "Ben DiMattia", email = "brdimattia@gmail.com" }]
@@ -39,5 +39,5 @@ Changelog = "https://github.com/stowken/stowken/blob/master/CHANGELOG.md"
 
 [tool.maturin]
 python-source = "python"
-features = ["pyo3/extension-module", "s3"]
+features = ["pyo3/extension-module"]
 manifest-path = "Cargo.toml"

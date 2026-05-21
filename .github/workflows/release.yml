@@ -77,6 +77,9 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Copy README for maturin
+        run: cp README.md crates/stowken-python/README.md
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -98,6 +101,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Copy README for maturin
+        run: cp README.md crates/stowken-python/README.md
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1

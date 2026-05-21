@@ -471,20 +471,15 @@ mod semantic {
     }
 
     /// Which embeddings to scan during a semantic search.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub enum SearchGranularity {
         /// Per-unique-segment embeddings only.
         Segment,
         /// Per-conversation summary embeddings only.
         Conversation,
         /// Both — best score per conversation across granularities.
+        #[default]
         Both,
-    }
-
-    impl Default for SearchGranularity {
-        fn default() -> Self {
-            Self::Both
-        }
     }
 
     impl std::str::FromStr for SearchGranularity {

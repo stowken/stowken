@@ -414,16 +414,16 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         for chunk in ids.chunks(EMBED_BATCH_SIZE) {
             // Drive at most SUMMARY_CONCURRENCY summary calls in flight at once
             // to stay within typical LLM API rate limits.
-            let results: Vec<(String, String)> = futures::stream::iter(chunk.iter())
+            let results: Vec<(String, String)> = futures::stream::iter(chunk.iter().cloned())
                 .map(|id| {
                     let strategy = strategy.clone();
                     let tokenizer_name = tokenizer_name.clone();
                     async move {
-                        let conv = self.retrieve(id).await?;
+                        let conv = self.retrieve(&id).await?;
                         let summary = self
                             .build_conversation_summary(&conv, &strategy, &tokenizer_name)
                             .await?;
-                        Ok::<(String, String), StowkenError>((id.clone(), summary))
+                        Ok::<(String, String), StowkenError>((id, summary))
                     }
                 })
                 .buffer_unordered(SUMMARY_CONCURRENCY)

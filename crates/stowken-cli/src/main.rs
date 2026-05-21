@@ -796,9 +796,9 @@ async fn cmd_ingest(
         match vault.store(conv).await {
             Ok(r) => {
                 stored += 1;
-                deduped_total += r.deduped_segments as u64;
+                deduped_total += r.deduped_segments;
                 bytes_saved_total += r.bytes_saved;
-                if stored % 100 == 0 {
+                if stored.is_multiple_of(100) {
                     eprintln!("  {stored}/{total} stored…");
                 }
             }
@@ -1495,6 +1495,7 @@ async fn cmd_dict(
 
 // ── Benchmark ─────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_bench(
     config: StowkenConfig,
     split_segments: Option<usize>,
@@ -2088,6 +2089,7 @@ async fn cmd_semantic_search(
 }
 
 #[cfg(feature = "semantic-search")]
+#[allow(clippy::too_many_arguments)]
 async fn cmd_typed_search(
     data_dir: &PathBuf,
     config: StowkenConfig,
@@ -2185,6 +2187,7 @@ async fn cmd_cluster(
 }
 
 #[cfg(feature = "semantic-search")]
+#[allow(clippy::too_many_arguments)]
 async fn cmd_outliers(
     data_dir: &PathBuf,
     config: StowkenConfig,
