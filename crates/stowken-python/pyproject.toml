@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "stowken"
-version = "0.6.1"
+version = "0.7.0"
 description = "Compressed, deduplicated, queryable storage for LLM conversations"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }

@@ -1,6 +1,6 @@
 [package]
 name = "stowken-cli"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 description = "Command-line interface for Stowken"
 license = "MIT OR Apache-2.0"
