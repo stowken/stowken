@@ -1,5 +1,11 @@
 # Stowken
 
+[![Crates.io](https://img.shields.io/crates/v/stowken.svg)](https://crates.io/crates/stowken)
+[![PyPI](https://img.shields.io/pypi/v/stowken.svg)](https://pypi.org/project/stowken/)
+[![CI](https://github.com/stowken/stowken/actions/workflows/ci.yml/badge.svg)](https://github.com/stowken/stowken/actions/workflows/ci.yml)
+[![docs.rs](https://docs.rs/stowken/badge.svg)](https://docs.rs/stowken)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Most teams running LLM APIs in production are storing every conversation as raw JSON — which means the same system prompt written to disk thousands of times, no visibility into what's actually flowing through the API, and no way to answer "how many tokens did we spend on model X last month?" without a full table scan.
 
 Stowken is a storage library that fixes this. It stores LLM conversations as content-addressed token segments: identical system prompts are stored once regardless of how many users trigger them, everything is compressed, and a SQLite index sits on top so you can query your traffic without rebuilding it from logs.
