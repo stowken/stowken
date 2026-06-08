@@ -25,6 +25,7 @@ fn config_with_near_dedup(threshold: f64) -> StowkenConfig {
     StowkenConfig {
         enable_compression: true,
         near_dedup_threshold: Some(threshold),
+        embed_reuse_threshold: None,
     }
 }
 
@@ -187,8 +188,11 @@ async fn reindex_rebuilds_lsh_after_db_deletion() {
         assert_eq!(vault.near_dedup_index_size().await.unwrap(), 4);
     }
 
-    // Wipe the index. Manifests + segment files survive.
+    // Wipe ALL derived state — the SQLite metadata DB *and* the packed
+    // near-dup logs (the LSH index no longer lives in SQLite). Manifests +
+    // segment files survive as the source of truth.
     std::fs::remove_file(&db_path).unwrap();
+    std::fs::remove_dir_all(data_path.join("near_dedup")).unwrap();
 
     // Reopen + reindex.
     let backend = FilesystemBackend::new(&data_path).await.unwrap();
@@ -289,4 +293,42 @@ async fn delta_only_used_when_actually_smaller() {
         .find(|s| matches!(s.segment_type, stowken::types::SegmentType::SystemPrompt))
         .unwrap();
     assert_eq!(sys.tokens, variant);
+}
+
+#[tokio::test]
+async fn gc_prunes_near_dedup_index() {
+    let vault = Stowken::new(MemoryBackend::new(), config_with_near_dedup(0.80))
+        .await
+        .unwrap();
+
+    let canonical: Vec<u32> = (0u32..200).collect();
+    vault.store(make_conv("a", canonical.clone(), vec![1])).await.unwrap();
+    // System prompt + user turn are both indexed for future matching.
+    assert_eq!(vault.near_dedup_index_size().await.unwrap(), 2);
+
+    // Drop all refs, then collect. The pruned signatures must disappear.
+    vault.delete("a").await.unwrap();
+    vault.gc().await.unwrap();
+    assert_eq!(
+        vault.near_dedup_index_size().await.unwrap(),
+        0,
+        "GC must prune near-dup signatures for collected segments"
+    );
+
+    // A fresh near-duplicate of the now-deleted canonical must still ingest
+    // cleanly — a stale signature would otherwise be surfaced as a delta
+    // target and fail when the (deleted) canonical is fetched.
+    let mut variant = canonical.clone();
+    variant[10] = 99_999;
+    let variant_clone = variant.clone();
+    vault.store(make_conv("b", variant, vec![2])).await.unwrap();
+
+    let r = vault.retrieve("b").await.unwrap();
+    let sys = r
+        .segments
+        .iter()
+        .find(|s| matches!(s.segment_type, stowken::types::SegmentType::SystemPrompt))
+        .unwrap();
+    assert_eq!(sys.tokens, variant_clone);
+    assert_eq!(vault.near_dedup_index_size().await.unwrap(), 2);
 }

@@ -19,7 +19,6 @@ use tokio::task;
 use tracing::info;
 
 use crate::clustering::{kmeans, KMeansConfig};
-use crate::compression::FrameVersion;
 use crate::index::metadata::BatchSegmentOp;
 use crate::storage::backend::StorageBackend;
 use crate::types::{
@@ -151,9 +150,19 @@ fn upsert_best(
 impl<B: StorageBackend + 'static> Stowken<B> {
     // ── Embedding core ────────────────────────────────────────────────────
 
-    /// Embed a batch of unique segment hashes. Skips delta frames (the
-    /// canonical captures the meaning) and segments that fail to decompress
-    /// or detokenize. Persists L2-normalized embeddings via
+    /// Embed a batch of unique segment hashes.
+    ///
+    /// Two paths:
+    ///   * **Aliased variants** (a near-duplicate the vault decided is close
+    ///     enough to a canonical — see `embed_reuse_threshold`) reuse the
+    ///     canonical's vector with no API call. This both saves the call and
+    ///     keeps the variant searchable.
+    ///   * **Everyone else** is embedded directly. Delta-stored variants that
+    ///     are *not* aliased are decompressed (via their canonical) and
+    ///     embedded on their own — they were judged too semantically distinct
+    ///     to share an embedding, so dropping them would lose recall.
+    ///
+    /// Persists L2-normalized embeddings via
     /// `MetadataIndex::upsert_segment_embedding`.
     pub(crate) async fn embed_segment_hashes(
         &self,
@@ -164,9 +173,21 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         if hashes.is_empty() {
             return Ok(0);
         }
-        let total = hashes.len();
+        let model_name = adapter.model_name().to_owned();
+
+        // Partition into alias-reuse vs. direct-embed.
+        let mut direct: Vec<SegmentHash> = Vec::with_capacity(hashes.len());
+        let mut aliased: Vec<(SegmentHash, SegmentHash)> = Vec::new();
+        for hash in hashes {
+            match self.near_dup_index_internal().embedding_alias(hash) {
+                Some(canonical) => aliased.push((hash.clone(), canonical)),
+                None => direct.push(hash.clone()),
+            }
+        }
+
+        let total = direct.len();
         let mut embedded: u64 = 0;
-        for chunk in hashes.chunks(EMBED_BATCH_SIZE) {
+        for chunk in direct.chunks(EMBED_BATCH_SIZE) {
             let mut texts: Vec<String> = Vec::with_capacity(chunk.len());
             let mut valid_hashes: Vec<SegmentHash> = Vec::with_capacity(chunk.len());
 
@@ -175,9 +196,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                if stored.compressed_data.first() == Some(&(FrameVersion::Delta as u8)) {
-                    continue;
-                }
+                // Note: delta frames are NOT skipped — decompress_segment_async
+                // resolves them against their canonical so non-aliased variants
+                // stay searchable.
                 let tokens = match self
                     .decompress_segment_async(&stored.compressed_data)
                     .await
@@ -218,7 +239,6 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                 )));
             }
 
-            let model_name = adapter.model_name().to_owned();
             for (hash, raw) in valid_hashes.iter().zip(embeddings.iter()) {
                 let normalized = l2_normalize(raw);
                 let index = self.index_clone();
@@ -233,7 +253,81 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             }
             eprintln!("  segments: {}/{total}", embedded);
         }
+
+        // Alias pass: copy each canonical's vector onto its variant. The
+        // direct pass above has already embedded any canonical that was new in
+        // this batch, so the lookup normally hits. If it misses (canonical not
+        // yet embedded for this model), fall back to embedding the variant
+        // directly so it isn't left unsearchable.
+        for (variant, canonical) in aliased {
+            let index = self.index_clone();
+            let canon = canonical.clone();
+            let mn = model_name.clone();
+            let existing = task::spawn_blocking(move || index.get_segment_embedding(&canon, &mn))
+                .await
+                .map_err(|e| StowkenError::Internal(e.to_string()))??;
+
+            match existing {
+                Some(vec) => {
+                    let index = self.index_clone();
+                    let v = variant.clone();
+                    let mn = model_name.clone();
+                    task::spawn_blocking(move || index.upsert_segment_embedding(&v, &mn, &vec))
+                        .await
+                        .map_err(|e| StowkenError::Internal(e.to_string()))??;
+                    embedded += 1;
+                }
+                None => {
+                    embedded += self
+                        .embed_direct_fallback(&variant, tokenizer_name, &adapter, &model_name)
+                        .await?;
+                }
+            }
+        }
+
         Ok(embedded)
+    }
+
+    /// Embed a single segment directly (used as a fallback when an aliased
+    /// variant's canonical has no embedding yet for the active model).
+    async fn embed_direct_fallback(
+        &self,
+        hash: &SegmentHash,
+        tokenizer_name: &str,
+        adapter: &Arc<dyn EmbeddingAdapter>,
+        model_name: &str,
+    ) -> Result<u64, StowkenError> {
+        let stored: StoredSegment = match self.backend_get_segment(hash).await {
+            Ok(s) => s,
+            Err(_) => return Ok(0),
+        };
+        let tokens = match self.decompress_segment_async(&stored.compressed_data).await {
+            Ok(t) => t,
+            Err(_) => return Ok(0),
+        };
+        if tokens.is_empty() {
+            return Ok(0);
+        }
+        let text = self.detokenize_segment_tokens(&tokens, tokenizer_name);
+        if text.trim().is_empty() {
+            return Ok(0);
+        }
+
+        let adapter_clone = Arc::clone(adapter);
+        let embeddings = task::spawn_blocking(move || adapter_clone.embed_batch(&[text.as_str()]))
+            .await
+            .map_err(|e| StowkenError::Internal(e.to_string()))?
+            .map_err(StowkenError::Embedding)?;
+        let Some(raw) = embeddings.first() else { return Ok(0) };
+
+        let normalized = l2_normalize(raw);
+        let index = self.index_clone();
+        let h = hash.clone();
+        let mn = model_name.to_owned();
+        task::spawn_blocking(move || index.upsert_segment_embedding(&h, &mn, &normalized))
+            .await
+            .map_err(|e| StowkenError::Internal(e.to_string()))??;
+        Ok(1)
     }
 
     /// Build a text summary of a conversation according to the active
@@ -414,16 +508,16 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         for chunk in ids.chunks(EMBED_BATCH_SIZE) {
             // Drive at most SUMMARY_CONCURRENCY summary calls in flight at once
             // to stay within typical LLM API rate limits.
-            let results: Vec<(String, String)> = futures::stream::iter(chunk.iter())
+            let results: Vec<(String, String)> = futures::stream::iter(chunk.iter().cloned())
                 .map(|id| {
                     let strategy = strategy.clone();
                     let tokenizer_name = tokenizer_name.clone();
                     async move {
-                        let conv = self.retrieve(id).await?;
+                        let conv = self.retrieve(&id).await?;
                         let summary = self
                             .build_conversation_summary(&conv, &strategy, &tokenizer_name)
                             .await?;
-                        Ok::<(String, String), StowkenError>((id.clone(), summary))
+                        Ok::<(String, String), StowkenError>((id, summary))
                     }
                 })
                 .buffer_unordered(SUMMARY_CONCURRENCY)

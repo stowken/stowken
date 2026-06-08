@@ -177,6 +177,19 @@ pub struct StowkenConfig {
     /// low values can produce inflated delta sizes and worse storage. Stick
     /// to the 0.80–0.95 range.
     pub near_dedup_threshold: Option<f64>,
+    /// Jaccard similarity threshold for *reusing a canonical's embedding* on
+    /// a near-duplicate variant instead of computing a fresh one. `None`
+    /// disables embedding reuse (default).
+    ///
+    /// This is deliberately a **separate, stricter** bar than
+    /// `near_dedup_threshold`. Delta storage is lossless, so 0.85 is safe for
+    /// bytes; embeddings are not — a single flipped token ("approve" vs
+    /// "deny") can score 0.95+ Jaccard yet mean the opposite, and aliasing
+    /// the vector would make the two indistinguishable in semantic search.
+    /// Keep this high (≥0.97). It is independent of `near_dedup_threshold`:
+    /// a variant can be delta-stored without sharing an embedding, and an
+    /// embedding can be aliased even when the delta wasn't a storage win.
+    pub embed_reuse_threshold: Option<f64>,
 }
 
 impl Default for StowkenConfig {
@@ -184,6 +197,7 @@ impl Default for StowkenConfig {
         Self {
             enable_compression: true,
             near_dedup_threshold: None,
+            embed_reuse_threshold: None,
         }
     }
 }
@@ -197,6 +211,39 @@ pub struct StoreResult {
     pub deduped_segments: u64,
     pub bytes_saved: u64,
     pub compression_ratio: f64,
+}
+
+/// A single chunked segment ready for persistence by an external store.
+///
+/// Produced by `Stowken::chunk_only`; carries no ref-count or `created_at`
+/// timestamp because the caller decides how to materialize the segment in
+/// its target store (Delta MERGE, external object store, custom DB).
+#[derive(Debug, Clone)]
+pub struct ChunkedSegment {
+    pub segment_type: SegmentType,
+    pub hash: SegmentHash,
+    pub compressed_data: Vec<u8>,
+    pub token_count: u32,
+    pub raw_size: u32,
+    pub position: u32,
+}
+
+/// Output of `Stowken::chunk_only` — a fully chunked, hashed, and compressed
+/// conversation that has NOT been persisted to any backend.
+///
+/// The caller is responsible for writing the segments and the manifest to
+/// whichever target it owns. Stowken makes no claim about exactly-once
+/// semantics across the boundary; the caller's MERGE / upsert logic is the
+/// source of truth for dedup.
+#[derive(Debug, Clone)]
+pub struct ChunkResult {
+    pub id: String,
+    pub application: Option<String>,
+    pub model: String,
+    pub tokenizer: String,
+    pub total_tokens: u64,
+    pub segments: Vec<ChunkedSegment>,
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// A retrieved conversation with all segments reassembled.

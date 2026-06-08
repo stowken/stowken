@@ -6,7 +6,8 @@
 #![cfg(feature = "semantic-search")]
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use stowken::{
     storage::MemoryBackend,
@@ -24,6 +25,9 @@ const DIM: usize = 4;
 /// extra detokenization paths still produce *some* embedding.
 struct MockEmbedder {
     responses: Mutex<HashMap<String, Vec<f32>>>,
+    /// Count of individual texts the embedder was actually asked to embed.
+    /// Shared so a test can read it after the adapter is moved into the vault.
+    calls: Arc<AtomicUsize>,
 }
 
 impl MockEmbedder {
@@ -34,7 +38,15 @@ impl MockEmbedder {
         }
         Self {
             responses: Mutex::new(map),
+            calls: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// A handle to the embed-call counter that outlives moving `self` into
+    /// the vault.
+    #[allow(dead_code)]
+    fn call_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.calls)
     }
 
     #[allow(dead_code)]
@@ -64,6 +76,7 @@ impl MockEmbedder {
 
 impl EmbeddingAdapter for MockEmbedder {
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+        self.calls.fetch_add(texts.len(), Ordering::SeqCst);
         let map = self.responses.lock().unwrap();
         Ok(texts
             .iter()
@@ -79,6 +92,26 @@ impl EmbeddingAdapter for MockEmbedder {
     }
     fn model_name(&self) -> &str {
         "mock-embed-v1"
+    }
+}
+
+/// Trivial tokenizer whose detokenize is a space-joined numeric string —
+/// guaranteed non-empty for any non-empty token slice. The bundled cl100k
+/// tokenizer detokenizes our synthetic byte-value tokens to whitespace,
+/// which the embed path (correctly) skips; this keeps segment text real.
+struct NumTokenizer;
+impl stowken::types::TokenizerAdapter for NumTokenizer {
+    fn tokenize(&self, text: &str) -> Vec<u32> {
+        text.bytes().map(|b| b as u32).collect()
+    }
+    fn detokenize(&self, tokens: &[u32]) -> String {
+        tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ")
+    }
+    fn vocab_size(&self) -> u32 {
+        u32::MAX
+    }
+    fn name(&self) -> &str {
+        "num-tokenizer"
     }
 }
 
@@ -402,4 +435,70 @@ async fn min_score_threshold_drops_low_results() {
         .await
         .unwrap();
     assert!(hits.is_empty(), "min_score=2.0 must filter everything");
+}
+
+#[tokio::test]
+async fn embed_reuse_aliases_near_duplicate_embedding() {
+    // near_dedup gates delta storage; embed_reuse (stricter) gates embedding
+    // reuse. They are independent — this test exercises the reuse path.
+    let config = StowkenConfig {
+        enable_compression: true,
+        near_dedup_threshold: Some(0.80),
+        embed_reuse_threshold: Some(0.90),
+    };
+    let mut vault = Stowken::new(MemoryBackend::new(), config).await.unwrap();
+    vault.set_tokenizer(NumTokenizer);
+    // Embed manually so the call count isn't muddied by embed-on-store or by
+    // conversation-summary embedding.
+    vault.set_embed_on_store(false);
+
+    // A long system prompt and a near-duplicate of it (one character changed
+    // at byte 100). Jaccard ≈ 0.99 → clears both thresholds.
+    let sys_a: String = "the quick brown fox jumps over the lazy dog. "
+        .repeat(8);
+    let sys_b = format!("{}X{}", &sys_a[..100], &sys_a[101..]);
+
+    // Deliberately dissimilar user/assistant turns so only the system prompt
+    // is treated as a near-duplicate.
+    vault
+        .store(make_conv_with_text(
+            "a",
+            &sys_a,
+            "What is the capital of France?",
+            "The capital of France is Paris.",
+        ))
+        .await
+        .unwrap();
+    vault
+        .store(make_conv_with_text(
+            "b",
+            &sys_b,
+            "Explain quantum entanglement briefly.",
+            "Two particles share a correlated state.",
+        ))
+        .await
+        .unwrap();
+
+    let embedder = MockEmbedder::new(vec![]);
+    let calls = embedder.call_counter();
+    vault.set_embedding_adapter(embedder);
+
+    // A's 3 segments + B's user/assistant = 5 embedded directly. B's system
+    // prompt is a near-duplicate of A's, so its vector is COPIED from the
+    // canonical — no API call.
+    let embedded = vault.embed_all_segments().await.unwrap();
+    assert_eq!(embedded, 6, "all 6 unique segments should end up embedded");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        5,
+        "the near-duplicate system prompt must NOT be sent to the embedder"
+    );
+
+    // Nothing left unembedded — the aliased variant is searchable.
+    let (segments_pending, _convs_pending) =
+        vault.embed_all_pending_counts().await.unwrap();
+    assert_eq!(
+        segments_pending, 0,
+        "aliased variant should have an embedding (stays searchable)"
+    );
 }

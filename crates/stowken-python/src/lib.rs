@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use tokio::runtime::Runtime;
 
 extern crate stowken as sk;
@@ -24,6 +24,17 @@ use sk::{
     storage::{s3::S3Backend, FilesystemBackend, MemoryBackend},
     types::{Conversation, Message, MessageContent, StowkenConfig},
     Stowken,
+};
+
+// Stateless near-dedup primitives for the distributed (Spark) pipeline. These
+// wrap the same algorithm the vault's `store()` uses, but operate on raw frame
+// bytes with no vault/index state — so a Spark UDF can compute signatures,
+// build/decode 0x04 delta frames, and score similarity per row.
+use sk::{
+    compression::{CanonicalResolver, CompressionError, CompressionPipeline},
+    get_tokenizer,
+    near_dedup::{self, MinHashSignature},
+    types::{SegmentHash, Token},
 };
 
 // ── Shared runtime ───────────────────────────────────────────────────────────
@@ -165,7 +176,28 @@ fn parse_conversation(dict: &pyo3::Bound<'_, PyDict>) -> PyResult<Conversation> 
         messages.push(parse_message(&item)?);
     }
 
-    Ok(Conversation { id, model, tokenizer, application, metadata: None, messages })
+    // Conversation-level metadata: accept any JSON-serializable Python dict.
+    // We round-trip through `json.dumps` so we don't have to take on a
+    // separate PyAny -> serde_json conversion crate (e.g. pythonize).
+    let metadata = match dict.get_item("metadata")? {
+        Some(v) if !v.is_none() => {
+            let json_mod = dict.py().import_bound("json")?;
+            let dumped: String = json_mod.getattr("dumps")?.call1((v,))?.extract()?;
+            Some(
+                serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(
+                    &dumped,
+                )
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "metadata must be a JSON-serializable object: {e}"
+                    ))
+                })?,
+            )
+        }
+        _ => None,
+    };
+
+    Ok(Conversation { id, model, tokenizer, application, metadata, messages })
 }
 
 // ── Result-shaping helpers (used by both sync and async paths) ───────────────
@@ -214,6 +246,50 @@ fn build_retrieve_dict(
         sd.set_item("token_count", seg.token_count)?;
         sd.set_item("hash", &seg.hash.0)?;
         sd.set_item("tokens", &seg.tokens)?;
+        segs_list.append(sd)?;
+    }
+    dict.set_item("segments", segs_list)?;
+    Ok(dict.into())
+}
+
+fn build_chunk_result_dict(
+    py: Python<'_>,
+    result: &sk::types::ChunkResult,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("id", &result.id)?;
+    if let Some(app) = &result.application {
+        dict.set_item("application", app)?;
+    } else {
+        dict.set_item("application", py.None())?;
+    }
+    dict.set_item("model", &result.model)?;
+    dict.set_item("tokenizer", &result.tokenizer)?;
+    dict.set_item("total_tokens", result.total_tokens)?;
+
+    // Serialize conversation-level metadata to a JSON string so callers can
+    // drop it straight into a `raw_metadata STRING` Delta column. None
+    // becomes Python None.
+    match &result.metadata {
+        Some(meta) => {
+            let json = serde_json::to_string(meta)
+                .map_err(|e| PyRuntimeError::new_err(format!("metadata serialize: {e}")))?;
+            dict.set_item("metadata_json", json)?;
+        }
+        None => {
+            dict.set_item("metadata_json", py.None())?;
+        }
+    }
+
+    let segs_list = PyList::empty_bound(py);
+    for seg in &result.segments {
+        let sd = PyDict::new_bound(py);
+        sd.set_item("segment_type", seg.segment_type.to_string())?;
+        sd.set_item("hash", &seg.hash.0)?;
+        sd.set_item("compressed_data", PyBytes::new_bound(py, &seg.compressed_data))?;
+        sd.set_item("token_count", seg.token_count)?;
+        sd.set_item("raw_size", seg.raw_size)?;
+        sd.set_item("position", seg.position)?;
         segs_list.append(sd)?;
     }
     dict.set_item("segments", segs_list)?;
@@ -422,6 +498,29 @@ fn vault_list_substrings(inner: &VaultKind) -> Vec<sk::substring_registry::Subst
         VaultKind::Memory(v) => v.list_substrings(),
         VaultKind::Filesystem(v) => v.list_substrings(),
         VaultKind::S3(v) => v.list_substrings(),
+    }
+}
+
+fn vault_chunk_only(
+    inner: &VaultKind,
+    conv: sk::types::Conversation,
+) -> Result<sk::types::ChunkResult, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.chunk_only(conv),
+        VaultKind::Filesystem(v) => v.chunk_only(conv),
+        VaultKind::S3(v) => v.chunk_only(conv),
+    }
+}
+
+fn vault_decompress_to_text(
+    inner: &VaultKind,
+    data: &[u8],
+    tokenizer_name: &str,
+) -> Result<String, sk::vault::StowkenError> {
+    match inner {
+        VaultKind::Memory(v) => v.decompress_to_text(data, tokenizer_name),
+        VaultKind::Filesystem(v) => v.decompress_to_text(data, tokenizer_name),
+        VaultKind::S3(v) => v.decompress_to_text(data, tokenizer_name),
     }
 }
 
@@ -897,12 +996,22 @@ impl PyStowken {
     ///     near_dedup: Jaccard threshold for storing variants as deltas
     ///         against near-duplicates. ``None`` (default) disables; a
     ///         typical conservative value is ``0.85``.
+    ///     embed_reuse: Jaccard threshold for reusing a canonical's
+    ///         embedding on a near-duplicate variant (no fresh API call).
+    ///         Stricter than ``near_dedup``; ``None`` (default) disables.
+    ///         Typical value ``0.97``.
     #[new]
-    #[pyo3(signature = (enable_compression=true, *, near_dedup=None))]
-    fn new(_py: Python<'_>, enable_compression: bool, near_dedup: Option<f64>) -> PyResult<Self> {
+    #[pyo3(signature = (enable_compression=true, *, near_dedup=None, embed_reuse=None))]
+    fn new(
+        _py: Python<'_>,
+        enable_compression: bool,
+        near_dedup: Option<f64>,
+        embed_reuse: Option<f64>,
+    ) -> PyResult<Self> {
         let config = StowkenConfig {
             enable_compression,
             near_dedup_threshold: near_dedup,
+            embed_reuse_threshold: embed_reuse,
         };
         let backend = MemoryBackend::new();
         let inner = runtime()
@@ -943,6 +1052,7 @@ impl PyStowken {
         region = None,
         enable_compression = true,
         near_dedup = None,
+        embed_reuse = None,
     ))]
     #[allow(clippy::too_many_arguments)] // each arg is a Python kwarg by design
     fn open_s3(
@@ -955,10 +1065,12 @@ impl PyStowken {
         region: Option<String>,
         enable_compression: bool,
         near_dedup: Option<f64>,
+        embed_reuse: Option<f64>,
     ) -> PyResult<Self> {
         let config = StowkenConfig {
             enable_compression,
             near_dedup_threshold: near_dedup,
+            embed_reuse_threshold: embed_reuse,
         };
         let inner = runtime()
             .block_on(async move {
@@ -975,17 +1087,19 @@ impl PyStowken {
 
     /// Open a filesystem-backed vault rooted at `path`.
     #[classmethod]
-    #[pyo3(signature = (path, enable_compression=true, *, near_dedup=None))]
+    #[pyo3(signature = (path, enable_compression=true, *, near_dedup=None, embed_reuse=None))]
     fn open(
         _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
         _py: Python<'_>,
         path: String,
         enable_compression: bool,
         near_dedup: Option<f64>,
+        embed_reuse: Option<f64>,
     ) -> PyResult<Self> {
         let config = StowkenConfig {
             enable_compression,
             near_dedup_threshold: near_dedup,
+            embed_reuse_threshold: embed_reuse,
         };
         let db_path = format!("{}/metadata.db", path.trim_end_matches('/'));
         let inner = runtime()
@@ -1026,6 +1140,63 @@ impl PyStowken {
             let result = vault_store(&inner, conv).await.map_err(py_err)?;
             Ok(shape_store_result(result))
         })
+    }
+
+    // ── chunk_only ───────────────────────────────────────────────────────────
+
+    /// Chunk, hash, and compress a conversation without persisting anything.
+    ///
+    /// Returns a dict shaped::
+    ///
+    ///     {
+    ///       "id":            str,
+    ///       "application":   str | None,
+    ///       "model":         str,
+    ///       "tokenizer":     str,
+    ///       "total_tokens":  int,
+    ///       "metadata_json": str | None,   # JSON-encoded Conversation.metadata
+    ///       "segments": [
+    ///         {
+    ///           "segment_type":    str,
+    ///           "hash":            str,
+    ///           "compressed_data": bytes,
+    ///           "token_count":     int,
+    ///           "raw_size":        int,
+    ///           "position":        int,
+    ///         },
+    ///         ...
+    ///       ],
+    ///     }
+    ///
+    /// Use this when you want Stowken's segmenter + hash + compressor pipeline
+    /// to drive an external store (e.g. a Spark UDF writing to Delta) without
+    /// touching the configured Stowken backend. Synchronous: all work is
+    /// CPU-bound.
+    fn chunk_only(
+        &self,
+        py: Python<'_>,
+        conversation: &pyo3::Bound<'_, PyDict>,
+    ) -> PyResult<PyObject> {
+        let conv = parse_conversation(conversation)?;
+        let result = vault_chunk_only(&self.inner, conv).map_err(py_err)?;
+        build_chunk_result_dict(py, &result)
+    }
+
+    /// Decompress a varint+zstd segment blob back to text.
+    ///
+    /// Pairs with :meth:`chunk_only` for external storage flows that hold
+    /// compressed segment bytes (e.g. rows from a Delta ``segments`` table)
+    /// and want to rehydrate them without going through a Stowken vault's
+    /// retrieve path. ``tokenizer`` selects the detokenizer — defaults to
+    /// ``cl100k_base`` to match the standard chunk_only configuration.
+    #[pyo3(signature = (data, tokenizer = "cl100k_base"))]
+    fn decompress_to_text(
+        &self,
+        _py: Python<'_>,
+        data: &[u8],
+        tokenizer: &str,
+    ) -> PyResult<String> {
+        vault_decompress_to_text(&self.inner, data, tokenizer).map_err(py_err)
     }
 
     // ── retrieve ─────────────────────────────────────────────────────────────
@@ -1688,6 +1859,135 @@ impl PyStowken {
     }
 }
 
+// ── Stateless near-dedup primitives (module-level functions) ─────────────────────
+//
+// These let the distributed Databricks pipeline run near-dedup *without* a
+// stateful vault: a Spark pass computes MinHash signatures from stored frames,
+// finds candidates by LSH band, scores Jaccard, re-encodes variants as 0x04
+// delta frames, and resolves those deltas on read. All operate on raw bytes.
+
+/// Default pipeline for stateless frame work. Self-contained frames
+/// (0x01/0x02/0x03/0x05) decompress without a resolver; 0x04 deltas need one
+/// (attached on demand in `decode_segment_text`).
+fn stateless_pipeline() -> CompressionPipeline {
+    CompressionPipeline::new(true, 3)
+}
+
+fn detokenize(tokens: &[Token], tokenizer_name: &str) -> String {
+    match get_tokenizer(tokenizer_name) {
+        Some(t) => t.detokenize(tokens),
+        // Fallback mirrors the vault: stable, non-empty, deterministic.
+        None => tokens
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// A one-shot [`CanonicalResolver`] that returns a single set of pre-decoded
+/// canonical tokens regardless of the requested hash — used to decode a 0x04
+/// delta frame when the caller already holds the canonical's bytes.
+struct OneShotResolver {
+    tokens: Vec<Token>,
+}
+
+impl CanonicalResolver for OneShotResolver {
+    fn resolve(&self, _hash: &SegmentHash) -> Result<Vec<Token>, CompressionError> {
+        Ok(self.tokens.clone())
+    }
+}
+
+/// MinHash signature (1024 bytes) for a stored, self-contained segment frame.
+#[pyfunction]
+fn segment_minhash<'py>(
+    py: Python<'py>,
+    content_zstd: &[u8],
+) -> PyResult<pyo3::Bound<'py, PyBytes>> {
+    let tokens = stateless_pipeline()
+        .decompress(content_zstd)
+        .map_err(py_err)?;
+    let sig = MinHashSignature::compute(&tokens);
+    Ok(PyBytes::new_bound(py, &sig.to_bytes()))
+}
+
+/// The 16 LSH band hashes of a 1024-byte signature. Two segments are
+/// near-dup *candidates* iff they share any (band_index, band_hash) bucket.
+#[pyfunction]
+fn signature_bands(sig: &[u8]) -> PyResult<Vec<u64>> {
+    let s = MinHashSignature::from_bytes(sig).map_err(py_err)?;
+    Ok((0..near_dedup::BANDS).map(|b| s.band_hash(b)).collect())
+}
+
+/// Estimated Jaccard similarity (0.0–1.0) between two 1024-byte signatures.
+#[pyfunction]
+fn signature_jaccard(a: &[u8], b: &[u8]) -> PyResult<f64> {
+    let sa = MinHashSignature::from_bytes(a).map_err(py_err)?;
+    let sb = MinHashSignature::from_bytes(b).map_err(py_err)?;
+    Ok(sa.jaccard(&sb))
+}
+
+/// Build a 0x04 delta frame encoding `variant_zstd` against `canonical_zstd`.
+/// Returns the frame bytes only if it's smaller than the variant's own frame
+/// (the same cost check the vault applies); otherwise `None`.
+#[pyfunction]
+fn make_delta_frame<'py>(
+    py: Python<'py>,
+    canonical_hash: &str,
+    canonical_zstd: &[u8],
+    variant_zstd: &[u8],
+) -> PyResult<Option<pyo3::Bound<'py, PyBytes>>> {
+    let pipe = stateless_pipeline();
+    let canonical_tokens = pipe.decompress(canonical_zstd).map_err(py_err)?;
+    let variant_tokens = pipe.decompress(variant_zstd).map_err(py_err)?;
+    let ops = near_dedup::compute_delta(&canonical_tokens, &variant_tokens);
+    let hash = SegmentHash(canonical_hash.to_owned());
+    let frame = pipe.compress_delta(&hash, &ops).map_err(py_err)?;
+    if frame.len() < variant_zstd.len() {
+        Ok(Some(PyBytes::new_bound(py, &frame)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Decode a stored segment frame to text. For 0x04 delta frames, pass the
+/// canonical's self-contained frame as `canonical_zstd`; for everything else
+/// it's ignored. Generalizes the vault's `decompress_to_text` for the
+/// distributed read paths.
+#[pyfunction]
+#[pyo3(signature = (content_zstd, tokenizer, canonical_zstd = None))]
+fn decode_segment_text(
+    content_zstd: &[u8],
+    tokenizer: &str,
+    canonical_zstd: Option<&[u8]>,
+) -> PyResult<String> {
+    let pipe = stateless_pipeline();
+    let is_delta = pipe
+        .frame_canonical_hash(content_zstd)
+        .map_err(py_err)?
+        .is_some();
+
+    let tokens = if is_delta {
+        let canonical = canonical_zstd.ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "delta (0x04) frame requires canonical_zstd to decode".to_owned(),
+            )
+        })?;
+        let canonical_tokens = pipe.decompress(canonical).map_err(py_err)?;
+        let resolver = Arc::new(OneShotResolver {
+            tokens: canonical_tokens,
+        });
+        stateless_pipeline()
+            .with_resolver(resolver)
+            .decompress(content_zstd)
+            .map_err(py_err)?
+    } else {
+        pipe.decompress(content_zstd).map_err(py_err)?
+    };
+
+    Ok(detokenize(&tokens, tokenizer))
+}
+
 // ── Module registration ────────────────────────────────────────────────────────
 
 #[pymodule]
@@ -1695,5 +1995,10 @@ fn stowken(m: &pyo3::Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStowken>()?;
     m.add_class::<StoreResult>()?;
     m.add_class::<TokenUsageStats>()?;
+    m.add_function(wrap_pyfunction!(segment_minhash, m)?)?;
+    m.add_function(wrap_pyfunction!(signature_bands, m)?)?;
+    m.add_function(wrap_pyfunction!(signature_jaccard, m)?)?;
+    m.add_function(wrap_pyfunction!(make_delta_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_segment_text, m)?)?;
     Ok(())
 }
