@@ -24,14 +24,15 @@
 //!    estimated by counting matching MinHash values.
 //! 4. If similarity exceeds the threshold, the variant is stored as a
 //!    [`Delta`] against the best-matching canonical instead of a full
-//!    token array.
+//!    token array. A separate, stricter threshold can additionally alias the
+//!    variant's *embedding* to the canonical's (see `embed_reuse_threshold`).
 //!
-//! # Persistence
-//!
-//! Unlike the v0.1 implementation, the LSH index lives in SQLite (handled
-//! by `MetadataIndex`), not in memory. Restart drops nothing. Token
-//! sequences are NOT cached in memory — when computing a delta we fetch
-//! the canonical from the backend on demand.
+//! This module is the algorithm only — signatures, MinHash, LSH bands, and
+//! delta encoding. Persistence of the index (signatures + band buckets +
+//! embedding aliases) lives in [`crate::near_dedup_index::NearDupIndex`],
+//! a self-contained set of append-only logs under the vault root — not in
+//! SQLite. Token sequences are never cached in memory; when computing a
+//! delta the canonical is fetched from the backend on demand.
 
 use std::io::Read;
 

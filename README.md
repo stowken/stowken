@@ -261,7 +261,7 @@ Long messages can optionally be split at paragraph boundaries into `Continuation
 
 Each path is gated by a strict cost-model check — if a smaller frame can't be produced, the previous best is kept. **There is never a net regression in stored bytes.**
 
-**Metadata index.** SQLite tracks conversations, segment metadata, near-dedup signatures, and LSH band buckets. The analytics commands run against this index. It's a derived cache — `stowken reindex` rebuilds it from on-disk manifests.
+**Metadata index.** SQLite tracks conversations and segment metadata; the analytics commands run against it. The near-dedup index (MinHash signatures, LSH band buckets, and embedding aliases) lives separately in append-only logs under `near_dedup/`, decoupled from SQLite so it scales independently. Both are derived caches — `stowken reindex` rebuilds them from on-disk manifests.
 
 ```
 vault-root/
@@ -269,6 +269,7 @@ vault-root/
 ├── manifests/         # per-conversation ordered segment lists
 ├── dictionaries/      # zstd dicts, one per training run (v0.3+)
 ├── substrings/        # packed substring registry (v0.5+)
+├── near_dedup/        # MinHash/LSH index + embedding aliases (append-only logs)
 └── metadata.db        # SQLite analytics index
 ```
 

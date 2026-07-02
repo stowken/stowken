@@ -47,6 +47,12 @@ struct Cli {
     #[arg(long, global = true)]
     near_dedup: Option<f64>,
 
+    /// Reuse a near-duplicate canonical's embedding for the variant instead
+    /// of computing a fresh one, when their Jaccard similarity meets this
+    /// threshold. Stricter than --near-dedup (typical: 0.97). Off by default.
+    #[arg(long, global = true)]
+    embed_reuse: Option<f64>,
+
     /// Split long messages into sub-segments of at most N tokens. Text
     /// messages are split at paragraph boundaries first; pre-tokenized
     /// messages are split at the hard token limit. Subsequent chunks use
@@ -503,6 +509,7 @@ async fn main() -> Result<()> {
     let config = StowkenConfig {
         enable_compression: !cli.no_compression,
         near_dedup_threshold: cli.near_dedup,
+        embed_reuse_threshold: cli.embed_reuse,
     };
     let split_segments = cli.split_segments;
 

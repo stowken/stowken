@@ -363,6 +363,7 @@ async fn compact_skips_delta_and_substring_frames() {
         StowkenConfig {
             enable_compression: true,
             near_dedup_threshold: Some(0.80),
+            embed_reuse_threshold: None,
         },
     )
     .await

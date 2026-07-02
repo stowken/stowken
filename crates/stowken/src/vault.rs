@@ -15,6 +15,7 @@ use crate::{
     dict_registry::{DictError, DictId, DictInfo, DictRegistry},
     index::metadata::{BatchSegmentOp, MetadataError, MetadataIndex},
     near_dedup::{self, MinHashSignature},
+    near_dedup_index::NearDupIndex,
     segmenter::{Segmenter, SegmenterConfig, SegmenterError},
     storage::backend::{StorageBackend, StorageError},
     substring_registry::{
@@ -31,11 +32,12 @@ use crate::{
 
 use crate::types::SegmentHash;
 
-/// Internal: output of a successful near-dedup probe.
-struct NearDedupOutcome {
-    canonical_hash: SegmentHash,
-    delta_frame: Vec<u8>,
-}
+// Near-dedup is now two decoupled decisions, each with its own threshold:
+//   * `find_best_canonical` surfaces the closest prior segment + similarity.
+//   * Storage-delta (`build_delta_frame`) fires at `near_dedup_threshold`.
+//   * Embedding-reuse (an alias in the NearDupIndex) fires at the stricter
+//     `embed_reuse_threshold`.
+// See `StowkenConfig` for why the two thresholds must differ.
 
 /// Substring discovery on a sample of segments. For each MIN_LENGTH-token
 /// window, count distinct segments observed it (the same window appearing
@@ -153,10 +155,19 @@ pub struct Stowken<B: StorageBackend> {
     /// In-memory for `Stowken::new`, file-backed under
     /// `<dirname(db_path)>/substrings/` for `Stowken::open`.
     substring_registry: Arc<SubstringRegistry>,
+    /// MinHash/LSH near-duplicate index + variant→canonical embedding-alias
+    /// map. In-memory for `Stowken::new`; append-only logs under
+    /// `<dirname(db_path)>/near_dedup/` for `Stowken::open`. Replaces the
+    /// former SQLite LSH tables.
+    near_dup_index: Arc<NearDupIndex>,
     segmenter_config: SegmenterConfig,
     tokenizer: Option<Arc<dyn TokenizerAdapter>>,
-    /// Cached from StowkenConfig — threshold for near-dedup. None disables.
+    /// Cached from StowkenConfig — threshold for storing near-duplicate
+    /// variants as deltas. None disables delta storage.
     near_dedup_threshold: Option<f64>,
+    /// Cached from StowkenConfig — threshold for reusing a canonical's
+    /// embedding on a near-duplicate variant. None disables reuse.
+    embed_reuse_threshold: Option<f64>,
     #[cfg(feature = "semantic-search")]
     embedding_adapter:
         Arc<std::sync::RwLock<Option<Arc<dyn crate::types::EmbeddingAdapter>>>>,
@@ -174,19 +185,23 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         let index = MetadataIndex::open_in_memory()?;
         let dict_registry = Arc::new(DictRegistry::in_memory());
         let substring_registry = Arc::new(SubstringRegistry::in_memory());
+        let near_dup_index = Arc::new(NearDupIndex::in_memory());
         let compressor = CompressionPipeline::new(config.enable_compression, 3)
             .with_registry(Arc::clone(&dict_registry))
             .with_substring_registry(Arc::clone(&substring_registry));
         let near_dedup_threshold = config.near_dedup_threshold;
+        let embed_reuse_threshold = config.embed_reuse_threshold;
         Ok(Self {
             backend: Arc::new(backend),
             compressor,
             index,
             dict_registry,
             substring_registry,
+            near_dup_index,
             segmenter_config: SegmenterConfig::default(),
             tokenizer: None,
             near_dedup_threshold,
+            embed_reuse_threshold,
             #[cfg(feature = "semantic-search")]
             embedding_adapter: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(feature = "semantic-search")]
@@ -210,20 +225,27 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         let dict_registry = Arc::new(DictRegistry::open(parent.join("dictionaries"))?);
         let substring_registry =
             Arc::new(SubstringRegistry::open(parent.join("substrings"))?);
+        let near_dup_index = Arc::new(
+            NearDupIndex::open(parent.join("near_dedup"))
+                .map_err(|e| StowkenError::Internal(e.to_string()))?,
+        );
 
         let compressor = CompressionPipeline::new(config.enable_compression, 3)
             .with_registry(Arc::clone(&dict_registry))
             .with_substring_registry(Arc::clone(&substring_registry));
         let near_dedup_threshold = config.near_dedup_threshold;
+        let embed_reuse_threshold = config.embed_reuse_threshold;
         Ok(Self {
             backend: Arc::new(backend),
             compressor,
             index,
             dict_registry,
             substring_registry,
+            near_dup_index,
             segmenter_config: SegmenterConfig::default(),
             tokenizer: None,
             near_dedup_threshold,
+            embed_reuse_threshold,
             #[cfg(feature = "semantic-search")]
             embedding_adapter: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(feature = "semantic-search")]
@@ -311,6 +333,10 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         self.index.clone()
     }
     #[cfg(feature = "semantic-search")]
+    pub(crate) fn near_dup_index_internal(&self) -> Arc<NearDupIndex> {
+        Arc::clone(&self.near_dup_index)
+    }
+    #[cfg(feature = "semantic-search")]
     pub(crate) fn tokenizer_internal(&self) -> Option<Arc<dyn TokenizerAdapter>> {
         self.tokenizer.clone()
     }
@@ -366,8 +392,16 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         let mut total_raw: u64 = 0;
 
         // Captured up-front so the per-segment loop can branch without
-        // an additional async boundary; cheap copy.
+        // an additional async boundary; cheap copies.
         let near_dedup_threshold = self.near_dedup_threshold;
+        let embed_reuse_threshold = self.embed_reuse_threshold;
+        // We probe the LSH index when EITHER feature is on. Candidates are
+        // surfaced down to the lower of the two thresholds; each feature then
+        // applies its own bar to the resulting similarity.
+        let probe_min = match (near_dedup_threshold, embed_reuse_threshold) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
 
         for (position, segment) in segments.iter().enumerate() {
             let hash = exact::hash_segment(&segment.tokens);
@@ -378,56 +412,75 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                 index_ops.push(BatchSegmentOp::IncrementRef(hash.clone()));
                 deduped_segments += 1;
                 bytes_saved += (segment.tokens.len() as u64) * 4;
-            } else if let Some(threshold) = near_dedup_threshold {
-                // Near-dedup probe. If a matching canonical exists, store
-                // the variant as a 0x04 delta frame.
-                match self
-                    .try_near_dedup(&hash, &segment.tokens, threshold)
-                    .await?
-                {
-                    Some(NearDedupOutcome { canonical_hash, delta_frame }) => {
-                        let raw_size = (segment.tokens.len() as u32) * 4;
-                        let compressed_size = delta_frame.len() as u32;
-                        total_compressed += compressed_size as u64;
-                        total_raw += raw_size as u64;
+            } else if let Some(min_threshold) = probe_min {
+                // Near-dedup probe: find the closest prior segment, then make
+                // two independent decisions — store as a delta, and/or reuse
+                // its embedding — each against its own threshold.
+                let signature = MinHashSignature::compute(&segment.tokens);
+                let best = self
+                    .find_best_canonical(&signature, &hash, min_threshold)
+                    .await?;
 
-                        let stored = StoredSegment {
-                            hash: hash.clone(),
-                            segment_type: segment.segment_type.clone(),
-                            tokenizer: conversation.tokenizer.clone(),
-                            token_count: segment.tokens.len() as u32,
-                            compressed_data: delta_frame,
-                            raw_size,
-                            compressed_size,
-                            ref_count: 1,
-                            created_at: chrono::Utc::now(),
-                        };
-                        self.backend.put_segment(&stored).await?;
-                        // The variant's existence keeps the canonical alive
-                        // — bump the canonical's ref so GC doesn't collect
-                        // it out from under the delta.
-                        self.backend.increment_ref(&canonical_hash).await?;
-                        index_ops.push(BatchSegmentOp::Upsert(stored));
-                        index_ops.push(BatchSegmentOp::IncrementRef(canonical_hash));
-                        new_segments += 1;
+                let mut stored_as_delta = false;
+                if let Some((canonical_hash, sim)) = &best {
+                    if near_dedup_threshold.is_some_and(|t| *sim >= t) {
+                        if let Some(delta_frame) =
+                            self.build_delta_frame(canonical_hash, &segment.tokens).await?
+                        {
+                            let raw_size = (segment.tokens.len() as u32) * 4;
+                            let compressed_size = delta_frame.len() as u32;
+                            total_compressed += compressed_size as u64;
+                            total_raw += raw_size as u64;
 
-                        // Index this variant in the LSH tables too — variants
-                        // can themselves be canonicals for future variants.
-                        self.upsert_lsh_entry(&hash, &segment.tokens).await?;
+                            let stored = StoredSegment {
+                                hash: hash.clone(),
+                                segment_type: segment.segment_type.clone(),
+                                tokenizer: conversation.tokenizer.clone(),
+                                token_count: segment.tokens.len() as u32,
+                                compressed_data: delta_frame,
+                                raw_size,
+                                compressed_size,
+                                ref_count: 1,
+                                created_at: chrono::Utc::now(),
+                            };
+                            self.backend.put_segment(&stored).await?;
+                            // The variant keeps the canonical alive — bump its
+                            // ref so GC won't collect it out from under the delta.
+                            self.backend.increment_ref(canonical_hash).await?;
+                            index_ops.push(BatchSegmentOp::Upsert(stored));
+                            index_ops
+                                .push(BatchSegmentOp::IncrementRef(canonical_hash.clone()));
+                            new_segments += 1;
+                            stored_as_delta = true;
+                        }
                     }
-                    None => {
-                        self.store_new_segment(
-                            &hash,
-                            segment,
-                            &conversation.tokenizer,
-                            &mut index_ops,
-                            &mut total_compressed,
-                            &mut total_raw,
-                        )
-                        .await?;
-                        new_segments += 1;
-                        // Add to LSH so future segments can find this one.
-                        self.upsert_lsh_entry(&hash, &segment.tokens).await?;
+                }
+
+                if !stored_as_delta {
+                    self.store_new_segment(
+                        &hash,
+                        segment,
+                        &conversation.tokenizer,
+                        &mut index_ops,
+                        &mut total_compressed,
+                        &mut total_raw,
+                    )
+                    .await?;
+                    new_segments += 1;
+                }
+
+                // Index this segment so future segments can match it. Reuse
+                // the signature we already computed.
+                self.index_signature(&hash, &signature).await?;
+
+                // Embedding reuse — a stricter, independent bar. When the
+                // variant is close enough to the canonical, alias its
+                // embedding so the embed path copies the canonical's vector
+                // instead of paying for a fresh call (and the variant stays
+                // searchable even when stored as a delta).
+                if let Some((canonical_hash, sim)) = &best {
+                    if embed_reuse_threshold.is_some_and(|t| *sim >= t) {
+                        self.set_embedding_alias(&hash, canonical_hash).await?;
                     }
                 }
             } else {
@@ -509,6 +562,65 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             deduped_segments,
             bytes_saved,
             compression_ratio,
+        })
+    }
+
+    /// Chunk, hash, and compress a conversation without persisting anything.
+    ///
+    /// Returns segment-level results so the caller can write them to an
+    /// external system (e.g. Delta MERGE, an object store batch, a custom
+    /// table). Unlike `store`, this method touches neither the storage
+    /// backend nor the metadata index, never performs near-dedup (the
+    /// caller owns dedup at write time against whatever target it controls),
+    /// and is synchronous — all work is CPU-bound.
+    ///
+    /// The active compression pipeline state (dict + substring registries)
+    /// still applies, so `compressed_data` is decompressible only by a
+    /// Stowken instance with access to the same registry contents. For
+    /// stateless deployments (e.g. ephemeral Spark workers writing to a
+    /// shared Delta table), leave the pipeline default-configured so the
+    /// output is plain varint+zstd and any reader can decompress it.
+    pub fn chunk_only(
+        &self,
+        conversation: Conversation,
+    ) -> Result<crate::types::ChunkResult, StowkenError> {
+        let id = conversation
+            .id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let segmenter = self.make_segmenter(&conversation.tokenizer);
+        let segments = segmenter.segment(&conversation)?;
+
+        let mut out: Vec<crate::types::ChunkedSegment> = Vec::with_capacity(segments.len());
+        let mut total_tokens: u64 = 0;
+
+        for (position, segment) in segments.iter().enumerate() {
+            let hash = exact::hash_segment(&segment.tokens);
+            let compressed_data = self
+                .compressor
+                .compress(&segment.tokens)
+                .map_err(|e| StowkenError::Compression(e.to_string()))?;
+            let token_count = segment.tokens.len() as u32;
+            total_tokens += token_count as u64;
+            out.push(crate::types::ChunkedSegment {
+                segment_type: segment.segment_type.clone(),
+                hash,
+                compressed_data,
+                token_count,
+                raw_size: token_count * 4,
+                position: position as u32,
+            });
+        }
+
+        Ok(crate::types::ChunkResult {
+            id,
+            application: conversation.application.clone(),
+            model: conversation.model.clone(),
+            tokenizer: conversation.tokenizer.clone(),
+            total_tokens,
+            segments: out,
+            metadata: conversation.metadata.clone(),
         })
     }
 
@@ -754,9 +866,35 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     // ── Maintenance ───────────────────────────────────────────────────────
 
     /// Run garbage collection on orphaned segments (ref_count == 0).
+    ///
+    /// Also prunes the collected segments from the near-dup index: a stale
+    /// signature for a deleted canonical would otherwise be surfaced as a
+    /// delta target and fail when `build_delta_frame` fetches it, breaking a
+    /// later ingest. Canonicals with live variants keep a non-zero ref count
+    /// (each variant bumps it), so they aren't collected out from under a
+    /// delta in the first place.
     pub async fn gc(&self) -> Result<u64, StowkenError> {
+        // Snapshot the eligible hashes before collection — `garbage_collect`
+        // returns only a count. In a single-writer vault these are exactly
+        // the segments about to be removed.
+        let collected = self.backend.list_garbage().await?;
         let deleted = self.backend.garbage_collect().await?;
-        info!(deleted, "garbage collected segments");
+
+        if !collected.is_empty() {
+            let index = Arc::clone(&self.near_dup_index);
+            let to_prune = collected.clone();
+            task::spawn_blocking(move || {
+                for hash in &to_prune {
+                    index.remove(hash)?;
+                }
+                Ok::<(), crate::near_dedup_index::NearDupIndexError>(())
+            })
+            .await
+            .map_err(|e| StowkenError::Internal(e.to_string()))?
+            .map_err(|e| StowkenError::Internal(e.to_string()))?;
+        }
+
+        info!(deleted, pruned = collected.len(), "garbage collected segments");
         Ok(deleted)
     }
 
@@ -785,41 +923,31 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         let mut clusters = Vec::new();
 
         for canonical in candidates {
-            // Need the canonical's tokens to compute a signature. Avoid
-            // doing this inside the SQL critical path.
-            let canonical_stored = self.backend.get_segment(&canonical.hash).await?;
-            let canonical_tokens = self
-                .decompress_segment_async(&canonical_stored.compressed_data)
-                .await?;
-            let sig = MinHashSignature::compute(&canonical_tokens);
+            // Need the canonical's tokens to compute a signature if it isn't
+            // already in the index.
+            let sig = match self.near_dup_index.signature(&canonical.hash) {
+                Some(s) => s,
+                None => {
+                    let canonical_stored = self.backend.get_segment(&canonical.hash).await?;
+                    let canonical_tokens = self
+                        .decompress_segment_async(&canonical_stored.compressed_data)
+                        .await?;
+                    MinHashSignature::compute(&canonical_tokens)
+                }
+            };
             let band_hashes: Vec<u64> =
                 (0..near_dedup::BANDS).map(|b| sig.band_hash(b)).collect();
 
-            let index = self.index.clone();
-            let bh = band_hashes.clone();
-            let cand_hashes = task::spawn_blocking(move || {
-                index.find_near_dedup_candidates(&bh)
-            })
-            .await
-            .map_err(|e| StowkenError::Internal(e.to_string()))??;
+            let cand_hashes = self.near_dup_index.candidates(&band_hashes);
+            let sig_map = self.near_dup_index.signatures_batch(&cand_hashes);
 
             let mut variants = Vec::new();
             for c in cand_hashes {
                 if c == canonical.hash {
                     continue;
                 }
-                let index = self.index.clone();
-                let h = c.clone();
-                let sig_bytes_opt =
-                    task::spawn_blocking(move || index.get_near_dedup_signature(&h))
-                        .await
-                        .map_err(|e| StowkenError::Internal(e.to_string()))??;
-                let other_sig = match sig_bytes_opt {
-                    Some(b) => MinHashSignature::from_bytes(&b)
-                        .map_err(|e| StowkenError::Internal(format!("LSH signature corrupt: {e}")))?,
-                    None => continue,
-                };
-                let similarity = sig.jaccard(&other_sig);
+                let Some(other_sig) = sig_map.get(&c) else { continue };
+                let similarity = sig.jaccard(other_sig);
                 if similarity >= threshold {
                     let stored = self.backend.get_segment(&c).await?;
                     variants.push(NearDuplicateVariant {
@@ -845,14 +973,10 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         Ok(clusters)
     }
 
-    /// Number of segments tracked in the LSH index. Useful for sanity
+    /// Number of segments tracked in the near-dup index. Useful for sanity
     /// checks and post-reindex confirmation.
     pub async fn near_dedup_index_size(&self) -> Result<u64, StowkenError> {
-        let index = self.index.clone();
-        task::spawn_blocking(move || index.near_dedup_size())
-            .await
-            .map_err(|e| StowkenError::Internal(e.to_string()))?
-            .map_err(Into::into)
+        Ok(self.near_dup_index.len())
     }
 
     // ── Substring management (v0.5) ────────────────────────────────────────
@@ -1246,11 +1370,12 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         let mut conversations_indexed = 0u64;
         let mut unique_segments_indexed = 0u64;
         let mut segments_missing = 0u64;
-        // Track all unique non-delta segments so we can replay the LSH index
-        // pass after the SQL-state pass. Done in two phases because the
-        // batch-insert path commits per-conversation and we don't want LSH
-        // upserts interleaved with that.
+        // Track unique non-delta segments (LSH signatures) and delta variants
+        // (embedding aliases) so we can rebuild the near-dup index after the
+        // SQL-state pass — kept separate so batch commits aren't interleaved
+        // with index writes.
         let mut lsh_targets: Vec<SegmentHash> = Vec::new();
+        let mut delta_variants: Vec<SegmentHash> = Vec::new();
 
         for id in &ids {
             let manifest = match self.backend.get_manifest(id).await {
@@ -1273,7 +1398,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                             // signatures.
                             let is_delta = stored.compressed_data.first()
                                 == Some(&(crate::compression::FrameVersion::Delta as u8));
-                            if !is_delta {
+                            if is_delta {
+                                delta_variants.push(seg_ref.hash.clone());
+                            } else {
                                 lsh_targets.push(seg_ref.hash.clone());
                             }
                             // Force ref_count=1 in the BatchSegmentOp::Upsert
@@ -1305,10 +1432,14 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             conversations_indexed += 1;
         }
 
-        // Phase 2: rebuild the LSH index for non-delta segments. Done
-        // unconditionally so the index is correct even when near-dedup
-        // is currently disabled — re-enabling later won't require another
-        // reindex.
+        // Phase 2: rebuild the near-dup signature index from scratch. The
+        // packed logs are derived state, so we clear and replay them from the
+        // manifests (the source of truth). Done unconditionally so the index
+        // is correct even when near-dedup is currently disabled —
+        // re-enabling later won't require another reindex.
+        self.near_dup_index
+            .clear()
+            .map_err(|e| StowkenError::Internal(e.to_string()))?;
         for hash in &lsh_targets {
             let stored = match self.backend.get_segment(hash).await {
                 Ok(s) => s,
@@ -1318,7 +1449,44 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            self.upsert_lsh_entry(hash, &tokens).await?;
+            let sig = MinHashSignature::compute(&tokens);
+            self.index_signature(hash, &sig).await?;
+        }
+
+        // Phase 3: rebuild embedding aliases for delta variants. Only when
+        // embedding reuse is configured — otherwise aliases stay empty,
+        // matching "feature off". A delta frame names its canonical directly;
+        // we recompute the similarity to apply the (stricter) reuse bar. This
+        // does not reconstruct aliases for full-frame variants stored under
+        // embed-reuse-without-near-dedup; those are rebuilt on next ingest.
+        let mut aliases_rebuilt = 0u64;
+        if let Some(reuse_threshold) = self.embed_reuse_threshold {
+            for variant in &delta_variants {
+                let stored = match self.backend.get_segment(variant).await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let canonical = match self
+                    .compressor
+                    .frame_canonical_hash(&stored.compressed_data)
+                {
+                    Ok(Some(c)) => c,
+                    _ => continue,
+                };
+                let variant_tokens =
+                    match self.decompress_segment_async(&stored.compressed_data).await {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                let variant_sig = MinHashSignature::compute(&variant_tokens);
+                let Some(canonical_sig) = self.near_dup_index.signature(&canonical) else {
+                    continue;
+                };
+                if variant_sig.jaccard(&canonical_sig) >= reuse_threshold {
+                    self.set_embedding_alias(variant, &canonical).await?;
+                    aliases_rebuilt += 1;
+                }
+            }
         }
 
         info!(
@@ -1326,6 +1494,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             segments = unique_segments_indexed,
             missing = segments_missing,
             lsh = lsh_targets.len(),
+            aliases = aliases_rebuilt,
             "reindexed metadata from manifests"
         );
 
@@ -1384,104 +1553,105 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         Ok(())
     }
 
-    /// Probe the LSH index for a near-duplicate canonical and, if found,
-    /// build a 0x04 delta frame for `tokens`. Returns `None` if no
-    /// candidate clears the threshold.
-    async fn try_near_dedup(
+    /// Find the closest prior segment to `signature` in the near-dup index,
+    /// returning `(canonical_hash, similarity)` for the best candidate whose
+    /// estimated Jaccard meets `min_threshold`. Candidate lookup and scoring
+    /// are pure in-memory operations against the [`NearDupIndex`].
+    async fn find_best_canonical(
         &self,
+        signature: &MinHashSignature,
         variant_hash: &SegmentHash,
-        tokens: &[Token],
-        threshold: f64,
-    ) -> Result<Option<NearDedupOutcome>, StowkenError> {
-        let signature = MinHashSignature::compute(tokens);
+        min_threshold: f64,
+    ) -> Result<Option<(SegmentHash, f64)>, StowkenError> {
         let band_hashes: Vec<u64> =
             (0..near_dedup::BANDS).map(|b| signature.band_hash(b)).collect();
 
-        // Pull LSH candidates from SQLite.
-        let index = self.index.clone();
-        let band_hashes_clone = band_hashes.clone();
-        let candidates = task::spawn_blocking(move || {
-            index.find_near_dedup_candidates(&band_hashes_clone)
-        })
-        .await
-        .map_err(|e| StowkenError::Internal(e.to_string()))??;
-
-        // Fetch all candidate signatures in one query, then score in memory.
-        let to_score: Vec<SegmentHash> = candidates
+        let candidates: Vec<SegmentHash> = self
+            .near_dup_index
+            .candidates(&band_hashes)
             .into_iter()
             .filter(|h| h != variant_hash)
             .collect();
-
-        let mut best: Option<(SegmentHash, f64)> = None;
-        if !to_score.is_empty() {
-            let index = self.index.clone();
-            let to_score_clone = to_score.clone();
-            let sig_map = task::spawn_blocking(move || {
-                index.get_near_dedup_signatures_batch(&to_score_clone)
-            })
-            .await
-            .map_err(|e| StowkenError::Internal(e.to_string()))??;
-
-            for candidate_hash in to_score {
-                let Some(bytes) = sig_map.get(&candidate_hash) else { continue };
-                let candidate_sig = MinHashSignature::from_bytes(bytes)
-                    .map_err(|e| StowkenError::Internal(format!("LSH signature corrupt: {e}")))?;
-                let sim = signature.jaccard(&candidate_sig);
-                if sim >= threshold && best.as_ref().is_none_or(|(_, prev)| sim > *prev) {
-                    best = Some((candidate_hash, sim));
-                }
-            }
-        }
-
-        let Some((canonical_hash, _sim)) = best else { return Ok(None) };
-
-        // Materialise the canonical's tokens to compute a delta against.
-        // Bypass our own decompress path's 0x04 handler — we only delta
-        // against true canonicals, never against existing deltas.
-        let canonical_stored = self.backend.get_segment(&canonical_hash).await?;
-        if canonical_stored.compressed_data.first() == Some(&(FrameVersion::Delta as u8)) {
-            // The "canonical" we matched is itself a delta. Skip — don't
-            // chain deltas. (Future v0.4.x optimization: hop through the
-            // chain to find the root canonical.)
+        if candidates.is_empty() {
             return Ok(None);
         }
-        let canonical_tokens = self.compressor.decompress(&canonical_stored.compressed_data)
+
+        let sig_map = self.near_dup_index.signatures_batch(&candidates);
+        let mut best: Option<(SegmentHash, f64)> = None;
+        for candidate_hash in candidates {
+            let Some(candidate_sig) = sig_map.get(&candidate_hash) else { continue };
+            let sim = signature.jaccard(candidate_sig);
+            if sim >= min_threshold && best.as_ref().is_none_or(|(_, prev)| sim > *prev) {
+                best = Some((candidate_hash, sim));
+            }
+        }
+        Ok(best)
+    }
+
+    /// Build a `0x04` delta frame for `tokens` against `canonical_hash`.
+    /// Returns `None` when the canonical is itself a delta (we never chain
+    /// deltas) or when the delta isn't smaller than a fresh full compression.
+    async fn build_delta_frame(
+        &self,
+        canonical_hash: &SegmentHash,
+        tokens: &[Token],
+    ) -> Result<Option<Vec<u8>>, StowkenError> {
+        let canonical_stored = self.backend.get_segment(canonical_hash).await?;
+        if canonical_stored.compressed_data.first() == Some(&(FrameVersion::Delta as u8)) {
+            return Ok(None);
+        }
+        let canonical_tokens = self
+            .compressor
+            .decompress(&canonical_stored.compressed_data)
             .map_err(|e| StowkenError::Compression(e.to_string()))?;
 
         let ops = near_dedup::compute_delta(&canonical_tokens, tokens);
-        let frame = self.compressor.compress_delta(&canonical_hash, &ops)
+        let frame = self
+            .compressor
+            .compress_delta(canonical_hash, &ops)
             .map_err(|e| StowkenError::Compression(e.to_string()))?;
 
         // Only accept the delta if it's actually smaller than a fresh full
-        // compression. Otherwise we'd be paying for the cross-segment ref
-        // (extra ref bump, can't GC canonical) for negative gain.
+        // compression. Otherwise we'd pay for the cross-segment ref (extra
+        // ref bump, can't GC canonical) for negative gain.
         let full_size = self.compress_tokens(tokens)?.len();
         if frame.len() >= full_size {
             return Ok(None);
         }
-
-        Ok(Some(NearDedupOutcome { canonical_hash, delta_frame: frame }))
+        Ok(Some(frame))
     }
 
-    /// Persist a segment's signature + LSH band hashes so future incoming
-    /// segments can find this one as a candidate.
-    async fn upsert_lsh_entry(
+    /// Persist a segment's signature into the near-dup index so future
+    /// incoming segments can match it. The signature is precomputed by the
+    /// caller (the store path already has it).
+    async fn index_signature(
         &self,
         hash: &SegmentHash,
-        tokens: &[Token],
+        signature: &MinHashSignature,
     ) -> Result<(), StowkenError> {
-        let signature = MinHashSignature::compute(tokens);
-        let sig_bytes = signature.to_bytes();
-        let band_hashes: Vec<u64> =
-            (0..near_dedup::BANDS).map(|b| signature.band_hash(b)).collect();
-
-        let index = self.index.clone();
+        let index = Arc::clone(&self.near_dup_index);
         let h = hash.clone();
-        task::spawn_blocking(move || {
-            index.upsert_near_dedup_entry(&h, &sig_bytes, &band_hashes)
-        })
-        .await
-        .map_err(|e| StowkenError::Internal(e.to_string()))??;
+        let sig = signature.clone();
+        task::spawn_blocking(move || index.insert(&h, &sig))
+            .await
+            .map_err(|e| StowkenError::Internal(e.to_string()))?
+            .map_err(|e| StowkenError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Record that `variant` should reuse `canonical`'s embedding.
+    async fn set_embedding_alias(
+        &self,
+        variant: &SegmentHash,
+        canonical: &SegmentHash,
+    ) -> Result<(), StowkenError> {
+        let index = Arc::clone(&self.near_dup_index);
+        let v = variant.clone();
+        let c = canonical.clone();
+        task::spawn_blocking(move || index.set_embedding_alias(&v, &c))
+            .await
+            .map_err(|e| StowkenError::Internal(e.to_string()))?
+            .map_err(|e| StowkenError::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -1511,6 +1681,25 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         self.compressor
             .decompress(data)
             .map_err(|e| StowkenError::Compression(e.to_string()))
+    }
+
+    /// Decompress a segment blob back to text using the named tokenizer.
+    ///
+    /// Convenience wrapper for callers that hold compressed bytes (e.g.
+    /// rows from an external `segments` table) and want readable text
+    /// without composing `decompress_data` + a tokenizer adapter manually.
+    /// Synchronous; cannot resolve `0x04` delta frames (same limitation as
+    /// `decompress_data`).
+    pub fn decompress_to_text(
+        &self,
+        data: &[u8],
+        tokenizer_name: &str,
+    ) -> Result<String, StowkenError> {
+        let tokens = self.decompress_data(data)?;
+        let adapter = crate::tokenizer::get_tokenizer(tokenizer_name).ok_or_else(|| {
+            StowkenError::Internal(format!("unknown tokenizer: {tokenizer_name}"))
+        })?;
+        Ok(adapter.detokenize(&tokens))
     }
 
     /// Decompress any frame, including `0x04` deltas. For deltas, the

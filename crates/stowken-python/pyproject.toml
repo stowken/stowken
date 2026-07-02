@@ -37,6 +37,14 @@ Repository = "https://github.com/stowken/stowken"
 "Bug Tracker" = "https://github.com/stowken/stowken/issues"
 Changelog = "https://github.com/stowken/stowken/blob/master/CHANGELOG.md"
 
+[project.optional-dependencies]
+databricks = [
+    "pyspark>=3.5",
+    "delta-spark>=3.0",
+    "databricks-sdk>=0.20",
+    "databricks-vectorsearch>=0.40",
+]
+
 [tool.maturin]
 python-source = "python"
 features = ["pyo3/extension-module"]
