@@ -427,7 +427,11 @@ mod tests {
         }
         {
             let idx = NearDupIndex::open(&dir).unwrap();
-            assert_eq!(idx.len(), 0, "tombstone should suppress the re-replayed insert");
+            assert_eq!(
+                idx.len(),
+                0,
+                "tombstone should suppress the re-replayed insert"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

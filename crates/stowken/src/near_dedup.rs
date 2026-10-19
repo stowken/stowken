@@ -117,7 +117,10 @@ impl MinHashSignature {
         let start = band * ROWS_PER_BAND;
         let mut h: u64 = (band as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
         for &v in &self.values[start..start + ROWS_PER_BAND] {
-            h = h.wrapping_add(v).rotate_left(17).wrapping_mul(0x6c62_272e_07bb_0142);
+            h = h
+                .wrapping_add(v)
+                .rotate_left(17)
+                .wrapping_mul(0x6c62_272e_07bb_0142);
         }
         h
     }
@@ -143,8 +146,14 @@ impl MinHashSignature {
         for (i, val) in values.iter_mut().enumerate() {
             let off = i * 8;
             *val = u64::from_le_bytes([
-                bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3],
-                bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7],
+                bytes[off],
+                bytes[off + 1],
+                bytes[off + 2],
+                bytes[off + 3],
+                bytes[off + 4],
+                bytes[off + 5],
+                bytes[off + 6],
+                bytes[off + 7],
             ]);
         }
         Ok(Self { values })
@@ -216,7 +225,9 @@ pub fn decode_delta(bytes: &[u8]) -> Result<Vec<DeltaOp>, NearDedupError> {
     let mut cursor = std::io::Cursor::new(bytes);
     while (cursor.position() as usize) < bytes.len() {
         let mut tag = [0u8; 1];
-        cursor.read_exact(&mut tag).map_err(|e| NearDedupError::Decode(e.to_string()))?;
+        cursor
+            .read_exact(&mut tag)
+            .map_err(|e| NearDedupError::Decode(e.to_string()))?;
         match tag[0] {
             OP_SKIP => {
                 let n = read_varint_u32(&mut cursor)?;
@@ -234,7 +245,11 @@ pub fn decode_delta(bytes: &[u8]) -> Result<Vec<DeltaOp>, NearDedupError> {
                 }
                 ops.push(DeltaOp::Insert(tokens));
             }
-            other => return Err(NearDedupError::Decode(format!("unknown delta op tag 0x{other:02x}"))),
+            other => {
+                return Err(NearDedupError::Decode(format!(
+                    "unknown delta op tag 0x{other:02x}"
+                )))
+            }
         }
     }
     Ok(ops)
@@ -251,7 +266,9 @@ pub fn apply_delta(canonical: &[Token], ops: &[DeltaOp]) -> Result<Vec<Token>, N
                 if next > canonical.len() {
                     return Err(NearDedupError::Decode(format!(
                         "delta Skip overflows canonical: cursor {} + {} > {}",
-                        cursor, n, canonical.len()
+                        cursor,
+                        n,
+                        canonical.len()
                     )));
                 }
                 cursor = next;
@@ -261,7 +278,9 @@ pub fn apply_delta(canonical: &[Token], ops: &[DeltaOp]) -> Result<Vec<Token>, N
                 if next > canonical.len() {
                     return Err(NearDedupError::Decode(format!(
                         "delta Copy overflows canonical: cursor {} + {} > {}",
-                        cursor, n, canonical.len()
+                        cursor,
+                        n,
+                        canonical.len()
                     )));
                 }
                 out.extend_from_slice(&canonical[cursor..next]);
@@ -348,8 +367,8 @@ fn push_or_extend_insert(ops: &mut Vec<DeltaOp>, tokens: Vec<Token>) {
 
 /// Decode a hex segment hash to its raw 32 bytes for compact frame embedding.
 pub fn segment_hash_to_bytes(hash: &SegmentHash) -> Result<[u8; 32], NearDedupError> {
-    let raw = hex::decode(&hash.0)
-        .map_err(|e| NearDedupError::Encode(format!("hex decode: {e}")))?;
+    let raw =
+        hex::decode(&hash.0).map_err(|e| NearDedupError::Encode(format!("hex decode: {e}")))?;
     if raw.len() != 32 {
         return Err(NearDedupError::Encode(format!(
             "expected 32-byte hash, got {}",
@@ -495,7 +514,10 @@ mod tests {
     fn apply_delta_overflow_errors() {
         let canonical: Vec<Token> = vec![1, 2, 3];
         let bad_ops = vec![DeltaOp::Copy(10)];
-        assert!(matches!(apply_delta(&canonical, &bad_ops), Err(NearDedupError::Decode(_))));
+        assert!(matches!(
+            apply_delta(&canonical, &bad_ops),
+            Err(NearDedupError::Decode(_))
+        ));
     }
 
     #[test]
@@ -510,7 +532,10 @@ mod tests {
         let sig_a = MinHashSignature::compute(&canonical);
         let sig_b = MinHashSignature::compute(&variant);
         let any_collision = (0..BANDS).any(|b| sig_a.band_hash(b) == sig_b.band_hash(b));
-        assert!(any_collision, "expected at least one band collision for high-similarity sequences");
+        assert!(
+            any_collision,
+            "expected at least one band collision for high-similarity sequences"
+        );
     }
 
     #[test]

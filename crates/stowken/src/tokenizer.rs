@@ -42,33 +42,52 @@ impl TiktokenAdapter {
         // Subsequent calls just clone the Arc pointer — no vocab loading.
         let (bpe, encoding_name, vocab_size) = match name {
             "cl100k_base" => {
-                static CACHE: std::sync::OnceLock<std::sync::Arc<tiktoken_rs::CoreBPE>> = std::sync::OnceLock::new();
-                let arc = CACHE.get_or_init(|| std::sync::Arc::new(tiktoken_rs::cl100k_base().expect("cl100k_base")));
+                static CACHE: std::sync::OnceLock<std::sync::Arc<tiktoken_rs::CoreBPE>> =
+                    std::sync::OnceLock::new();
+                let arc = CACHE.get_or_init(|| {
+                    std::sync::Arc::new(tiktoken_rs::cl100k_base().expect("cl100k_base"))
+                });
                 (std::sync::Arc::clone(arc), "cl100k_base", 100_277u32)
             }
             "o200k_base" => {
-                static CACHE: std::sync::OnceLock<std::sync::Arc<tiktoken_rs::CoreBPE>> = std::sync::OnceLock::new();
-                let arc = CACHE.get_or_init(|| std::sync::Arc::new(tiktoken_rs::o200k_base().expect("o200k_base")));
+                static CACHE: std::sync::OnceLock<std::sync::Arc<tiktoken_rs::CoreBPE>> =
+                    std::sync::OnceLock::new();
+                let arc = CACHE.get_or_init(|| {
+                    std::sync::Arc::new(tiktoken_rs::o200k_base().expect("o200k_base"))
+                });
                 (std::sync::Arc::clone(arc), "o200k_base", 200_019u32)
             }
             "p50k_base" => {
-                static CACHE: std::sync::OnceLock<std::sync::Arc<tiktoken_rs::CoreBPE>> = std::sync::OnceLock::new();
-                let arc = CACHE.get_or_init(|| std::sync::Arc::new(tiktoken_rs::p50k_base().expect("p50k_base")));
+                static CACHE: std::sync::OnceLock<std::sync::Arc<tiktoken_rs::CoreBPE>> =
+                    std::sync::OnceLock::new();
+                let arc = CACHE.get_or_init(|| {
+                    std::sync::Arc::new(tiktoken_rs::p50k_base().expect("p50k_base"))
+                });
                 (std::sync::Arc::clone(arc), "p50k_base", 50_281u32)
             }
             "p50k_edit" => {
-                static CACHE: std::sync::OnceLock<std::sync::Arc<tiktoken_rs::CoreBPE>> = std::sync::OnceLock::new();
-                let arc = CACHE.get_or_init(|| std::sync::Arc::new(tiktoken_rs::p50k_edit().expect("p50k_edit")));
+                static CACHE: std::sync::OnceLock<std::sync::Arc<tiktoken_rs::CoreBPE>> =
+                    std::sync::OnceLock::new();
+                let arc = CACHE.get_or_init(|| {
+                    std::sync::Arc::new(tiktoken_rs::p50k_edit().expect("p50k_edit"))
+                });
                 (std::sync::Arc::clone(arc), "p50k_edit", 50_281u32)
             }
             "r50k_base" => {
-                static CACHE: std::sync::OnceLock<std::sync::Arc<tiktoken_rs::CoreBPE>> = std::sync::OnceLock::new();
-                let arc = CACHE.get_or_init(|| std::sync::Arc::new(tiktoken_rs::r50k_base().expect("r50k_base")));
+                static CACHE: std::sync::OnceLock<std::sync::Arc<tiktoken_rs::CoreBPE>> =
+                    std::sync::OnceLock::new();
+                let arc = CACHE.get_or_init(|| {
+                    std::sync::Arc::new(tiktoken_rs::r50k_base().expect("r50k_base"))
+                });
                 (std::sync::Arc::clone(arc), "r50k_base", 50_257u32)
             }
             _ => return None,
         };
-        Some(Self { bpe, encoding_name, vocab_size })
+        Some(Self {
+            bpe,
+            encoding_name,
+            vocab_size,
+        })
     }
 }
 

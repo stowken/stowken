@@ -24,10 +24,7 @@ fn bin() -> PathBuf {
 
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest.parent().unwrap().parent().unwrap();
-    workspace
-        .join("target")
-        .join("debug")
-        .join("stowken")
+    workspace.join("target").join("debug").join("stowken")
 }
 
 fn run(data_dir: &Path, args: &[&str]) -> Output {
@@ -86,14 +83,22 @@ fn store_and_retrieve_roundtrip() {
 
     // Store via stdin.
     let out = run_stdin(dir.path(), &["store", "-"], &conv);
-    assert!(out.status.success(), "store failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "store failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("test-conv-1"), "id not in output: {stdout}");
 
     // Retrieve by id (--json for parseable output).
     let out = run(dir.path(), &["retrieve", "test-conv-1", "--json"]);
-    assert!(out.status.success(), "retrieve failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "retrieve failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let retrieved: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("retrieve output not JSON");
@@ -107,7 +112,11 @@ fn store_json_flag_emits_valid_json() {
     let conv = sample_conversation("json-test");
 
     let out = run_stdin(dir.path(), &["store", "-", "--json"], &conv);
-    assert!(out.status.success(), "store --json failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "store --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let parsed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("output is not valid JSON");
@@ -156,7 +165,11 @@ fn stats_returns_nonzero_after_store() {
     run_stdin(dir.path(), &["store", "-"], &conv);
 
     let out = run(dir.path(), &["stats", "--json"]);
-    assert!(out.status.success(), "stats failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stats failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let stats: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(stats["total_conversations"].as_u64().unwrap_or(0) >= 1);
@@ -172,7 +185,11 @@ fn delete_removes_conversation() {
 
     // Delete with --yes to skip interactive confirmation.
     let out = run(dir.path(), &["delete", "delete-test", "--yes"]);
-    assert!(out.status.success(), "delete failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "delete failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Retrieve should now fail.
     let out = run(dir.path(), &["retrieve", "delete-test"]);
@@ -188,7 +205,11 @@ fn gc_runs_without_error() {
     run(dir.path(), &["delete", "gc-test", "--yes"]);
 
     let out = run(dir.path(), &["gc"]);
-    assert!(out.status.success(), "gc failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gc failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -198,13 +219,22 @@ fn segment_stats_lists_segment_types() {
     run_stdin(dir.path(), &["store", "-"], &conv);
 
     let out = run(dir.path(), &["segment-stats", "--json"]);
-    assert!(out.status.success(), "segment-stats failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "segment-stats failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let arr: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
     assert!(!arr.is_empty(), "expected at least one segment type");
-    let types: Vec<_> = arr.iter().filter_map(|e| e["segment_type"].as_str()).collect();
+    let types: Vec<_> = arr
+        .iter()
+        .filter_map(|e| e["segment_type"].as_str())
+        .collect();
     assert!(
-        types.iter().any(|t| t.contains("system") || t.contains("user")),
+        types
+            .iter()
+            .any(|t| t.contains("system") || t.contains("user")),
         "expected system/user segment types, got {types:?}"
     );
 }
@@ -226,11 +256,12 @@ fn store_from_file() {
     let tmp_file = dir.path().join("conv.json");
     std::fs::write(&tmp_file, conv).unwrap();
 
-    let out = run(
-        dir.path(),
-        &["store", tmp_file.to_str().unwrap(), "--json"],
+    let out = run(dir.path(), &["store", tmp_file.to_str().unwrap(), "--json"]);
+    assert!(
+        out.status.success(),
+        "store from file failed: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert!(out.status.success(), "store from file failed: {}", String::from_utf8_lossy(&out.stderr));
     let r: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(r["id"].as_str(), Some("file-test"));
 }
@@ -258,7 +289,11 @@ fn dict_train_list_and_activate_round_trip() {
         })
         .to_string();
         let out = run_stdin(dir.path(), &["store", "-"], &conv);
-        assert!(out.status.success(), "seed store failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "seed store failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     // Empty list to start.
@@ -268,8 +303,15 @@ fn dict_train_list_and_activate_round_trip() {
     assert_eq!(list.as_array().map(|v| v.len()), Some(0));
 
     // Train + activate in one shot.
-    let train_out = run(dir.path(), &["--json", "dict", "train", "--samples", "20", "--activate"]);
-    assert!(train_out.status.success(), "train failed: {}", String::from_utf8_lossy(&train_out.stderr));
+    let train_out = run(
+        dir.path(),
+        &["--json", "dict", "train", "--samples", "20", "--activate"],
+    );
+    assert!(
+        train_out.status.success(),
+        "train failed: {}",
+        String::from_utf8_lossy(&train_out.stderr)
+    );
     let info: serde_json::Value = serde_json::from_slice(&train_out.stdout).unwrap();
     let id = info["id"].as_u64().expect("id should be u64");
     assert!(info["is_active"].as_bool().unwrap());
@@ -308,12 +350,22 @@ fn dict_train_list_and_activate_round_trip() {
     assert!(train2.status.success());
     let info2: serde_json::Value = serde_json::from_slice(&train2.stdout).unwrap();
     let id2 = info2["id"].as_u64().unwrap();
-    assert_ne!(id, id2, "different training corpora should produce different ids");
-    assert!(!info2["is_active"].as_bool().unwrap(), "second dict trained without --activate");
+    assert_ne!(
+        id, id2,
+        "different training corpora should produce different ids"
+    );
+    assert!(
+        !info2["is_active"].as_bool().unwrap(),
+        "second dict trained without --activate"
+    );
 
     // Now activate the second one.
     let act_out = run(dir.path(), &["dict", "activate", &id2.to_string()]);
-    assert!(act_out.status.success(), "activate failed: {}", String::from_utf8_lossy(&act_out.stderr));
+    assert!(
+        act_out.status.success(),
+        "activate failed: {}",
+        String::from_utf8_lossy(&act_out.stderr)
+    );
 
     // Verify activation flipped.
     let list3: serde_json::Value =
@@ -325,11 +377,19 @@ fn dict_train_list_and_activate_round_trip() {
         .filter(|d| d["is_active"].as_bool().unwrap())
         .map(|d| d["id"].as_u64().unwrap())
         .collect();
-    assert_eq!(active_ids, vec![id2], "exactly one dict active, must be id2");
+    assert_eq!(
+        active_ids,
+        vec![id2],
+        "exactly one dict active, must be id2"
+    );
 
     // Pre-dict retrievals still work after activations + rotations.
     let r = run(dir.path(), &["--json", "retrieve", "dict-seed-0"]);
-    assert!(r.status.success(), "pre-dict retrieve failed: {}", String::from_utf8_lossy(&r.stderr));
+    assert!(
+        r.status.success(),
+        "pre-dict retrieve failed: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
 }
 
 #[test]
@@ -350,7 +410,11 @@ fn reindex_restores_stats_after_db_deletion() {
         })
         .to_string();
         let out = run_stdin(dir.path(), &["store", "-"], &conv);
-        assert!(out.status.success(), "seed store failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "seed store failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     let stats_before = run(dir.path(), &["--json", "stats"]);
@@ -367,7 +431,11 @@ fn reindex_restores_stats_after_db_deletion() {
 
     // Reindex.
     let reidx = run(dir.path(), &["--json", "reindex"]);
-    assert!(reidx.status.success(), "reindex failed: {}", String::from_utf8_lossy(&reidx.stderr));
+    assert!(
+        reidx.status.success(),
+        "reindex failed: {}",
+        String::from_utf8_lossy(&reidx.stderr)
+    );
     let report: serde_json::Value = serde_json::from_slice(&reidx.stdout).unwrap();
     assert_eq!(report["conversations_indexed"].as_u64(), Some(2));
 
@@ -413,8 +481,8 @@ fn bench_runs_on_jsonl_directory() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let result: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .expect("bench --json should emit valid JSON");
+    let result: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("bench --json should emit valid JSON");
 
     assert_eq!(result["ingested"], 2, "expected 2 conversations ingested");
     assert_eq!(result["failures"], 0, "expected 0 failures");
@@ -429,7 +497,10 @@ fn bench_runs_on_jsonl_directory() {
     let naive = result["naive_bytes"].as_u64().unwrap();
     let dedup = result["dedup_only_bytes"].as_u64().unwrap();
     let storage = result["storage_bytes"].as_u64().unwrap();
-    assert!(dedup < naive, "dedup ({dedup}) should be smaller than naive ({naive})");
+    assert!(
+        dedup < naive,
+        "dedup ({dedup}) should be smaller than naive ({naive})"
+    );
     // storage may be larger than dedup on tiny corpora due to zstd frame
     // overhead — that's expected and the report shows it honestly. Only
     // sanity-check that storage is positive and not absurd.
@@ -441,7 +512,10 @@ fn bench_errors_on_empty_directory() {
     let dir = temp_dir();
     let empty = tempfile::tempdir().unwrap();
     let out = run(dir.path(), &["bench", empty.path().to_str().unwrap()]);
-    assert!(!out.status.success(), "bench should fail on empty directory");
+    assert!(
+        !out.status.success(),
+        "bench should fail on empty directory"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("no conversations found"),
@@ -469,14 +543,18 @@ fn export_jsonl_format() {
     }
 
     let out = run(dir.path(), &["export", "--format", "jsonl"]);
-    assert!(out.status.success(), "export failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "export failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Each line in JSONL output should be valid JSON.
     let lines: Vec<_> = stdout.lines().filter(|l| !l.is_empty()).collect();
     assert!(!lines.is_empty(), "export produced no output");
     for line in &lines {
-        let _: serde_json::Value =
-            serde_json::from_str(line).unwrap_or_else(|e| panic!("invalid JSONL line: {e}\n{line}"));
+        let _: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("invalid JSONL line: {e}\n{line}"));
     }
 }

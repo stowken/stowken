@@ -96,7 +96,10 @@ async fn reindex_after_db_deletion_restores_all_stats() {
 
         // ── Stats should now match the pre-deletion state exactly. ──────
         let stats_after = vault.stats().await.unwrap();
-        assert_eq!(stats_after.total_conversations, stats_before.total_conversations);
+        assert_eq!(
+            stats_after.total_conversations,
+            stats_before.total_conversations
+        );
         assert_eq!(stats_after.unique_segments, stats_before.unique_segments);
         assert_eq!(stats_after.total_segments, stats_before.total_segments);
         assert_eq!(stats_after.total_tokens, stats_before.total_tokens);
@@ -118,11 +121,22 @@ async fn reindex_after_db_deletion_restores_all_stats() {
 
         // Differentiator commands should also work post-reindex.
         let prompts = vault.list_system_prompts().await.unwrap();
-        assert_eq!(prompts.len(), 1, "shared system prompt should be findable after reindex");
-        assert_eq!(prompts[0].ref_count, 5, "system prompt should still report 5 refs");
+        assert_eq!(
+            prompts.len(),
+            1,
+            "shared system prompt should be findable after reindex"
+        );
+        assert_eq!(
+            prompts[0].ref_count, 5,
+            "system prompt should still report 5 refs"
+        );
 
         let dups = vault.find_duplicates(2, 100).await.unwrap();
-        assert_eq!(dups.len(), 1, "find-duplicates should still surface the shared prompt");
+        assert_eq!(
+            dups.len(),
+            1,
+            "find-duplicates should still surface the shared prompt"
+        );
         assert_eq!(dups[0].ref_count, 5);
     }
 }

@@ -181,7 +181,10 @@ fn extract_metadata(msg: &Message) -> Option<std::collections::HashMap<String, s
         map.insert("name".to_owned(), serde_json::Value::String(name.clone()));
     }
     if let Some(id) = &msg.tool_call_id {
-        map.insert("tool_call_id".to_owned(), serde_json::Value::String(id.clone()));
+        map.insert(
+            "tool_call_id".to_owned(),
+            serde_json::Value::String(id.clone()),
+        );
     }
     if map.is_empty() {
         None
@@ -221,7 +224,8 @@ fn split_text_at_paragraphs(
         } else {
             adapter.tokenize("\n\n")
         };
-        if current.len() + sep_tokens.len() + para_tokens.len() > max_tokens && !current.is_empty() {
+        if current.len() + sep_tokens.len() + para_tokens.len() > max_tokens && !current.is_empty()
+        {
             chunks.push(std::mem::take(&mut current));
             current = para_tokens;
         } else {
@@ -263,9 +267,7 @@ fn find_subsequence(haystack: &[Token], needle: &[Token]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -385,7 +387,10 @@ mod tests {
             tool_call_id: None,
         }]);
         let result = segmenter.segment(&conv);
-        assert!(matches!(result, Err(SegmenterError::TextWithoutTokenizer { .. })));
+        assert!(matches!(
+            result,
+            Err(SegmenterError::TextWithoutTokenizer { .. })
+        ));
     }
 
     #[test]

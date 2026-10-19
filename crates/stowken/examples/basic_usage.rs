@@ -37,7 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 Message {
                     role: "assistant".into(),
-                    content: MessageContent::Text(format!("Hello! I'm conversation {} response.", i)),
+                    content: MessageContent::Text(format!(
+                        "Hello! I'm conversation {} response.",
+                        i
+                    )),
                     name: None,
                     tool_call_id: None,
                 },

@@ -86,7 +86,10 @@ async fn discovery_promotes_frequent_windows() {
     assert_eq!(vault.list_substrings().len(), promoted.len());
     // Each promoted substring is the minimum-length window.
     for info in &promoted {
-        assert!(info.length >= 16, "promoted substring must clear MIN_LENGTH");
+        assert!(
+            info.length >= 16,
+            "promoted substring must clear MIN_LENGTH"
+        );
         assert!(info.source_occurrences >= 5, "must clear min_occurrences");
     }
 }
@@ -238,7 +241,10 @@ async fn substring_persistence_across_vault_reopen() {
             .iter()
             .find(|s| matches!(s.segment_type, stowken::types::SegmentType::SystemPrompt))
             .unwrap();
-        assert_eq!(sys.tokens, novel_clone, "0x05 frame failed to round-trip after reopen");
+        assert_eq!(
+            sys.tokens, novel_clone,
+            "0x05 frame failed to round-trip after reopen"
+        );
     }
 }
 
@@ -251,7 +257,10 @@ async fn pre_substring_segments_remain_readable_after_promotion() {
         .await
         .unwrap();
     let pre = make_drift_system(1, 250);
-    vault.store(make_conv("pre", pre.clone(), vec![1])).await.unwrap();
+    vault
+        .store(make_conv("pre", pre.clone(), vec![1]))
+        .await
+        .unwrap();
 
     for i in 100..130u32 {
         vault
@@ -266,7 +275,10 @@ async fn pre_substring_segments_remain_readable_after_promotion() {
     vault.train_substrings(30, 5).await.unwrap();
 
     let post = make_drift_system(2, 250);
-    vault.store(make_conv("post", post.clone(), vec![2])).await.unwrap();
+    vault
+        .store(make_conv("post", post.clone(), vec![2]))
+        .await
+        .unwrap();
 
     // Both retrievals work.
     assert_eq!(
@@ -316,7 +328,11 @@ async fn compact_rewrites_pre_train_segments() {
     let pre_tokens: Vec<Vec<u32>> = (0..30u32).map(|i| make_drift_system(i, 250)).collect();
     for (i, sys) in pre_tokens.iter().enumerate() {
         vault
-            .store(make_conv(&format!("pre-{i}"), sys.clone(), vec![100 + i as u32]))
+            .store(make_conv(
+                &format!("pre-{i}"),
+                sys.clone(),
+                vec![100 + i as u32],
+            ))
             .await
             .unwrap();
     }
@@ -327,11 +343,17 @@ async fn compact_rewrites_pre_train_segments() {
     // After training, no segments are rewritten yet — only new ingests
     // would use the registry. Storage should be unchanged.
     let mid_storage = vault.stats().await.unwrap().storage_bytes;
-    assert_eq!(mid_storage, pre_compaction_storage, "training shouldn't rewrite existing segments");
+    assert_eq!(
+        mid_storage, pre_compaction_storage,
+        "training shouldn't rewrite existing segments"
+    );
 
     // Compact rewrites the existing segments where it's a win.
     let report = vault.compact_substrings().await.unwrap();
-    assert!(report.segments_rewritten > 0, "expected at least one rewrite on a drift corpus");
+    assert!(
+        report.segments_rewritten > 0,
+        "expected at least one rewrite on a drift corpus"
+    );
     assert!(report.bytes_saved > 0);
 
     let post_storage = vault.stats().await.unwrap().storage_bytes;
@@ -374,14 +396,24 @@ async fn compact_skips_delta_and_substring_frames() {
     let mut variant = canon.clone();
     variant[10] = 99_999;
     variant[100] = 88_888;
-    vault.store(make_conv("canon", canon.clone(), vec![1])).await.unwrap();
-    vault.store(make_conv("variant", variant.clone(), vec![2])).await.unwrap();
+    vault
+        .store(make_conv("canon", canon.clone(), vec![1]))
+        .await
+        .unwrap();
+    vault
+        .store(make_conv("variant", variant.clone(), vec![2]))
+        .await
+        .unwrap();
 
     // Add some drift segments and train substrings. After training,
     // store one more conversation that should produce a 0x05 frame.
     for i in 0..30u32 {
         vault
-            .store(make_conv(&format!("drift-{i}"), make_drift_system(i, 250), vec![100 + i]))
+            .store(make_conv(
+                &format!("drift-{i}"),
+                make_drift_system(i, 250),
+                vec![100 + i],
+            ))
             .await
             .unwrap();
     }
@@ -425,7 +457,11 @@ async fn gc_drops_unreferenced_substrings() {
     // substrings, all referenced by the post-training ingests.
     for i in 0..30u32 {
         vault
-            .store(make_conv(&format!("seed-{i}"), make_drift_system(i, 250), vec![i]))
+            .store(make_conv(
+                &format!("seed-{i}"),
+                make_drift_system(i, 250),
+                vec![i],
+            ))
             .await
             .unwrap();
     }
@@ -450,7 +486,11 @@ async fn gc_after_compaction_keeps_referenced_substrings() {
 
     for i in 0..30u32 {
         vault
-            .store(make_conv(&format!("seed-{i}"), make_drift_system(i, 250), vec![i]))
+            .store(make_conv(
+                &format!("seed-{i}"),
+                make_drift_system(i, 250),
+                vec![i],
+            ))
             .await
             .unwrap();
     }
@@ -463,10 +503,12 @@ async fn gc_after_compaction_keeps_referenced_substrings() {
     // After compaction, at least some substrings are referenced by
     // 0x05 frames and shouldn't be dropped. Some may still be unused
     // (rejected by the cost-model fallback during compact).
-    assert!(report.registry_size_after > 0, "compacted segments should keep at least some substrings alive");
+    assert!(
+        report.registry_size_after > 0,
+        "compacted segments should keep at least some substrings alive"
+    );
     assert_eq!(
-        report.registry_size_before,
-        before,
+        report.registry_size_before, before,
         "registry size before should match list_substrings"
     );
 }

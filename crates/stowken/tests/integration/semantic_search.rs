@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use stowken::{
     storage::MemoryBackend,
     types::{
-        Conversation, EmbeddingAdapter, Message, MessageContent, SearchGranularity,
-        SegmentType, SemanticSearchQuery, StowkenConfig, SummarizerAdapter,
+        Conversation, EmbeddingAdapter, Message, MessageContent, SearchGranularity, SegmentType,
+        SemanticSearchQuery, StowkenConfig, SummarizerAdapter,
     },
     Stowken,
 };
@@ -80,11 +80,7 @@ impl EmbeddingAdapter for MockEmbedder {
         let map = self.responses.lock().unwrap();
         Ok(texts
             .iter()
-            .map(|t| {
-                map.get(*t)
-                    .cloned()
-                    .unwrap_or_else(|| Self::fallback(t))
-            })
+            .map(|t| map.get(*t).cloned().unwrap_or_else(|| Self::fallback(t)))
             .collect())
     }
     fn dimension(&self) -> usize {
@@ -105,7 +101,11 @@ impl stowken::types::TokenizerAdapter for NumTokenizer {
         text.bytes().map(|b| b as u32).collect()
     }
     fn detokenize(&self, tokens: &[u32]) -> String {
-        tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ")
+        tokens
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
     fn vocab_size(&self) -> u32 {
         u32::MAX
@@ -118,7 +118,10 @@ impl stowken::types::TokenizerAdapter for NumTokenizer {
 struct MockSummarizer;
 impl SummarizerAdapter for MockSummarizer {
     fn summarize(&self, text: &str) -> Result<String, String> {
-        Ok(format!("summary of: {}", text.chars().take(80).collect::<String>()))
+        Ok(format!(
+            "summary of: {}",
+            text.chars().take(80).collect::<String>()
+        ))
     }
     fn model_name(&self) -> &str {
         "mock-llm-v1"
@@ -126,9 +129,7 @@ impl SummarizerAdapter for MockSummarizer {
 }
 
 fn make_conv_with_text(id: &str, system: &str, user: &str, assistant: &str) -> Conversation {
-    let tokenize = |s: &str| -> Vec<u32> {
-        s.bytes().map(|b| b as u32).collect()
-    };
+    let tokenize = |s: &str| -> Vec<u32> { s.bytes().map(|b| b as u32).collect() };
     Conversation {
         id: Some(id.to_owned()),
         application: Some("test".to_owned()),
@@ -202,27 +203,15 @@ async fn semantic_search_ranks_closest_vector_first() {
 
     // Build embedder with crafted vectors. The query "production failures"
     // will get the vector [1, 0, 0, 0] — closest to conv-prod.
-    let embedder = MockEmbedder::new(vec![
-        ("production failures", [1.0, 0.0, 0.0, 0.0]),
-    ]);
+    let embedder = MockEmbedder::new(vec![("production failures", [1.0, 0.0, 0.0, 0.0])]);
     vault.set_embedding_adapter(embedder);
     vault.use_concat_summary(10_000);
 
     // Store a "production failures" themed conversation.
-    let conv_prod = make_conv_with_text(
-        "conv-prod",
-        "sys-prod",
-        "user-prod",
-        "asst-prod",
-    );
+    let conv_prod = make_conv_with_text("conv-prod", "sys-prod", "user-prod", "asst-prod");
     vault.store(conv_prod).await.unwrap();
 
-    let conv_bill = make_conv_with_text(
-        "conv-bill",
-        "sys-bill",
-        "user-bill",
-        "asst-bill",
-    );
+    let conv_bill = make_conv_with_text("conv-bill", "sys-bill", "user-bill", "asst-bill");
     vault.store(conv_bill).await.unwrap();
 
     // Search with the registered query — embedder returns [1,0,0,0].
@@ -454,8 +443,7 @@ async fn embed_reuse_aliases_near_duplicate_embedding() {
 
     // A long system prompt and a near-duplicate of it (one character changed
     // at byte 100). Jaccard ≈ 0.99 → clears both thresholds.
-    let sys_a: String = "the quick brown fox jumps over the lazy dog. "
-        .repeat(8);
+    let sys_a: String = "the quick brown fox jumps over the lazy dog. ".repeat(8);
     let sys_b = format!("{}X{}", &sys_a[..100], &sys_a[101..]);
 
     // Deliberately dissimilar user/assistant turns so only the system prompt
@@ -495,8 +483,7 @@ async fn embed_reuse_aliases_near_duplicate_embedding() {
     );
 
     // Nothing left unembedded — the aliased variant is searchable.
-    let (segments_pending, _convs_pending) =
-        vault.embed_all_pending_counts().await.unwrap();
+    let (segments_pending, _convs_pending) = vault.embed_all_pending_counts().await.unwrap();
     assert_eq!(
         segments_pending, 0,
         "aliased variant should have an embedding (stays searchable)"

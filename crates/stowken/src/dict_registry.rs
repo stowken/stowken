@@ -237,11 +237,7 @@ impl DictRegistry {
         if !state.known.contains_key(&id) {
             return Err(DictError::NotFound(id));
         }
-        let root = state
-            .root
-            .as_ref()
-            .ok_or(DictError::NotFound(id))?
-            .clone();
+        let root = state.root.as_ref().ok_or(DictError::NotFound(id))?.clone();
         let bytes = std::fs::read(root.join(format!("{id}.zstd")))?;
         let arc = Arc::new(bytes);
         state.cache.insert(id, Arc::clone(&arc));
@@ -381,7 +377,10 @@ mod tests {
         let d2 = train_dict(23);
         let i1 = reg.register(d1.clone(), 30).unwrap().id;
         let i2 = reg.register(d2.clone(), 30).unwrap().id;
-        assert_ne!(i1, i2, "different training corpora should produce different ids");
+        assert_ne!(
+            i1, i2,
+            "different training corpora should produce different ids"
+        );
 
         reg.activate(i2).unwrap();
 

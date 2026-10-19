@@ -140,9 +140,7 @@ pub fn kmeans(points: &[Vec<f32>], config: KMeansConfig) -> KMeansResult {
                             .fold(f32::INFINITY, f32::min);
                         (i, 1.0 - min_sim)
                     })
-                    .max_by(|a, b| {
-                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(i, _)| i)
                     .unwrap_or(0);
                 new_centroids.push(normalize(&points[farthest]));

@@ -90,7 +90,12 @@ pub struct OpenAiEmbeddingAdapter {
 
 impl OpenAiEmbeddingAdapter {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>, dimension: usize) -> Self {
-        Self { api_key: api_key.into(), model: model.into(), dimension, client: build_blocking_client() }
+        Self {
+            api_key: api_key.into(),
+            model: model.into(),
+            dimension,
+            client: build_blocking_client(),
+        }
     }
 
     #[allow(dead_code)]
@@ -131,14 +136,19 @@ impl EmbeddingAdapter for OpenAiEmbeddingAdapter {
         let model = self.model.clone();
         std::thread::spawn(move || {
             let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-            let body = EmbedRequest { input: &refs, model: &model };
+            let body = EmbedRequest {
+                input: &refs,
+                model: &model,
+            };
             retry_on_rate_limit(8, || {
                 let resp = client
                     .post(OPENAI_EMBEDDINGS_URL)
                     .bearer_auth(&api_key)
                     .json(&body)
                     .send()
-                    .map_err(|e| RetryError::Fatal(format!("openai embeddings request failed: {e}")))?;
+                    .map_err(|e| {
+                        RetryError::Fatal(format!("openai embeddings request failed: {e}"))
+                    })?;
                 if resp.status().as_u16() == 429 {
                     return Err(RetryError::RateLimit(parse_retry_after(&resp)));
                 }
@@ -150,9 +160,9 @@ impl EmbeddingAdapter for OpenAiEmbeddingAdapter {
                         body.chars().take(500).collect::<String>()
                     )));
                 }
-                let parsed: EmbedResponse = resp
-                    .json()
-                    .map_err(|e| RetryError::Fatal(format!("decoding openai embeddings response: {e}")))?;
+                let parsed: EmbedResponse = resp.json().map_err(|e| {
+                    RetryError::Fatal(format!("decoding openai embeddings response: {e}"))
+                })?;
                 Ok(parsed.data.into_iter().map(|i| i.embedding).collect())
             })
         })
@@ -160,8 +170,12 @@ impl EmbeddingAdapter for OpenAiEmbeddingAdapter {
         .map_err(|_| "embedding thread panicked".to_string())?
     }
 
-    fn dimension(&self) -> usize { self.dimension }
-    fn model_name(&self) -> &str { &self.model }
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+    fn model_name(&self) -> &str {
+        &self.model
+    }
 }
 
 // ── Summarizer adapter ────────────────────────────────────────────────────────
@@ -175,7 +189,11 @@ pub struct OpenAiSummarizerAdapter {
 
 impl OpenAiSummarizerAdapter {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
-        Self { api_key: api_key.into(), model: model.into(), client: build_blocking_client() }
+        Self {
+            api_key: api_key.into(),
+            model: model.into(),
+            client: build_blocking_client(),
+        }
     }
 
     #[allow(dead_code)]
@@ -223,8 +241,14 @@ impl SummarizerAdapter for OpenAiSummarizerAdapter {
                 let body = ChatRequest {
                     model: &model,
                     messages: vec![
-                        ChatMessage { role: "system", content: SUMMARY_SYSTEM_PROMPT },
-                        ChatMessage { role: "user",   content: &text },
+                        ChatMessage {
+                            role: "system",
+                            content: SUMMARY_SYSTEM_PROMPT,
+                        },
+                        ChatMessage {
+                            role: "user",
+                            content: &text,
+                        },
                     ],
                     temperature: 0.2,
                 };
@@ -245,9 +269,9 @@ impl SummarizerAdapter for OpenAiSummarizerAdapter {
                         body.chars().take(500).collect::<String>()
                     )));
                 }
-                let parsed: ChatResponse = resp
-                    .json()
-                    .map_err(|e| RetryError::Fatal(format!("decoding openai chat response: {e}")))?;
+                let parsed: ChatResponse = resp.json().map_err(|e| {
+                    RetryError::Fatal(format!("decoding openai chat response: {e}"))
+                })?;
                 parsed
                     .choices
                     .into_iter()
@@ -260,7 +284,9 @@ impl SummarizerAdapter for OpenAiSummarizerAdapter {
         .map_err(|_| "summarizer thread panicked".to_string())?
     }
 
-    fn model_name(&self) -> &str { &self.model }
+    fn model_name(&self) -> &str {
+        &self.model
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

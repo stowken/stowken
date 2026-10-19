@@ -120,20 +120,14 @@ fn scan_top_k<K: Clone>(
             }
         })
         .collect();
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k);
     scored
 }
 
 /// Merge a hit into the per-conversation map, keeping the best-scoring
 /// match per conversation_id.
-fn upsert_best(
-    hits: &mut HashMap<String, SemanticSearchHit>,
-    candidate: SemanticSearchHit,
-) {
+fn upsert_best(hits: &mut HashMap<String, SemanticSearchHit>, candidate: SemanticSearchHit) {
     use std::collections::hash_map::Entry;
     match hits.entry(candidate.conversation_id.clone()) {
         Entry::Vacant(v) => {
@@ -199,10 +193,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                 // Note: delta frames are NOT skipped — decompress_segment_async
                 // resolves them against their canonical so non-aliased variants
                 // stay searchable.
-                let tokens = match self
-                    .decompress_segment_async(&stored.compressed_data)
-                    .await
-                {
+                let tokens = match self.decompress_segment_async(&stored.compressed_data).await {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
@@ -244,11 +235,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                 let index = self.index_clone();
                 let h = hash.clone();
                 let mn = model_name.clone();
-                task::spawn_blocking(move || {
-                    index.upsert_segment_embedding(&h, &mn, &normalized)
-                })
-                .await
-                .map_err(|e| StowkenError::Internal(e.to_string()))??;
+                task::spawn_blocking(move || index.upsert_segment_embedding(&h, &mn, &normalized))
+                    .await
+                    .map_err(|e| StowkenError::Internal(e.to_string()))??;
                 embedded += 1;
             }
             eprintln!("  segments: {}/{total}", embedded);
@@ -318,7 +307,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             .await
             .map_err(|e| StowkenError::Internal(e.to_string()))?
             .map_err(StowkenError::Embedding)?;
-        let Some(raw) = embeddings.first() else { return Ok(0) };
+        let Some(raw) = embeddings.first() else {
+            return Ok(0);
+        };
 
         let normalized = l2_normalize(raw);
         let index = self.index_clone();
@@ -350,12 +341,11 @@ impl<B: StorageBackend + 'static> Stowken<B> {
 
         let adapter_clone = Arc::clone(&adapter);
         let summary_for_embed = summary.clone();
-        let embeddings = task::spawn_blocking(move || {
-            adapter_clone.embed_batch(&[summary_for_embed.as_str()])
-        })
-        .await
-        .map_err(|e| StowkenError::Internal(e.to_string()))?
-        .map_err(StowkenError::Embedding)?;
+        let embeddings =
+            task::spawn_blocking(move || adapter_clone.embed_batch(&[summary_for_embed.as_str()]))
+                .await
+                .map_err(|e| StowkenError::Internal(e.to_string()))?
+                .map_err(StowkenError::Embedding)?;
 
         if embeddings.is_empty() {
             return Err(StowkenError::Embedding(
@@ -392,11 +382,8 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         strategy: &SummaryStrategy,
         tokenizer_name: &str,
     ) -> Result<String, StowkenError> {
-        let full_text = detokenize_with_role_markers(
-            conv,
-            self.tokenizer_arc().as_ref(),
-            tokenizer_name,
-        );
+        let full_text =
+            detokenize_with_role_markers(conv, self.tokenizer_arc().as_ref(), tokenizer_name);
 
         match strategy {
             SummaryStrategy::ConcatTruncate { max_chars } => {
@@ -470,11 +457,10 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             .ok_or_else(|| StowkenError::Internal("no embedding adapter set".into()))?;
         let model = adapter.model_name().to_owned();
         let index = self.index_clone();
-        let unembedded = task::spawn_blocking(move || {
-            index.unembedded_segment_hashes(&model, u64::MAX)
-        })
-        .await
-        .map_err(|e| StowkenError::Internal(e.to_string()))??;
+        let unembedded =
+            task::spawn_blocking(move || index.unembedded_segment_hashes(&model, u64::MAX))
+                .await
+                .map_err(|e| StowkenError::Internal(e.to_string()))??;
         let tokenizer_name = self.default_tokenizer_name();
         self.embed_segment_hashes(&unembedded, &tokenizer_name, adapter)
             .await
@@ -557,8 +543,10 @@ impl<B: StorageBackend + 'static> Stowken<B> {
 
             let model_name = adapter.model_name().to_owned();
             let strategy_id = strategy.id();
-            for ((conv_id, summary), raw) in
-                valid_ids.iter().zip(summaries.iter()).zip(embeddings.iter())
+            for ((conv_id, summary), raw) in valid_ids
+                .iter()
+                .zip(summaries.iter())
+                .zip(embeddings.iter())
             {
                 let normalized = l2_normalize(raw);
                 let index = self.index_clone();
@@ -601,7 +589,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             let m = model.clone();
             let s = strategy_id.clone();
             task::spawn_blocking(move || {
-                index.unembedded_conversation_ids(&m, &s, u64::MAX).map(|v| v.len() as u64)
+                index
+                    .unembedded_conversation_ids(&m, &s, u64::MAX)
+                    .map(|v| v.len() as u64)
             })
             .await
             .map_err(|e| StowkenError::Internal(e.to_string()))??
@@ -632,7 +622,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             let m = model.clone();
             let s = strategy_id.clone();
             task::spawn_blocking(move || {
-                index.unembedded_conversation_ids(&m, &s, u64::MAX).map(|v| v.len() as u64)
+                index
+                    .unembedded_conversation_ids(&m, &s, u64::MAX)
+                    .map(|v| v.len() as u64)
             })
             .await
             .map_err(|e| StowkenError::Internal(e.to_string()))??
@@ -944,9 +936,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                     (id.clone(), score)
                 })
                 .collect();
-            scored.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
             let representatives: Vec<String> = scored
                 .iter()
@@ -1022,9 +1012,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             })
             .filter(|(_, d)| *d >= threshold)
             .collect();
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
 
         if scored.is_empty() {
@@ -1125,4 +1113,3 @@ pub(crate) fn collect_new_hashes(ops: &[BatchSegmentOp]) -> Vec<SegmentHash> {
         })
         .collect()
 }
-

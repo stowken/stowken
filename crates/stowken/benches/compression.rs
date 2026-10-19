@@ -39,5 +39,10 @@ fn bench_full_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_varint_encode, bench_varint_decode, bench_full_pipeline);
+criterion_group!(
+    benches,
+    bench_varint_encode,
+    bench_varint_decode,
+    bench_full_pipeline
+);
 criterion_main!(benches);

@@ -207,9 +207,10 @@ impl SubstringRegistry {
 
         let mut state = self.inner.write().unwrap();
         let id = state.next_id;
-        state.next_id = state.next_id.checked_add(1).ok_or_else(|| {
-            SubstringError::Serialization("substring id space exhausted".into())
-        })?;
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| SubstringError::Serialization("substring id space exhausted".into()))?;
 
         let info = SubstringInfo {
             id,
@@ -294,7 +295,9 @@ impl SubstringRegistry {
             // Use cached tokens directly; if missing, skip rather than
             // page in (the lookup is on a hot path; cold candidates
             // rarely beat the cached ones in practice).
-            let Some(stored) = state.cache.get(&id) else { continue };
+            let Some(stored) = state.cache.get(&id) else {
+                continue;
+            };
             if tokens.len() < stored.len() {
                 continue;
             }
@@ -431,8 +434,7 @@ fn read_index(root: &Path) -> SubstringResult<Vec<IndexEntry>> {
         return Ok(Vec::new());
     }
     let raw = std::fs::read(&path)?;
-    serde_json::from_slice(&raw)
-        .map_err(|e| SubstringError::Serialization(e.to_string()))
+    serde_json::from_slice(&raw).map_err(|e| SubstringError::Serialization(e.to_string()))
 }
 
 fn write_index(root: &Path, entries: &[IndexEntry]) -> SubstringResult<()> {
@@ -497,7 +499,9 @@ mod tests {
     use tempfile::TempDir;
 
     fn substring(seed: u32, length: usize) -> Vec<Token> {
-        (0..length as u32).map(|i| (seed * 17 + i * 3) % 50_000).collect()
+        (0..length as u32)
+            .map(|i| (seed * 17 + i * 3) % 50_000)
+            .collect()
     }
 
     #[test]

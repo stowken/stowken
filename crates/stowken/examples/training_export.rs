@@ -16,8 +16,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let system = "You are a helpful, accurate assistant.";
     let training_pairs = [
         ("What is 2 + 2?", "2 + 2 equals 4."),
-        ("Explain gravity.", "Gravity is the force that attracts objects with mass toward each other."),
-        ("Write a haiku.", "Old silent pond\nA frog jumps into the pond\nSplash! Silence again."),
+        (
+            "Explain gravity.",
+            "Gravity is the force that attracts objects with mass toward each other.",
+        ),
+        (
+            "Write a haiku.",
+            "Old silent pond\nA frog jumps into the pond\nSplash! Silence again.",
+        ),
     ];
 
     for (question, answer) in &training_pairs {

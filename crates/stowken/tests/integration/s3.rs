@@ -28,7 +28,10 @@ use std::sync::Arc;
 
 use stowken::{
     storage::{s3::S3Backend, StorageBackend},
-    types::{Conversation, Message, MessageContent, SegmentHash, SegmentType, StoredSegment, StowkenConfig},
+    types::{
+        Conversation, Message, MessageContent, SegmentHash, SegmentType, StoredSegment,
+        StowkenConfig,
+    },
     Stowken,
 };
 
@@ -38,9 +41,7 @@ async fn s3_backend_or_skip(test_name: &str) -> Option<S3Backend> {
     let bucket = match std::env::var("STOWKEN_S3_TEST_BUCKET") {
         Ok(b) if !b.is_empty() => b,
         _ => {
-            eprintln!(
-                "skipping {test_name}: set STOWKEN_S3_TEST_BUCKET to enable"
-            );
+            eprintln!("skipping {test_name}: set STOWKEN_S3_TEST_BUCKET to enable");
             return None;
         }
     };

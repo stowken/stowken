@@ -49,7 +49,9 @@ async fn seed<B: stowken::storage::backend::StorageBackend + 'static>(
     sys_seed: u32,
 ) {
     for i in 0..n {
-        let sys: Vec<u32> = (0u32..120).map(|t| (t * 13 + i * 7 + sys_seed) % 50_000).collect();
+        let sys: Vec<u32> = (0u32..120)
+            .map(|t| (t * 13 + i * 7 + sys_seed) % 50_000)
+            .collect();
         let user: Vec<u32> = (0u32..40).map(|t| (t * 5 + i * 11) % 50_000).collect();
         vault
             .store(make_conv(&format!("seed-{sys_seed}-{i}"), sys, user))
@@ -83,7 +85,10 @@ async fn segments_compressed_with_old_dict_remain_readable_after_rotation() {
     // Store conversation X under dict A.
     let x_sys: Vec<u32> = (0u32..120).collect();
     let x_user: Vec<u32> = (1000u32..1040).collect();
-    vault.store(make_conv("X-pre-rotation", x_sys.clone(), x_user.clone())).await.unwrap();
+    vault
+        .store(make_conv("X-pre-rotation", x_sys.clone(), x_user.clone()))
+        .await
+        .unwrap();
 
     // Seed more data so dict B trains on something different.
     seed(&vault, 30, 2).await;
@@ -95,7 +100,10 @@ async fn segments_compressed_with_old_dict_remain_readable_after_rotation() {
     // Store conversation Y under dict B.
     let y_sys: Vec<u32> = (5000u32..5120).collect();
     let y_user: Vec<u32> = (6000u32..6040).collect();
-    vault.store(make_conv("Y-post-rotation", y_sys.clone(), y_user.clone())).await.unwrap();
+    vault
+        .store(make_conv("Y-post-rotation", y_sys.clone(), y_user.clone()))
+        .await
+        .unwrap();
 
     // Retrieve both and confirm exact roundtrip.
     let x = vault.retrieve("X-pre-rotation").await.unwrap();
@@ -121,27 +129,45 @@ async fn three_dict_rotation_all_frames_readable() {
     let _a = vault.train_and_activate_dictionary(20).await.unwrap();
 
     let conv_a_sys: Vec<u32> = (0u32..100).collect();
-    vault.store(make_conv("conv-a", conv_a_sys.clone(), vec![1, 2, 3])).await.unwrap();
+    vault
+        .store(make_conv("conv-a", conv_a_sys.clone(), vec![1, 2, 3]))
+        .await
+        .unwrap();
 
     seed(&vault, 30, 7).await;
     let _b = vault.train_and_activate_dictionary(20).await.unwrap();
 
     let conv_b_sys: Vec<u32> = (200u32..300).collect();
-    vault.store(make_conv("conv-b", conv_b_sys.clone(), vec![4, 5, 6])).await.unwrap();
+    vault
+        .store(make_conv("conv-b", conv_b_sys.clone(), vec![4, 5, 6]))
+        .await
+        .unwrap();
 
     seed(&vault, 30, 19).await;
     let _c = vault.train_and_activate_dictionary(20).await.unwrap();
 
     let conv_c_sys: Vec<u32> = (400u32..500).collect();
-    vault.store(make_conv("conv-c", conv_c_sys.clone(), vec![7, 8, 9])).await.unwrap();
+    vault
+        .store(make_conv("conv-c", conv_c_sys.clone(), vec![7, 8, 9]))
+        .await
+        .unwrap();
 
     // Three dicts now in the registry.
     assert_eq!(vault.list_dictionaries().len(), 3);
 
     // All three pre-rotation conversations must round-trip.
-    assert_eq!(vault.retrieve("conv-a").await.unwrap().segments[0].tokens, conv_a_sys);
-    assert_eq!(vault.retrieve("conv-b").await.unwrap().segments[0].tokens, conv_b_sys);
-    assert_eq!(vault.retrieve("conv-c").await.unwrap().segments[0].tokens, conv_c_sys);
+    assert_eq!(
+        vault.retrieve("conv-a").await.unwrap().segments[0].tokens,
+        conv_a_sys
+    );
+    assert_eq!(
+        vault.retrieve("conv-b").await.unwrap().segments[0].tokens,
+        conv_b_sys
+    );
+    assert_eq!(
+        vault.retrieve("conv-c").await.unwrap().segments[0].tokens,
+        conv_c_sys
+    );
 }
 
 #[tokio::test]
@@ -188,7 +214,10 @@ async fn dict_persistence_across_vault_reopen() {
         let dicts = vault.list_dictionaries();
         assert_eq!(dicts.len(), 1, "dict not persisted across reopen");
         assert_eq!(dicts[0].id, dict_id);
-        assert!(dicts[0].is_active, "active marker not persisted across reopen");
+        assert!(
+            dicts[0].is_active,
+            "active marker not persisted across reopen"
+        );
 
         // The dict-compressed frame must decompress correctly.
         let retrieved = vault.retrieve("persist-test").await.unwrap();
@@ -209,7 +238,11 @@ async fn pre_dict_frames_remain_readable_after_dict_introduced() {
 
     let pre_dict_tokens: Vec<u32> = (0u32..200).collect();
     vault
-        .store(make_conv("pre-dict", pre_dict_tokens.clone(), vec![1, 2, 3]))
+        .store(make_conv(
+            "pre-dict",
+            pre_dict_tokens.clone(),
+            vec![1, 2, 3],
+        ))
         .await
         .unwrap();
 
@@ -218,15 +251,25 @@ async fn pre_dict_frames_remain_readable_after_dict_introduced() {
 
     let post_dict_tokens: Vec<u32> = (1000u32..1200).collect();
     vault
-        .store(make_conv("post-dict", post_dict_tokens.clone(), vec![4, 5, 6]))
+        .store(make_conv(
+            "post-dict",
+            post_dict_tokens.clone(),
+            vec![4, 5, 6],
+        ))
         .await
         .unwrap();
 
     let pre = vault.retrieve("pre-dict").await.unwrap();
     let post = vault.retrieve("post-dict").await.unwrap();
 
-    assert_eq!(pre.segments[0].tokens, pre_dict_tokens, "pre-dict (0x02) frame corrupted");
-    assert_eq!(post.segments[0].tokens, post_dict_tokens, "post-dict (0x03) frame corrupted");
+    assert_eq!(
+        pre.segments[0].tokens, pre_dict_tokens,
+        "pre-dict (0x02) frame corrupted"
+    );
+    assert_eq!(
+        post.segments[0].tokens, post_dict_tokens,
+        "post-dict (0x03) frame corrupted"
+    );
 }
 
 #[tokio::test]
@@ -237,7 +280,10 @@ async fn training_with_too_few_samples_errors_clearly() {
 
     // Only 3 conversations stored, each 1 segment — far below MIN_TRAINING_SAMPLES.
     for i in 0..3u32 {
-        vault.store(make_conv(&format!("c{i}"), vec![i, i + 1], vec![i + 2])).await.unwrap();
+        vault
+            .store(make_conv(&format!("c{i}"), vec![i, i + 1], vec![i + 2]))
+            .await
+            .unwrap();
     }
 
     let err = vault.train_dictionary(50).await.unwrap_err();
