@@ -871,8 +871,8 @@ fn f32_slice_to_bytes(v: &[f32]) -> Vec<u8> {
 #[cfg(feature = "semantic-search")]
 fn bytes_to_f32_vec(b: &[u8]) -> Vec<f32> {
     let mut out = Vec::with_capacity(b.len() / 4);
-    for chunk in b.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in b.as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(*chunk));
     }
     out
 }
