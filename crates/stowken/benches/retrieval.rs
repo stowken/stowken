@@ -38,9 +38,8 @@ fn bench_retrieve(c: &mut Criterion) {
             (vault, r.id)
         });
 
-        b.to_async(&runtime).iter(|| async {
-            vault.retrieve(&id).await.unwrap()
-        });
+        b.to_async(&runtime)
+            .iter(|| async { vault.retrieve(&id).await.unwrap() });
     });
 }
 

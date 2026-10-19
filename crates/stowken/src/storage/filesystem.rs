@@ -81,8 +81,7 @@ impl FilesystemBackend {
                 StorageError::IoError(e)
             }
         })?;
-        serde_json::from_slice(&data)
-            .map_err(|e| StorageError::SerializationError(e.to_string()))
+        serde_json::from_slice(&data).map_err(|e| StorageError::SerializationError(e.to_string()))
     }
 
     async fn write_meta(&self, hash: &SegmentHash, meta: &SegmentMeta) -> StorageResult<()> {
@@ -224,8 +223,7 @@ impl StorageBackend for FilesystemBackend {
                 StorageError::IoError(e)
             }
         })?;
-        serde_json::from_slice(&data)
-            .map_err(|e| StorageError::SerializationError(e.to_string()))
+        serde_json::from_slice(&data).map_err(|e| StorageError::SerializationError(e.to_string()))
     }
 
     async fn delete_manifest(&self, id: &str) -> StorageResult<()> {
@@ -249,8 +247,10 @@ impl StorageBackend for FilesystemBackend {
             if name_str.ends_with(".json") {
                 let id = name_str.trim_end_matches(".json").to_owned();
                 // Apply filters — read manifests only when needed
-                if query.model.is_some() || query.application.is_some()
-                    || query.date_from.is_some() || query.date_to.is_some()
+                if query.model.is_some()
+                    || query.application.is_some()
+                    || query.date_from.is_some()
+                    || query.date_to.is_some()
                 {
                     if let Ok(manifest) = self.get_manifest(&id).await {
                         if let Some(m) = &query.model {
@@ -281,7 +281,11 @@ impl StorageBackend for FilesystemBackend {
             }
         }
 
-        Ok(ids.into_iter().skip(offset as usize).take(limit as usize).collect())
+        Ok(ids
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
     }
 
     async fn list_garbage(&self) -> StorageResult<Vec<SegmentHash>> {
@@ -451,7 +455,11 @@ mod tests {
     #[tokio::test]
     async fn missing_segment_returns_error() {
         let (b, _dir) = backend().await;
-        let result = b.get_segment(&SegmentHash("nonexistent0011223344556677889900112233445566778899".to_owned())).await;
+        let result = b
+            .get_segment(&SegmentHash(
+                "nonexistent0011223344556677889900112233445566778899".to_owned(),
+            ))
+            .await;
         assert!(matches!(result, Err(StorageError::SegmentNotFound(_))));
     }
 
@@ -491,8 +499,14 @@ mod tests {
 
         let deleted = b.garbage_collect().await.unwrap();
         assert_eq!(deleted, 1, "exactly one segment should be GC'd");
-        assert!(!b.has_segment(&seg_a.hash).await.unwrap(), "A should be gone");
-        assert!(b.has_segment(&seg_b.hash).await.unwrap(), "B should survive");
+        assert!(
+            !b.has_segment(&seg_a.hash).await.unwrap(),
+            "A should be gone"
+        );
+        assert!(
+            b.has_segment(&seg_b.hash).await.unwrap(),
+            "B should survive"
+        );
     }
 
     #[tokio::test]
@@ -516,11 +530,16 @@ mod tests {
         {
             let b = FilesystemBackend::new(dir.path()).await.unwrap();
             b.put_segment(&make_segment(HASH_A)).await.unwrap();
-            b.put_manifest(&make_manifest("durable-conv")).await.unwrap();
+            b.put_manifest(&make_manifest("durable-conv"))
+                .await
+                .unwrap();
         } // backend dropped here
 
         let b2 = FilesystemBackend::new(dir.path()).await.unwrap();
-        assert!(b2.has_segment(&hash).await.unwrap(), "segment missing after reopen");
+        assert!(
+            b2.has_segment(&hash).await.unwrap(),
+            "segment missing after reopen"
+        );
         let fetched = b2.get_segment(&hash).await.unwrap();
         assert_eq!(fetched.compressed_data, vec![1, 2, 3, 4, 5]);
         let manifest = b2.get_manifest("durable-conv").await.unwrap();
@@ -649,9 +668,15 @@ mod tests {
         let before = b.storage_size_bytes().await.unwrap();
 
         let payload = vec![0u8; 512];
-        b.put_segment(&make_segment_with_data(HASH_A, payload.clone())).await.unwrap();
-        b.put_segment(&make_segment_with_data(HASH_B, payload.clone())).await.unwrap();
-        b.put_segment(&make_segment_with_data(HASH_C, payload.clone())).await.unwrap();
+        b.put_segment(&make_segment_with_data(HASH_A, payload.clone()))
+            .await
+            .unwrap();
+        b.put_segment(&make_segment_with_data(HASH_B, payload.clone()))
+            .await
+            .unwrap();
+        b.put_segment(&make_segment_with_data(HASH_C, payload.clone()))
+            .await
+            .unwrap();
 
         let after = b.storage_size_bytes().await.unwrap();
         // Each segment file is 512 bytes; meta files add a little extra.
@@ -659,7 +684,8 @@ mod tests {
         assert!(
             after >= before + 3 * 512,
             "expected at least 1536 more bytes, got {} → {}",
-            before, after
+            before,
+            after
         );
     }
 
@@ -675,7 +701,9 @@ mod tests {
         for i in 0u32..n {
             let hash = format!("{:0>64x}", (i as u64).wrapping_mul(0x9e3779b97f4a7c15u64));
             let data: Vec<u8> = (0..128).map(|j| ((i * 17 + j) % 256) as u8).collect();
-            b.put_segment(&make_segment_with_data(&hash, data.clone())).await.unwrap();
+            b.put_segment(&make_segment_with_data(&hash, data.clone()))
+                .await
+                .unwrap();
             hashes.push((hash, data));
         }
 
@@ -683,7 +711,10 @@ mod tests {
         for (hash, expected_data) in &hashes {
             let h = SegmentHash(hash.clone());
             let fetched = b.get_segment(&h).await.unwrap();
-            assert_eq!(&fetched.compressed_data, expected_data, "data mismatch for {hash}");
+            assert_eq!(
+                &fetched.compressed_data, expected_data,
+                "data mismatch for {hash}"
+            );
         }
 
         // GC with all ref_counts=1 should delete nothing.
@@ -704,7 +735,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let backend = FilesystemBackend::new(dir.path()).await.unwrap();
         let db_path = dir.path().join("meta.db").to_str().unwrap().to_owned();
-        let vault = Stowken::open(backend, StowkenConfig::default(), &db_path).await.unwrap();
+        let vault = Stowken::open(backend, StowkenConfig::default(), &db_path)
+            .await
+            .unwrap();
 
         let tokens: Vec<u32> = (0u32..100).collect();
         let conv = Conversation {
@@ -748,7 +781,9 @@ mod tests {
         // Session 1: store a conversation.
         {
             let backend = FilesystemBackend::new(dir.path()).await.unwrap();
-            let vault = Stowken::open(backend, StowkenConfig::default(), &db_path).await.unwrap();
+            let vault = Stowken::open(backend, StowkenConfig::default(), &db_path)
+                .await
+                .unwrap();
             let conv = Conversation {
                 id: Some("persist-test".to_owned()),
                 model: "gpt-4".to_owned(),
@@ -768,9 +803,14 @@ mod tests {
         // Session 2: open fresh vault on same directory, data must still be there.
         {
             let backend = FilesystemBackend::new(dir.path()).await.unwrap();
-            let vault = Stowken::open(backend, StowkenConfig::default(), &db_path).await.unwrap();
+            let vault = Stowken::open(backend, StowkenConfig::default(), &db_path)
+                .await
+                .unwrap();
             let retrieved = vault.retrieve("persist-test").await.unwrap();
-            assert_eq!(retrieved.segments[0].tokens, tokens, "data corrupted across reopen");
+            assert_eq!(
+                retrieved.segments[0].tokens, tokens,
+                "data corrupted across reopen"
+            );
         }
     }
 }

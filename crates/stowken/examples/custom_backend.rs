@@ -12,8 +12,8 @@ use tokio::sync::RwLock;
 use stowken::{
     storage::{StorageBackend, StorageError, StorageResult},
     types::{
-        AnalyticsQuery, Conversation, ConversationManifest, Message, MessageContent,
-        SegmentHash, StoredSegment, StowkenConfig,
+        AnalyticsQuery, Conversation, ConversationManifest, Message, MessageContent, SegmentHash,
+        StoredSegment, StowkenConfig,
     },
     Stowken,
 };
@@ -88,7 +88,10 @@ impl StorageBackend for MyBackend {
     }
 
     async fn put_manifest(&self, manifest: &ConversationManifest) -> StorageResult<()> {
-        self.manifests.write().await.insert(manifest.id.clone(), manifest.clone());
+        self.manifests
+            .write()
+            .await
+            .insert(manifest.id.clone(), manifest.clone());
         Ok(())
     }
 
@@ -113,7 +116,11 @@ impl StorageBackend for MyBackend {
         offset: u64,
     ) -> StorageResult<Vec<String>> {
         let ids: Vec<String> = self.manifests.read().await.keys().cloned().collect();
-        Ok(ids.into_iter().skip(offset as usize).take(limit as usize).collect())
+        Ok(ids
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
     }
 
     async fn garbage_collect(&self) -> StorageResult<u64> {
@@ -124,7 +131,13 @@ impl StorageBackend for MyBackend {
     }
 
     async fn storage_size_bytes(&self) -> StorageResult<u64> {
-        Ok(self.segments.read().await.values().map(|s| s.compressed_size as u64).sum())
+        Ok(self
+            .segments
+            .read()
+            .await
+            .values()
+            .map(|s| s.compressed_size as u64)
+            .sum())
     }
 }
 
@@ -147,7 +160,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let result = vault.store(conv).await?;
-    println!("Stored via custom backend: {} segments ({} new)", result.total_segments, result.new_segments);
+    println!(
+        "Stored via custom backend: {} segments ({} new)",
+        result.total_segments, result.new_segments
+    );
 
     let stats = vault.stats().await?;
     println!("Storage size: {} bytes", stats.storage_bytes);

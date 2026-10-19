@@ -44,9 +44,7 @@ use sk::{
 /// only ever use this on a thread that doesn't have an active runtime.
 fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        Runtime::new().expect("failed to construct shared tokio runtime")
-    })
+    RT.get_or_init(|| Runtime::new().expect("failed to construct shared tokio runtime"))
 }
 
 fn py_err(e: impl std::fmt::Display) -> PyErr {
@@ -144,10 +142,17 @@ fn parse_message(obj: &pyo3::Bound<'_, PyAny>) -> PyResult<Message> {
     };
 
     let name: Option<String> = obj.get_item("name").ok().and_then(|v| v.extract().ok());
-    let tool_call_id: Option<String> =
-        obj.get_item("tool_call_id").ok().and_then(|v| v.extract().ok());
+    let tool_call_id: Option<String> = obj
+        .get_item("tool_call_id")
+        .ok()
+        .and_then(|v| v.extract().ok());
 
-    Ok(Message { role, content, name, tool_call_id })
+    Ok(Message {
+        role,
+        content,
+        name,
+        tool_call_id,
+    })
 }
 
 fn parse_conversation(dict: &pyo3::Bound<'_, PyDict>) -> PyResult<Conversation> {
@@ -161,8 +166,7 @@ fn parse_conversation(dict: &pyo3::Bound<'_, PyDict>) -> PyResult<Conversation> 
         .and_then(|v| v.extract().ok())
         .unwrap_or_else(|| "cl100k_base".to_owned());
 
-    let application: Option<String> =
-        dict.get_item("application")?.and_then(|v| v.extract().ok());
+    let application: Option<String> = dict.get_item("application")?.and_then(|v| v.extract().ok());
 
     let id: Option<String> = dict.get_item("id")?.and_then(|v| v.extract().ok());
 
@@ -197,7 +201,14 @@ fn parse_conversation(dict: &pyo3::Bound<'_, PyDict>) -> PyResult<Conversation> 
         _ => None,
     };
 
-    Ok(Conversation { id, model, tokenizer, application, metadata, messages })
+    Ok(Conversation {
+        id,
+        model,
+        tokenizer,
+        application,
+        metadata,
+        messages,
+    })
 }
 
 // ── Result-shaping helpers (used by both sync and async paths) ───────────────
@@ -252,10 +263,7 @@ fn build_retrieve_dict(
     Ok(dict.into())
 }
 
-fn build_chunk_result_dict(
-    py: Python<'_>,
-    result: &sk::types::ChunkResult,
-) -> PyResult<PyObject> {
+fn build_chunk_result_dict(py: Python<'_>, result: &sk::types::ChunkResult) -> PyResult<PyObject> {
     let dict = PyDict::new_bound(py);
     dict.set_item("id", &result.id)?;
     if let Some(app) = &result.application {
@@ -286,7 +294,10 @@ fn build_chunk_result_dict(
         let sd = PyDict::new_bound(py);
         sd.set_item("segment_type", seg.segment_type.to_string())?;
         sd.set_item("hash", &seg.hash.0)?;
-        sd.set_item("compressed_data", PyBytes::new_bound(py, &seg.compressed_data))?;
+        sd.set_item(
+            "compressed_data",
+            PyBytes::new_bound(py, &seg.compressed_data),
+        )?;
         sd.set_item("token_count", seg.token_count)?;
         sd.set_item("raw_size", seg.raw_size)?;
         sd.set_item("position", seg.position)?;
@@ -296,10 +307,7 @@ fn build_chunk_result_dict(
     Ok(dict.into())
 }
 
-fn build_conversation_text(
-    py: Python<'_>,
-    ct: &sk::types::ConversationText,
-) -> PyResult<PyObject> {
+fn build_conversation_text(py: Python<'_>, ct: &sk::types::ConversationText) -> PyResult<PyObject> {
     let dict = PyDict::new_bound(py);
     dict.set_item("conversation_id", &ct.conversation_id)?;
     dict.set_item("model", &ct.model)?;
@@ -337,10 +345,7 @@ fn build_segment_stats_list(
     Ok(list.into())
 }
 
-fn build_reindex_dict(
-    py: Python<'_>,
-    report: &sk::types::ReindexStats,
-) -> PyResult<PyObject> {
+fn build_reindex_dict(py: Python<'_>, report: &sk::types::ReindexStats) -> PyResult<PyObject> {
     let dict = PyDict::new_bound(py);
     dict.set_item("conversations_indexed", report.conversations_indexed)?;
     dict.set_item("unique_segments_indexed", report.unique_segments_indexed)?;
@@ -560,9 +565,7 @@ async fn vault_find_near_duplicates(
     }
 }
 
-async fn vault_near_dedup_index_size(
-    inner: &VaultKind,
-) -> Result<u64, sk::vault::StowkenError> {
+async fn vault_near_dedup_index_size(inner: &VaultKind) -> Result<u64, sk::vault::StowkenError> {
     match inner {
         VaultKind::Memory(v) => v.near_dedup_index_size().await,
         VaultKind::Filesystem(v) => v.near_dedup_index_size().await,
@@ -636,10 +639,7 @@ fn vault_list_dicts(inner: &VaultKind) -> Vec<sk::dict_registry::DictInfo> {
     }
 }
 
-fn build_dict_info_dict(
-    py: Python<'_>,
-    info: &sk::dict_registry::DictInfo,
-) -> PyResult<PyObject> {
+fn build_dict_info_dict(py: Python<'_>, info: &sk::dict_registry::DictInfo) -> PyResult<PyObject> {
     let dict = PyDict::new_bound(py);
     dict.set_item("id", info.id)?;
     dict.set_item("created_at", info.created_at.to_rfc3339())?;
@@ -726,10 +726,7 @@ mod semantic_bridge {
 }
 
 #[cfg(feature = "semantic-search")]
-fn vault_set_embedding_adapter(
-    inner: &VaultKind,
-    adapter: semantic_bridge::PyEmbeddingAdapter,
-) {
+fn vault_set_embedding_adapter(inner: &VaultKind, adapter: semantic_bridge::PyEmbeddingAdapter) {
     match inner {
         VaultKind::Memory(v) => v.set_embedding_adapter(adapter),
         VaultKind::Filesystem(v) => v.set_embedding_adapter(adapter),
@@ -738,10 +735,7 @@ fn vault_set_embedding_adapter(
 }
 
 #[cfg(feature = "semantic-search")]
-fn vault_set_summarizer(
-    inner: &VaultKind,
-    adapter: semantic_bridge::PySummarizerAdapter,
-) {
+fn vault_set_summarizer(inner: &VaultKind, adapter: semantic_bridge::PySummarizerAdapter) {
     match inner {
         VaultKind::Memory(v) => v.set_summarizer(adapter),
         VaultKind::Filesystem(v) => v.set_summarizer(adapter),
@@ -893,10 +887,7 @@ fn shape_embed_stats(py: Python<'_>, s: &sk::types::EmbedStats) -> PyResult<PyOb
 }
 
 #[cfg(feature = "semantic-search")]
-fn shape_clusters(
-    py: Python<'_>,
-    cs: &[sk::types::ConversationCluster],
-) -> PyResult<PyObject> {
+fn shape_clusters(py: Python<'_>, cs: &[sk::types::ConversationCluster]) -> PyResult<PyObject> {
     let list = PyList::empty_bound(py);
     for c in cs {
         let d = PyDict::new_bound(py);
@@ -910,10 +901,7 @@ fn shape_clusters(
 }
 
 #[cfg(feature = "semantic-search")]
-fn shape_outliers(
-    py: Python<'_>,
-    os: &[sk::types::OutlierConversation],
-) -> PyResult<PyObject> {
+fn shape_outliers(py: Python<'_>, os: &[sk::types::OutlierConversation]) -> PyResult<PyObject> {
     let list = PyList::empty_bound(py);
     for o in os {
         let d = PyDict::new_bound(py);
@@ -1017,7 +1005,9 @@ impl PyStowken {
         let inner = runtime()
             .block_on(Stowken::new(backend, config))
             .map_err(py_err)?;
-        Ok(Self { inner: Arc::new(VaultKind::Memory(inner)) })
+        Ok(Self {
+            inner: Arc::new(VaultKind::Memory(inner)),
+        })
     }
 
     /// Open an S3-backed vault.
@@ -1082,7 +1072,9 @@ impl PyStowken {
                     .map_err(|e| e.to_string())
             })
             .map_err(PyRuntimeError::new_err)?;
-        Ok(Self { inner: Arc::new(VaultKind::S3(inner)) })
+        Ok(Self {
+            inner: Arc::new(VaultKind::S3(inner)),
+        })
     }
 
     /// Open a filesystem-backed vault rooted at `path`.
@@ -1104,13 +1096,17 @@ impl PyStowken {
         let db_path = format!("{}/metadata.db", path.trim_end_matches('/'));
         let inner = runtime()
             .block_on(async move {
-                let backend = FilesystemBackend::new(&path).await.map_err(|e| e.to_string())?;
+                let backend = FilesystemBackend::new(&path)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Stowken::open(backend, config, &db_path)
                     .await
                     .map_err(|e| e.to_string())
             })
             .map_err(PyRuntimeError::new_err)?;
-        Ok(Self { inner: Arc::new(VaultKind::Filesystem(inner)) })
+        Ok(Self {
+            inner: Arc::new(VaultKind::Filesystem(inner)),
+        })
     }
 
     // ── store ────────────────────────────────────────────────────────────────
@@ -1244,7 +1240,9 @@ impl PyStowken {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-            let results = vault_retrieve_batch(&inner, &id_refs).await.map_err(py_err)?;
+            let results = vault_retrieve_batch(&inner, &id_refs)
+                .await
+                .map_err(py_err)?;
             Python::with_gil(|py| {
                 let list = PyList::empty_bound(py);
                 for ct in &results {
@@ -1258,14 +1256,12 @@ impl PyStowken {
     // ── delete ───────────────────────────────────────────────────────────────
 
     fn delete(&self, _py: Python<'_>, id: &str) -> PyResult<()> {
-        runtime().block_on(vault_delete(&self.inner, id)).map_err(py_err)
+        runtime()
+            .block_on(vault_delete(&self.inner, id))
+            .map_err(py_err)
     }
 
-    fn delete_async<'py>(
-        &self,
-        py: Python<'py>,
-        id: String,
-    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+    fn delete_async<'py>(&self, py: Python<'py>, id: String) -> PyResult<pyo3::Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             vault_delete(&inner, &id).await.map_err(py_err)?;
@@ -1276,7 +1272,9 @@ impl PyStowken {
     // ── stats ────────────────────────────────────────────────────────────────
 
     fn stats(&self, _py: Python<'_>) -> PyResult<TokenUsageStats> {
-        let s = runtime().block_on(vault_stats(&self.inner)).map_err(py_err)?;
+        let s = runtime()
+            .block_on(vault_stats(&self.inner))
+            .map_err(py_err)?;
         Ok(shape_token_stats(s))
     }
 
@@ -1336,7 +1334,9 @@ impl PyStowken {
     // ── reindex ──────────────────────────────────────────────────────────────
 
     fn reindex(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let report = runtime().block_on(vault_reindex(&self.inner)).map_err(py_err)?;
+        let report = runtime()
+            .block_on(vault_reindex(&self.inner))
+            .map_err(py_err)?;
         build_reindex_dict(py, &report)
     }
 
@@ -1363,7 +1363,11 @@ impl PyStowken {
         min_occurrences: u32,
     ) -> PyResult<PyObject> {
         let promoted = runtime()
-            .block_on(vault_train_substrings(&self.inner, samples, min_occurrences))
+            .block_on(vault_train_substrings(
+                &self.inner,
+                samples,
+                min_occurrences,
+            ))
             .map_err(py_err)?;
         build_substring_info_list(py, &promoted)
     }
@@ -1377,10 +1381,9 @@ impl PyStowken {
     ) -> PyResult<pyo3::Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let promoted =
-                vault_train_substrings(&inner, samples, min_occurrences)
-                    .await
-                    .map_err(py_err)?;
+            let promoted = vault_train_substrings(&inner, samples, min_occurrences)
+                .await
+                .map_err(py_err)?;
             Python::with_gil(|py| build_substring_info_list(py, &promoted))
         })
     }
@@ -1414,10 +1417,7 @@ impl PyStowken {
         Ok(dict.into())
     }
 
-    fn compact_substrings_async<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+    fn compact_substrings_async<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let report = vault_compact_substrings(&inner).await.map_err(py_err)?;
@@ -1446,10 +1446,7 @@ impl PyStowken {
         Ok(dict.into())
     }
 
-    fn gc_substrings_async<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<pyo3::Bound<'py, PyAny>> {
+    fn gc_substrings_async<'py>(&self, py: Python<'py>) -> PyResult<pyo3::Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let report = vault_gc_substrings(&inner).await.map_err(py_err)?;
@@ -1478,7 +1475,12 @@ impl PyStowken {
         limit: u64,
     ) -> PyResult<PyObject> {
         let clusters = runtime()
-            .block_on(vault_find_near_duplicates(&self.inner, threshold, min_refs, limit))
+            .block_on(vault_find_near_duplicates(
+                &self.inner,
+                threshold,
+                min_refs,
+                limit,
+            ))
             .map_err(py_err)?;
         build_near_dup_clusters(py, &clusters)
     }
@@ -1493,10 +1495,9 @@ impl PyStowken {
     ) -> PyResult<pyo3::Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let clusters =
-                vault_find_near_duplicates(&inner, threshold, min_refs, limit)
-                    .await
-                    .map_err(py_err)?;
+            let clusters = vault_find_near_duplicates(&inner, threshold, min_refs, limit)
+                .await
+                .map_err(py_err)?;
             Python::with_gil(|py| build_near_dup_clusters(py, &clusters))
         })
     }
@@ -1553,7 +1554,9 @@ impl PyStowken {
         let inner = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let info = if activate {
-                vault_train_and_activate_dict(&inner, samples).await.map_err(py_err)?
+                vault_train_and_activate_dict(&inner, samples)
+                    .await
+                    .map_err(py_err)?
             } else {
                 vault_train_dict(&inner, samples).await.map_err(py_err)?
             };
@@ -1789,7 +1792,12 @@ impl PyStowken {
         limit: usize,
     ) -> PyResult<PyObject> {
         let hits = runtime()
-            .block_on(vault_typed_search(&self.inner, "user_questions", &text, limit))
+            .block_on(vault_typed_search(
+                &self.inner,
+                "user_questions",
+                &text,
+                limit,
+            ))
             .map_err(py_err)?;
         shape_hits(py, &hits)
     }
@@ -1812,7 +1820,12 @@ impl PyStowken {
         limit: usize,
     ) -> PyResult<PyObject> {
         let hits = runtime()
-            .block_on(vault_typed_search(&self.inner, "conversations", &text, limit))
+            .block_on(vault_typed_search(
+                &self.inner,
+                "conversations",
+                &text,
+                limit,
+            ))
             .map_err(py_err)?;
         shape_hits(py, &hits)
     }

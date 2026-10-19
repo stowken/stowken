@@ -42,7 +42,9 @@ impl MetadataIndex {
     /// Open (or create) the metadata database at `path`.
     pub fn open(path: &str) -> MetadataResult<Self> {
         let conn = Connection::open(path)?;
-        let idx = Self { conn: Arc::new(Mutex::new(conn)) };
+        let idx = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
         idx.initialize()?;
         Ok(idx)
     }
@@ -50,7 +52,9 @@ impl MetadataIndex {
     /// Open an in-memory database (for testing / memory backend).
     pub fn open_in_memory() -> MetadataResult<Self> {
         let conn = Connection::open_in_memory()?;
-        let idx = Self { conn: Arc::new(Mutex::new(conn)) };
+        let idx = Self {
+            conn: Arc::new(Mutex::new(conn)),
+        };
         idx.initialize()?;
         Ok(idx)
     }
@@ -162,7 +166,10 @@ impl MetadataIndex {
             ],
         )?;
 
-        conn.execute("DELETE FROM segment_refs WHERE conversation_id = ?1", params![manifest.id])?;
+        conn.execute(
+            "DELETE FROM segment_refs WHERE conversation_id = ?1",
+            params![manifest.id],
+        )?;
         for seg_ref in &manifest.segments {
             conn.execute(
                 "INSERT INTO segment_refs \
@@ -259,7 +266,10 @@ impl MetadataIndex {
     /// Remove a conversation from the index.
     pub fn remove_conversation(&self, id: &str) -> MetadataResult<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM segment_refs WHERE conversation_id = ?1", params![id])?;
+        conn.execute(
+            "DELETE FROM segment_refs WHERE conversation_id = ?1",
+            params![id],
+        )?;
         conn.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -285,18 +295,33 @@ impl MetadataIndex {
 
         let total_conversations: i64 =
             conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
-        let total_tokens: i64 =
-            conn.query_row("SELECT COALESCE(SUM(total_tokens), 0) FROM conversations", [], |r| r.get(0))?;
+        let total_tokens: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(total_tokens), 0) FROM conversations",
+            [],
+            |r| r.get(0),
+        )?;
         let unique_segments: i64 =
             conn.query_row("SELECT COUNT(*) FROM segments_meta", [], |r| r.get(0))?;
-        let total_segments: i64 =
-            conn.query_row("SELECT COALESCE(SUM(ref_count), 0) FROM segments_meta", [], |r| r.get(0))?;
-        let storage_bytes: i64 =
-            conn.query_row("SELECT COALESCE(SUM(compressed_size), 0) FROM segments_meta", [], |r| r.get(0))?;
-        let naive_bytes: i64 =
-            conn.query_row("SELECT COALESCE(SUM(CAST(raw_size AS INTEGER) * ref_count), 0) FROM segments_meta", [], |r| r.get(0))?;
-        let raw_bytes: i64 =
-            conn.query_row("SELECT COALESCE(SUM(raw_size), 0) FROM segments_meta", [], |r| r.get(0))?;
+        let total_segments: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(ref_count), 0) FROM segments_meta",
+            [],
+            |r| r.get(0),
+        )?;
+        let storage_bytes: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(compressed_size), 0) FROM segments_meta",
+            [],
+            |r| r.get(0),
+        )?;
+        let naive_bytes: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(CAST(raw_size AS INTEGER) * ref_count), 0) FROM segments_meta",
+            [],
+            |r| r.get(0),
+        )?;
+        let raw_bytes: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(raw_size), 0) FROM segments_meta",
+            [],
+            |r| r.get(0),
+        )?;
 
         let dedup_ratio = if total_segments == 0 {
             0.0
@@ -358,7 +383,11 @@ impl MetadataIndex {
             let seg_type: SegmentType = type_str
                 .parse()
                 .map_err(|e: String| MetadataError::Parse(e))?;
-            let dedup_ratio = if refs == 0 { 0.0 } else { 1.0 - unique as f64 / refs as f64 };
+            let dedup_ratio = if refs == 0 {
+                0.0
+            } else {
+                1.0 - unique as f64 / refs as f64
+            };
             stats.push(SegmentTypeStats {
                 segment_type: seg_type,
                 unique_count: unique as u64,
@@ -414,9 +443,8 @@ impl MetadataIndex {
     /// Conversations referencing a specific segment hash.
     pub fn find_conversations_by_segment(&self, hash: &SegmentHash) -> MetadataResult<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT conversation_id FROM segment_refs WHERE segment_hash = ?1",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT conversation_id FROM segment_refs WHERE segment_hash = ?1")?;
         let ids = stmt
             .query_map(params![hash.0], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -672,8 +700,10 @@ impl MetadataIndex {
              WHERE sr.segment_hash IN ({})",
             placeholders.join(",")
         );
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
-            hashes.iter().map(|h| Box::new(h.0.clone()) as Box<dyn rusqlite::ToSql>).collect();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = hashes
+            .iter()
+            .map(|h| Box::new(h.0.clone()) as Box<dyn rusqlite::ToSql>)
+            .collect();
         if let Some(m) = filter_model {
             sql.push_str(" AND c.model = ?");
             params_vec.push(Box::new(m.to_owned()));
@@ -695,8 +725,7 @@ impl MetadataIndex {
             params_vec.push(Box::new(to.to_rfc3339()));
         }
         let mut stmt = conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|b| b.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
         let rows = stmt
             .query_map(rusqlite::params_from_iter(param_refs), |r| {
                 let st_str: String = r.get(2)?;
@@ -819,8 +848,10 @@ impl MetadataIndex {
              WHERE id IN ({})",
             placeholders.join(",")
         );
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
-            ids.iter().map(|i| Box::new(i.clone()) as Box<dyn rusqlite::ToSql>).collect();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = ids
+            .iter()
+            .map(|i| Box::new(i.clone()) as Box<dyn rusqlite::ToSql>)
+            .collect();
         if let Some(m) = filter_model {
             sql.push_str(" AND model = ?");
             params_vec.push(Box::new(m.to_owned()));
@@ -838,8 +869,7 @@ impl MetadataIndex {
             params_vec.push(Box::new(to.to_rfc3339()));
         }
         let mut stmt = conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|b| b.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
         let rows = stmt
             .query_map(rusqlite::params_from_iter(param_refs), |r| {
                 let created: String = r.get(3)?;
@@ -1053,7 +1083,9 @@ mod tests {
         idx.upsert_segment(&make_stored_seg()).unwrap();
         idx.index_conversation(&make_manifest("conv-1")).unwrap();
         idx.index_conversation(&make_manifest("conv-2")).unwrap();
-        let ids = idx.find_conversations_by_segment(&SegmentHash("abc123".to_owned())).unwrap();
+        let ids = idx
+            .find_conversations_by_segment(&SegmentHash("abc123".to_owned()))
+            .unwrap();
         assert_eq!(ids.len(), 2);
     }
 

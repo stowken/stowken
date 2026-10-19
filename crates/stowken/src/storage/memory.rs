@@ -104,7 +104,9 @@ impl StorageBackend for MemoryBackend {
 
     async fn put_manifest(&self, manifest: &ConversationManifest) -> StorageResult<()> {
         let mut state = self.state.write().await;
-        state.manifests.insert(manifest.id.clone(), manifest.clone());
+        state
+            .manifests
+            .insert(manifest.id.clone(), manifest.clone());
         Ok(())
     }
 
@@ -184,7 +186,11 @@ impl StorageBackend for MemoryBackend {
 
     async fn storage_size_bytes(&self) -> StorageResult<u64> {
         let state = self.state.read().await;
-        let total: u64 = state.segments.values().map(|s| s.compressed_size as u64).sum();
+        let total: u64 = state
+            .segments
+            .values()
+            .map(|s| s.compressed_size as u64)
+            .sum();
         Ok(total)
     }
 }
@@ -233,7 +239,10 @@ mod tests {
         let backend = MemoryBackend::new();
         let seg = make_segment("abc123", 1);
         backend.put_segment(&seg).await.unwrap();
-        let fetched = backend.get_segment(&SegmentHash("abc123".to_owned())).await.unwrap();
+        let fetched = backend
+            .get_segment(&SegmentHash("abc123".to_owned()))
+            .await
+            .unwrap();
         assert_eq!(fetched.token_count, 10);
     }
 
@@ -243,7 +252,10 @@ mod tests {
         let seg = make_segment("abc123", 1);
         backend.put_segment(&seg).await.unwrap();
         backend.put_segment(&seg).await.unwrap();
-        let fetched = backend.get_segment(&SegmentHash("abc123".to_owned())).await.unwrap();
+        let fetched = backend
+            .get_segment(&SegmentHash("abc123".to_owned()))
+            .await
+            .unwrap();
         assert_eq!(fetched.ref_count, 2);
     }
 
@@ -252,7 +264,10 @@ mod tests {
         let backend = MemoryBackend::new();
         let seg = make_segment("abc123", 1);
         backend.put_segment(&seg).await.unwrap();
-        let zero = backend.decrement_ref(&SegmentHash("abc123".to_owned())).await.unwrap();
+        let zero = backend
+            .decrement_ref(&SegmentHash("abc123".to_owned()))
+            .await
+            .unwrap();
         assert!(zero);
     }
 
@@ -261,10 +276,16 @@ mod tests {
         let backend = MemoryBackend::new();
         let seg = make_segment("abc123", 1);
         backend.put_segment(&seg).await.unwrap();
-        backend.decrement_ref(&SegmentHash("abc123".to_owned())).await.unwrap();
+        backend
+            .decrement_ref(&SegmentHash("abc123".to_owned()))
+            .await
+            .unwrap();
         let deleted = backend.garbage_collect().await.unwrap();
         assert_eq!(deleted, 1);
-        assert!(!backend.has_segment(&SegmentHash("abc123".to_owned())).await.unwrap());
+        assert!(!backend
+            .has_segment(&SegmentHash("abc123".to_owned()))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -279,7 +300,9 @@ mod tests {
     #[tokio::test]
     async fn missing_segment_returns_error() {
         let backend = MemoryBackend::new();
-        let result = backend.get_segment(&SegmentHash("nonexistent".to_owned())).await;
+        let result = backend
+            .get_segment(&SegmentHash("nonexistent".to_owned()))
+            .await;
         assert!(matches!(result, Err(StorageError::SegmentNotFound(_))));
     }
 }

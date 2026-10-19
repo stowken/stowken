@@ -292,7 +292,10 @@ impl CompressionPipeline {
             return Ok(None);
         }
         if rest.len() < 32 {
-            return Err(CompressionError::Truncated { expected: 32, got: rest.len() });
+            return Err(CompressionError::Truncated {
+                expected: 32,
+                got: rest.len(),
+            });
         }
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&rest[..32]);
@@ -364,12 +367,8 @@ impl CompressionPipeline {
                     });
                 }
                 let (id_bytes, payload) = rest.split_at(4);
-                let dict_id = u32::from_le_bytes([
-                    id_bytes[0],
-                    id_bytes[1],
-                    id_bytes[2],
-                    id_bytes[3],
-                ]);
+                let dict_id =
+                    u32::from_le_bytes([id_bytes[0], id_bytes[1], id_bytes[2], id_bytes[3]]);
 
                 let registry = self.registry.as_ref().ok_or_else(|| {
                     CompressionError::Decompress(format!(
@@ -394,7 +393,10 @@ impl CompressionPipeline {
     /// inline tokens directly and looking up substring refs from the
     /// registry.
     fn decompress_substring_frame(&self, body: &[u8]) -> Result<Vec<Token>, CompressionError> {
-        let registry = self.substrings.as_ref().ok_or(CompressionError::NoSubstringRegistry)?;
+        let registry = self
+            .substrings
+            .as_ref()
+            .ok_or(CompressionError::NoSubstringRegistry)?;
         let ops = decode_substring_frame(body)?;
         // Pre-allocate based on op count — a rough upper bound is enough
         // to avoid most reallocations.
@@ -466,14 +468,20 @@ impl CompressionPipeline {
     /// resolve to tokens, decode the delta, apply.
     fn decompress_delta(&self, body: &[u8]) -> Result<Vec<Token>, CompressionError> {
         if body.len() < 32 {
-            return Err(CompressionError::Truncated { expected: 32, got: body.len() });
+            return Err(CompressionError::Truncated {
+                expected: 32,
+                got: body.len(),
+            });
         }
         let (hash_bytes, delta_bytes) = body.split_at(32);
         let mut raw_hash = [0u8; 32];
         raw_hash.copy_from_slice(hash_bytes);
         let canonical_hash = crate::near_dedup::bytes_to_segment_hash(&raw_hash);
 
-        let resolver = self.resolver.as_ref().ok_or(CompressionError::NoCanonicalResolver)?;
+        let resolver = self
+            .resolver
+            .as_ref()
+            .ok_or(CompressionError::NoCanonicalResolver)?;
         let canonical_tokens = resolver.resolve(&canonical_hash)?;
 
         let ops = crate::near_dedup::decode_delta(delta_bytes)
@@ -533,7 +541,10 @@ mod tests {
     #[test]
     fn empty_frame_errors() {
         let pipeline = CompressionPipeline::new(true, 3);
-        assert!(matches!(pipeline.decompress(&[]), Err(CompressionError::EmptyFrame)));
+        assert!(matches!(
+            pipeline.decompress(&[]),
+            Err(CompressionError::EmptyFrame)
+        ));
     }
 
     #[test]
@@ -558,8 +569,7 @@ mod tests {
         let frame = pipeline.compress(&tokens).unwrap();
 
         assert_eq!(frame[0], FrameVersion::VarintZstdDict as u8);
-        let dict_id_in_frame =
-            u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]);
+        let dict_id_in_frame = u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]);
         assert_eq!(dict_id_in_frame, info.id);
 
         assert_eq!(pipeline.decompress(&frame).unwrap(), tokens);
@@ -591,12 +601,15 @@ mod tests {
         let frame_b = pipeline.compress(&tokens_b).unwrap();
 
         // Both frames must decompress correctly even though A is no longer active.
-        assert_eq!(pipeline.decompress(&frame_a).unwrap(), tokens_a, "old dict frame lost!");
+        assert_eq!(
+            pipeline.decompress(&frame_a).unwrap(),
+            tokens_a,
+            "old dict frame lost!"
+        );
         assert_eq!(pipeline.decompress(&frame_b).unwrap(), tokens_b);
 
         // And the second frame should be tagged with B's ID.
-        let id_in_frame_b =
-            u32::from_le_bytes([frame_b[1], frame_b[2], frame_b[3], frame_b[4]]);
+        let id_in_frame_b = u32::from_le_bytes([frame_b[1], frame_b[2], frame_b[3], frame_b[4]]);
         assert_eq!(id_in_frame_b, info_b.id);
     }
 
@@ -644,19 +657,14 @@ mod tests {
         }
         impl super::CanonicalResolver for StubResolver {
             fn resolve(&self, hash: &SegmentHash) -> Result<Vec<Token>, super::CompressionError> {
-                self.map
-                    .lock()
-                    .unwrap()
-                    .get(hash)
-                    .cloned()
-                    .ok_or_else(|| super::CompressionError::Decompress(format!("no canonical: {}", hash.0)))
+                self.map.lock().unwrap().get(hash).cloned().ok_or_else(|| {
+                    super::CompressionError::Decompress(format!("no canonical: {}", hash.0))
+                })
             }
         }
 
         let resolver = Arc::new(StubResolver {
-            map: Mutex::new(
-                std::iter::once((canonical_hash.clone(), canonical.clone())).collect(),
-            ),
+            map: Mutex::new(std::iter::once((canonical_hash.clone(), canonical.clone())).collect()),
         });
 
         let pipeline = CompressionPipeline::new(true, 3).with_resolver(resolver);
@@ -722,8 +730,8 @@ mod tests {
         let id_a = registry.register(chunk_a.clone(), 50).unwrap().id;
         let id_b = registry.register(chunk_b.clone(), 30).unwrap().id;
 
-        let pipeline = CompressionPipeline::new(true, 3)
-            .with_substring_registry(Arc::clone(&registry));
+        let pipeline =
+            CompressionPipeline::new(true, 3).with_substring_registry(Arc::clone(&registry));
 
         // Encode a frame that interleaves a Ref, an Inline run, and another Ref.
         let ops = vec![
@@ -752,14 +760,13 @@ mod tests {
     fn try_compress_substring_frame_returns_none_when_no_match() {
         use crate::substring_registry::SubstringRegistry;
         let registry = Arc::new(SubstringRegistry::in_memory());
-        registry
-            .register((0u32..32).collect(), 5)
-            .unwrap();
-        let pipeline =
-            CompressionPipeline::new(true, 3).with_substring_registry(registry);
+        registry.register((0u32..32).collect(), 5).unwrap();
+        let pipeline = CompressionPipeline::new(true, 3).with_substring_registry(registry);
         // No registered substring matches this prefix.
         let tokens: Vec<Token> = (90_000u32..90_064).collect();
-        let result = pipeline.try_compress_substring_frame(&tokens, 1024).unwrap();
+        let result = pipeline
+            .try_compress_substring_frame(&tokens, 1024)
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -767,11 +774,8 @@ mod tests {
     fn try_compress_substring_frame_returns_none_when_not_smaller() {
         use crate::substring_registry::SubstringRegistry;
         let registry = Arc::new(SubstringRegistry::in_memory());
-        registry
-            .register((0u32..32).collect(), 5)
-            .unwrap();
-        let pipeline =
-            CompressionPipeline::new(true, 3).with_substring_registry(registry);
+        registry.register((0u32..32).collect(), 5).unwrap();
+        let pipeline = CompressionPipeline::new(true, 3).with_substring_registry(registry);
         let tokens: Vec<Token> = (0u32..32).collect();
         // Pretend the fallback is ridiculously small — substring frame
         // can't beat that.
@@ -794,7 +798,9 @@ mod tests {
 
         // Fallback len of 1024 is more than enough for the substring frame
         // to beat (frame is ~5 bytes for the Ref + a tiny Inline run).
-        let result = pipeline.try_compress_substring_frame(&tokens, 1024).unwrap();
+        let result = pipeline
+            .try_compress_substring_frame(&tokens, 1024)
+            .unwrap();
         let frame = result.expect("substring frame should be smaller than fallback");
         assert_eq!(frame[0], FrameVersion::Substring as u8);
 

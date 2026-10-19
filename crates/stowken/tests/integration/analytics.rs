@@ -1,6 +1,9 @@
 use stowken::{
     storage::MemoryBackend,
-    types::{AnalyticsQuery, Conversation, ExportConfig, ExportFormat, Message, MessageContent, StowkenConfig},
+    types::{
+        AnalyticsQuery, Conversation, ExportConfig, ExportFormat, Message, MessageContent,
+        StowkenConfig,
+    },
     Stowken,
 };
 
@@ -33,9 +36,24 @@ async fn populated_vault() -> Stowken<MemoryBackend> {
         .await
         .unwrap();
 
-    vault.store(make_conv("a1", "gpt-4", "app-a", vec![1, 2], vec![3, 4])).await.unwrap();
-    vault.store(make_conv("a2", "gpt-4", "app-a", vec![5, 6], vec![7, 8])).await.unwrap();
-    vault.store(make_conv("b1", "gpt-3.5", "app-b", vec![9, 10], vec![11, 12])).await.unwrap();
+    vault
+        .store(make_conv("a1", "gpt-4", "app-a", vec![1, 2], vec![3, 4]))
+        .await
+        .unwrap();
+    vault
+        .store(make_conv("a2", "gpt-4", "app-a", vec![5, 6], vec![7, 8]))
+        .await
+        .unwrap();
+    vault
+        .store(make_conv(
+            "b1",
+            "gpt-3.5",
+            "app-b",
+            vec![9, 10],
+            vec![11, 12],
+        ))
+        .await
+        .unwrap();
     vault
 }
 
@@ -115,7 +133,10 @@ async fn export_training_data_jsonl() {
     // Each line must be valid JSON with a "messages" key
     for line in &lines {
         let parsed: serde_json::Value = serde_json::from_str(line).expect("invalid JSON line");
-        assert!(parsed["messages"].is_array(), "each line must have a 'messages' array");
+        assert!(
+            parsed["messages"].is_array(),
+            "each line must have a 'messages' array"
+        );
     }
 }
 
@@ -172,5 +193,8 @@ async fn export_deduplicates_pairs() {
         .unwrap();
 
     assert_eq!(stats.total_pairs, 2);
-    assert_eq!(stats.unique_pairs, 1, "dedup should yield 1 unique pair from 2 identical conversations");
+    assert_eq!(
+        stats.unique_pairs, 1,
+        "dedup should yield 1 unique pair from 2 identical conversations"
+    );
 }

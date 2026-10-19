@@ -71,10 +71,7 @@ async fn retrieve_segments_filtered_by_type() {
         .await
         .unwrap();
 
-    let conv = make_conversation(
-        "rt-3",
-        vec![vec![1u32, 2], vec![3u32, 4], vec![5u32, 6]],
-    );
+    let conv = make_conversation("rt-3", vec![vec![1u32, 2], vec![3u32, 4], vec![5u32, 6]]);
     let result = vault.store(conv).await.unwrap();
 
     let user_segs = vault
@@ -97,7 +94,10 @@ async fn delete_removes_conversation() {
     vault.delete(&result.id).await.unwrap();
 
     let retrieve_result = vault.retrieve(&result.id).await;
-    assert!(retrieve_result.is_err(), "deleted conversation should not be retrievable");
+    assert!(
+        retrieve_result.is_err(),
+        "deleted conversation should not be retrievable"
+    );
 }
 
 #[tokio::test]
@@ -107,14 +107,14 @@ async fn large_token_sequence_roundtrip() {
         .unwrap();
 
     // 10K tokens spanning all varint encoding ranges
-    let tokens: Vec<u32> = (0..10_000).map(|i| {
-        match i % 4 {
+    let tokens: Vec<u32> = (0..10_000)
+        .map(|i| match i % 4 {
             0 => i % 128,
             1 => 128 + (i % (16_383 - 128)),
             2 => 16_384 + (i % (2_097_151 - 16_384)),
             _ => 2_097_152 + (i % 100_000),
-        }
-    }).collect();
+        })
+        .collect();
 
     let conv = make_conversation("rt-5", vec![tokens.clone()]);
     let result = vault.store(conv).await.unwrap();
@@ -125,8 +125,8 @@ async fn large_token_sequence_roundtrip() {
 
 #[tokio::test]
 async fn roundtrip_with_filesystem_backend() {
-    use tempfile::TempDir;
     use stowken::storage::FilesystemBackend;
+    use tempfile::TempDir;
 
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("meta.db");
@@ -160,7 +160,10 @@ async fn retrieve_batch_returns_all_stored_conversations() {
 
     assert_eq!(results.len(), 4, "should return one entry per stored id");
     for r in &results {
-        assert!(ids.contains(&r.conversation_id), "returned id should be one we stored");
+        assert!(
+            ids.contains(&r.conversation_id),
+            "returned id should be one we stored"
+        );
         assert!(!r.text.is_empty(), "text should be non-empty");
         assert!(!r.turns.is_empty(), "turns should be non-empty");
     }
@@ -191,20 +194,29 @@ async fn retrieve_batch_text_contains_role_markers() {
         .unwrap();
 
     // Store a minimal conversation with known structure
-    let conv = make_conversation("markers", vec![
-        vec![1u32, 2],   // system
-        vec![3u32, 4],   // user
-        vec![5u32, 6],   // assistant
-    ]);
+    let conv = make_conversation(
+        "markers",
+        vec![
+            vec![1u32, 2], // system
+            vec![3u32, 4], // user
+            vec![5u32, 6], // assistant
+        ],
+    );
     vault.store(conv).await.unwrap();
 
     let results = vault.retrieve_batch(&["markers"]).await.unwrap();
     assert_eq!(results.len(), 1);
 
     let text = &results[0].text;
-    assert!(text.contains("[system]"),    "text should contain [system] marker");
-    assert!(text.contains("[user]"),      "text should contain [user] marker");
-    assert!(text.contains("[assistant]"), "text should contain [assistant] marker");
+    assert!(
+        text.contains("[system]"),
+        "text should contain [system] marker"
+    );
+    assert!(text.contains("[user]"), "text should contain [user] marker");
+    assert!(
+        text.contains("[assistant]"),
+        "text should contain [assistant] marker"
+    );
 
     let turns = &results[0].turns;
     assert_eq!(turns.len(), 3, "should have 3 turns");

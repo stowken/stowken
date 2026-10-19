@@ -108,9 +108,8 @@ fn decode_one(data: &[u8], base_offset: usize) -> Result<(Token, usize), DecodeE
         if data.len() < 3 {
             return Err(DecodeError::Truncated(base_offset));
         }
-        let val = ((u32::from(first & 0x1F)) << 16)
-            | (u32::from(data[1]) << 8)
-            | u32::from(data[2]);
+        let val =
+            ((u32::from(first & 0x1F)) << 16) | (u32::from(data[1]) << 8) | u32::from(data[2]);
         Ok((val, 3))
     } else if first == 0xFF {
         // 5-byte escape: raw big-endian u32
@@ -139,7 +138,11 @@ mod tests {
     fn roundtrip(tokens: &[Token]) {
         let encoded = encode_tokens(tokens);
         let decoded = decode_tokens(&encoded).expect("decode failed");
-        assert_eq!(tokens, decoded.as_slice(), "roundtrip mismatch for {tokens:?}");
+        assert_eq!(
+            tokens,
+            decoded.as_slice(),
+            "roundtrip mismatch for {tokens:?}"
+        );
     }
 
     #[test]
@@ -192,7 +195,10 @@ mod tests {
     fn truncated_stream_errors() {
         // A 2-byte encoding truncated to 1 byte
         let partial = vec![0b1000_0000u8]; // first byte of a 2-byte token, missing second
-        assert!(matches!(decode_tokens(&partial), Err(DecodeError::Truncated(_))));
+        assert!(matches!(
+            decode_tokens(&partial),
+            Err(DecodeError::Truncated(_))
+        ));
     }
 
     #[test]

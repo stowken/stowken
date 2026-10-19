@@ -60,21 +60,32 @@ async fn variant_stored_as_delta_round_trips() {
         .unwrap();
 
     let canonical: Vec<u32> = (0u32..200).collect();
-    vault.store(make_conv("canon", canonical.clone(), vec![1, 2, 3])).await.unwrap();
+    vault
+        .store(make_conv("canon", canonical.clone(), vec![1, 2, 3]))
+        .await
+        .unwrap();
 
     // Near-duplicate: 2 token edits in a 200-token sequence.
     let mut variant = canonical.clone();
     variant[20] = 99_999;
     variant[150] = 88_888;
     let variant_clone = variant.clone();
-    vault.store(make_conv("variant", variant, vec![4, 5, 6])).await.unwrap();
+    vault
+        .store(make_conv("variant", variant, vec![4, 5, 6]))
+        .await
+        .unwrap();
 
     // Retrieval reconstructs the original variant tokens via delta apply.
     let r = vault.retrieve("variant").await.unwrap();
-    let sys = r.segments.iter()
+    let sys = r
+        .segments
+        .iter()
         .find(|s| matches!(s.segment_type, stowken::types::SegmentType::SystemPrompt))
         .unwrap();
-    assert_eq!(sys.tokens, variant_clone, "delta-decoded variant doesn't match input");
+    assert_eq!(
+        sys.tokens, variant_clone,
+        "delta-decoded variant doesn't match input"
+    );
 }
 
 #[tokio::test]
@@ -86,10 +97,16 @@ async fn no_near_dedup_when_disabled() {
         .unwrap();
 
     let canonical: Vec<u32> = (0u32..200).collect();
-    vault.store(make_conv("canon", canonical.clone(), vec![1, 2, 3])).await.unwrap();
+    vault
+        .store(make_conv("canon", canonical.clone(), vec![1, 2, 3]))
+        .await
+        .unwrap();
     let mut variant = canonical.clone();
     variant[20] = 99_999;
-    vault.store(make_conv("variant", variant.clone(), vec![4, 5, 6])).await.unwrap();
+    vault
+        .store(make_conv("variant", variant.clone(), vec![4, 5, 6]))
+        .await
+        .unwrap();
 
     // The LSH index should be empty — feature is off.
     assert_eq!(vault.near_dedup_index_size().await.unwrap(), 0);
@@ -105,11 +122,16 @@ async fn dissimilar_segments_are_not_near_deduped() {
     let b: Vec<u32> = (1000u32..1100).collect();
 
     vault.store(make_conv("a", a, vec![1])).await.unwrap();
-    vault.store(make_conv("b", b.clone(), vec![2])).await.unwrap();
+    vault
+        .store(make_conv("b", b.clone(), vec![2]))
+        .await
+        .unwrap();
 
     // Both should be retrievable as their original tokens.
     let r = vault.retrieve("b").await.unwrap();
-    let sys = r.segments.iter()
+    let sys = r
+        .segments
+        .iter()
         .find(|s| matches!(s.segment_type, stowken::types::SegmentType::SystemPrompt))
         .unwrap();
     assert_eq!(sys.tokens, b);
@@ -133,7 +155,10 @@ async fn lsh_index_survives_vault_reopen() {
         let vault = Stowken::open(backend, config_with_near_dedup(0.80), &db_str)
             .await
             .unwrap();
-        vault.store(make_conv("canon", canonical.clone(), vec![1, 2, 3])).await.unwrap();
+        vault
+            .store(make_conv("canon", canonical.clone(), vec![1, 2, 3]))
+            .await
+            .unwrap();
         assert_eq!(vault.near_dedup_index_size().await.unwrap(), 2);
     }
 
@@ -156,11 +181,16 @@ async fn lsh_index_survives_vault_reopen() {
         variant[10] = 99_999;
         variant[100] = 88_888;
         let variant_clone = variant.clone();
-        vault.store(make_conv("variant", variant, vec![4, 5, 6])).await.unwrap();
+        vault
+            .store(make_conv("variant", variant, vec![4, 5, 6]))
+            .await
+            .unwrap();
 
         // The variant should round-trip via the delta path.
         let r = vault.retrieve("variant").await.unwrap();
-        let sys = r.segments.iter()
+        let sys = r
+            .segments
+            .iter()
             .find(|s| matches!(s.segment_type, stowken::types::SegmentType::SystemPrompt))
             .unwrap();
         assert_eq!(sys.tokens, variant_clone);
@@ -183,8 +213,14 @@ async fn reindex_rebuilds_lsh_after_db_deletion() {
         let vault = Stowken::open(backend, config_with_near_dedup(0.80), &db_str)
             .await
             .unwrap();
-        vault.store(make_conv("a", canonical_a.clone(), vec![1])).await.unwrap();
-        vault.store(make_conv("b", canonical_b.clone(), vec![2])).await.unwrap();
+        vault
+            .store(make_conv("a", canonical_a.clone(), vec![1]))
+            .await
+            .unwrap();
+        vault
+            .store(make_conv("b", canonical_b.clone(), vec![2]))
+            .await
+            .unwrap();
         assert_eq!(vault.near_dedup_index_size().await.unwrap(), 4);
     }
 
@@ -212,9 +248,14 @@ async fn reindex_rebuilds_lsh_after_db_deletion() {
     let mut variant = canonical_a.clone();
     variant[50] = 99_999;
     let variant_clone = variant.clone();
-    vault.store(make_conv("a-variant", variant, vec![3])).await.unwrap();
+    vault
+        .store(make_conv("a-variant", variant, vec![3]))
+        .await
+        .unwrap();
     let r = vault.retrieve("a-variant").await.unwrap();
-    let sys = r.segments.iter()
+    let sys = r
+        .segments
+        .iter()
         .find(|s| matches!(s.segment_type, stowken::types::SegmentType::SystemPrompt))
         .unwrap();
     assert_eq!(sys.tokens, variant_clone);
@@ -232,13 +273,14 @@ async fn find_near_duplicates_surfaces_clusters() {
     let canonical: Vec<u32> = (0u32..200).collect();
     // Reference the canonical many times so it shows up in find_duplicates.
     for i in 0..6u32 {
-        vault.store(make_conv(
-            &format!("canon-{i}"),
-            canonical.clone(),
-            vec![100 + i],
-        ))
-        .await
-        .unwrap();
+        vault
+            .store(make_conv(
+                &format!("canon-{i}"),
+                canonical.clone(),
+                vec![100 + i],
+            ))
+            .await
+            .unwrap();
     }
 
     // Add some variants.
@@ -246,24 +288,21 @@ async fn find_near_duplicates_surfaces_clusters() {
         let mut variant = canonical.clone();
         variant[10 + i as usize] = 99_000 + i;
         variant[100 + i as usize] = 88_000 + i;
-        vault.store(make_conv(
-            &format!("var-{i}"),
-            variant,
-            vec![200 + i],
-        ))
-        .await
-        .unwrap();
+        vault
+            .store(make_conv(&format!("var-{i}"), variant, vec![200 + i]))
+            .await
+            .unwrap();
     }
 
-    let clusters = vault
-        .find_near_duplicates(0.80, 5, 100)
-        .await
-        .unwrap();
+    let clusters = vault.find_near_duplicates(0.80, 5, 100).await.unwrap();
 
     assert!(!clusters.is_empty(), "expected at least one cluster");
     let cluster = &clusters[0];
     assert!(cluster.canonical_ref_count >= 5);
-    assert!(!cluster.variants.is_empty(), "expected variants in the cluster");
+    assert!(
+        !cluster.variants.is_empty(),
+        "expected variants in the cluster"
+    );
     // Variants should be sorted similarity descending.
     let sims: Vec<f64> = cluster.variants.iter().map(|v| v.similarity).collect();
     let mut sorted = sims.clone();
@@ -281,15 +320,23 @@ async fn delta_only_used_when_actually_smaller() {
         .unwrap();
 
     let canonical: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-    vault.store(make_conv("canon", canonical, vec![1])).await.unwrap();
+    vault
+        .store(make_conv("canon", canonical, vec![1]))
+        .await
+        .unwrap();
 
     // A 10-token "variant" — too small for a delta to win.
     let variant = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 99];
-    vault.store(make_conv("variant", variant.clone(), vec![2])).await.unwrap();
+    vault
+        .store(make_conv("variant", variant.clone(), vec![2]))
+        .await
+        .unwrap();
 
     // Variant must still round-trip exactly.
     let r = vault.retrieve("variant").await.unwrap();
-    let sys = r.segments.iter()
+    let sys = r
+        .segments
+        .iter()
         .find(|s| matches!(s.segment_type, stowken::types::SegmentType::SystemPrompt))
         .unwrap();
     assert_eq!(sys.tokens, variant);
@@ -302,7 +349,10 @@ async fn gc_prunes_near_dedup_index() {
         .unwrap();
 
     let canonical: Vec<u32> = (0u32..200).collect();
-    vault.store(make_conv("a", canonical.clone(), vec![1])).await.unwrap();
+    vault
+        .store(make_conv("a", canonical.clone(), vec![1]))
+        .await
+        .unwrap();
     // System prompt + user turn are both indexed for future matching.
     assert_eq!(vault.near_dedup_index_size().await.unwrap(), 2);
 

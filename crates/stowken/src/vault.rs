@@ -25,8 +25,8 @@ use crate::{
         AnalyticsQuery, Conversation, ConversationManifest, ConversationText, ConversationTurn,
         ExportConfig, ExportStats, NearDuplicateCluster, NearDuplicateVariant,
         RetrievedConversation, RetrievedSegment, SegmentRef, SegmentType, SegmentTypeStats,
-        StoreResult, StoredSegment, SystemPromptInfo, Token, TokenUsageStats, TokenizerAdapter,
-        StowkenConfig,
+        StoreResult, StoredSegment, StowkenConfig, SystemPromptInfo, Token, TokenUsageStats,
+        TokenizerAdapter,
     },
 };
 
@@ -75,9 +75,7 @@ fn discover_substrings(
             if !seen_this_segment.insert(h) {
                 continue;
             }
-            let entry = counts
-                .entry(h)
-                .or_insert_with(|| (0, window.to_vec()));
+            let entry = counts.entry(h).or_insert_with(|| (0, window.to_vec()));
             entry.0 += 1;
         }
     }
@@ -169,8 +167,7 @@ pub struct Stowken<B: StorageBackend> {
     /// embedding on a near-duplicate variant. None disables reuse.
     embed_reuse_threshold: Option<f64>,
     #[cfg(feature = "semantic-search")]
-    embedding_adapter:
-        Arc<std::sync::RwLock<Option<Arc<dyn crate::types::EmbeddingAdapter>>>>,
+    embedding_adapter: Arc<std::sync::RwLock<Option<Arc<dyn crate::types::EmbeddingAdapter>>>>,
     #[cfg(feature = "semantic-search")]
     summary_strategy: Arc<std::sync::RwLock<crate::types::SummaryStrategy>>,
     #[cfg(feature = "semantic-search")]
@@ -215,7 +212,11 @@ impl<B: StorageBackend + 'static> Stowken<B> {
 
     /// Open a vault with a persistent metadata database at `db_path`. The
     /// dictionary registry is rooted at `<dirname(db_path)>/dictionaries/`.
-    pub async fn open(backend: B, config: StowkenConfig, db_path: &str) -> Result<Self, StowkenError> {
+    pub async fn open(
+        backend: B,
+        config: StowkenConfig,
+        db_path: &str,
+    ) -> Result<Self, StowkenError> {
         let index = MetadataIndex::open(db_path)?;
 
         let parent = std::path::Path::new(db_path)
@@ -223,8 +224,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let dict_registry = Arc::new(DictRegistry::open(parent.join("dictionaries"))?);
-        let substring_registry =
-            Arc::new(SubstringRegistry::open(parent.join("substrings"))?);
+        let substring_registry = Arc::new(SubstringRegistry::open(parent.join("substrings"))?);
         let near_dup_index = Arc::new(
             NearDupIndex::open(parent.join("near_dedup"))
                 .map_err(|e| StowkenError::Internal(e.to_string()))?,
@@ -272,10 +272,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     #[cfg(feature = "semantic-search")]
     /// Set the embedding adapter used by `semantic_search`, embed-on-store,
     /// and `embed_all`. Takes `&self` (interior mutability via `RwLock`).
-    pub fn set_embedding_adapter(
-        &self,
-        adapter: impl crate::types::EmbeddingAdapter + 'static,
-    ) {
+    pub fn set_embedding_adapter(&self, adapter: impl crate::types::EmbeddingAdapter + 'static) {
         *self.embedding_adapter.write().unwrap() = Some(Arc::new(adapter));
     }
 
@@ -340,7 +337,8 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     pub(crate) fn tokenizer_internal(&self) -> Option<Arc<dyn TokenizerAdapter>> {
         self.tokenizer.clone()
     }
-    pub(crate) fn default_tokenizer_name_internal(&self) -> String {  // used by retrieve_batch + semantic
+    pub(crate) fn default_tokenizer_name_internal(&self) -> String {
+        // used by retrieve_batch + semantic
         self.tokenizer
             .as_ref()
             .map(|t| t.name().to_owned())
@@ -359,7 +357,11 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         } else if let Some(t) = crate::tokenizer::get_tokenizer(tokenizer_name) {
             t.detokenize(tokens)
         } else {
-            tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ")
+            tokens
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
         }
     }
     #[cfg(feature = "semantic-search")]
@@ -424,8 +426,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                 let mut stored_as_delta = false;
                 if let Some((canonical_hash, sim)) = &best {
                     if near_dedup_threshold.is_some_and(|t| *sim >= t) {
-                        if let Some(delta_frame) =
-                            self.build_delta_frame(canonical_hash, &segment.tokens).await?
+                        if let Some(delta_frame) = self
+                            .build_delta_frame(canonical_hash, &segment.tokens)
+                            .await?
                         {
                             let raw_size = (segment.tokens.len() as u32) * 4;
                             let compressed_size = delta_frame.len() as u32;
@@ -448,8 +451,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                             // ref so GC won't collect it out from under the delta.
                             self.backend.increment_ref(canonical_hash).await?;
                             index_ops.push(BatchSegmentOp::Upsert(stored));
-                            index_ops
-                                .push(BatchSegmentOp::IncrementRef(canonical_hash.clone()));
+                            index_ops.push(BatchSegmentOp::IncrementRef(canonical_hash.clone()));
                             new_segments += 1;
                             stored_as_delta = true;
                         }
@@ -553,7 +555,10 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         };
 
         let total_segments = new_segments + deduped_segments;
-        info!(id, total_segments, new_segments, deduped_segments, "stored conversation");
+        info!(
+            id,
+            total_segments, new_segments, deduped_segments, "stored conversation"
+        );
 
         Ok(StoreResult {
             id,
@@ -643,7 +648,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         let mut retrieved_segments = Vec::with_capacity(manifest.segments.len());
         for seg_ref in &manifest.segments {
             let stored = self.backend.get_segment(&seg_ref.hash).await?;
-            let tokens = self.decompress_segment_async(&stored.compressed_data).await?;
+            let tokens = self
+                .decompress_segment_async(&stored.compressed_data)
+                .await?;
             retrieved_segments.push(RetrievedSegment {
                 segment_type: seg_ref.segment_type.clone(),
                 hash: seg_ref.hash.clone(),
@@ -653,7 +660,11 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             });
         }
 
-        debug!(id, segments = retrieved_segments.len(), "retrieved conversation");
+        debug!(
+            id,
+            segments = retrieved_segments.len(),
+            "retrieved conversation"
+        );
         Ok(RetrievedConversation {
             manifest,
             segments: retrieved_segments,
@@ -681,13 +692,13 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             };
             let role_for = |seg_type: &SegmentType| -> &'static str {
                 match seg_type {
-                    SegmentType::SystemPrompt  => "system",
-                    SegmentType::UserTurn      => "user",
+                    SegmentType::SystemPrompt => "system",
+                    SegmentType::UserTurn => "user",
                     SegmentType::AssistantTurn => "assistant",
-                    SegmentType::ToolCall      => "tool_call",
-                    SegmentType::ToolResult    => "tool_result",
-                    SegmentType::Context       => "context",
-                    SegmentType::Continuation  => "continuation",
+                    SegmentType::ToolCall => "tool_call",
+                    SegmentType::ToolResult => "tool_result",
+                    SegmentType::Context => "context",
+                    SegmentType::Continuation => "continuation",
                 }
             };
             let mut turns: Vec<ConversationTurn> = Vec::new();
@@ -741,7 +752,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         hash: &SegmentHash,
     ) -> Result<RetrievedSegment, StowkenError> {
         let stored = self.backend.get_segment(hash).await?;
-        let tokens = self.decompress_segment_async(&stored.compressed_data).await?;
+        let tokens = self
+            .decompress_segment_async(&stored.compressed_data)
+            .await?;
         Ok(RetrievedSegment {
             segment_type: stored.segment_type,
             hash: hash.clone(),
@@ -894,7 +907,11 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             .map_err(|e| StowkenError::Internal(e.to_string()))?;
         }
 
-        info!(deleted, pruned = collected.len(), "garbage collected segments");
+        info!(
+            deleted,
+            pruned = collected.len(),
+            "garbage collected segments"
+        );
         Ok(deleted)
     }
 
@@ -935,8 +952,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                     MinHashSignature::compute(&canonical_tokens)
                 }
             };
-            let band_hashes: Vec<u64> =
-                (0..near_dedup::BANDS).map(|b| sig.band_hash(b)).collect();
+            let band_hashes: Vec<u64> = (0..near_dedup::BANDS).map(|b| sig.band_hash(b)).collect();
 
             let cand_hashes = self.near_dup_index.candidates(&band_hashes);
             let sig_map = self.near_dup_index.signatures_batch(&cand_hashes);
@@ -946,7 +962,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                 if c == canonical.hash {
                     continue;
                 }
-                let Some(other_sig) = sig_map.get(&c) else { continue };
+                let Some(other_sig) = sig_map.get(&c) else {
+                    continue;
+                };
                 let similarity = sig.jaccard(other_sig);
                 if similarity >= threshold {
                     let stored = self.backend.get_segment(&c).await?;
@@ -960,7 +978,11 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             }
 
             if !variants.is_empty() {
-                variants.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+                variants.sort_by(|a, b| {
+                    b.similarity
+                        .partial_cmp(&a.similarity)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 clusters.push(NearDuplicateCluster {
                     canonical: canonical.hash,
                     canonical_token_count: canonical.token_count,
@@ -992,7 +1014,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     /// form — both decompressible. The metadata index's
     /// `compressed_size` is updated after each replace, so stats
     /// remain consistent.
-    pub async fn compact_substrings(&self) -> Result<crate::types::SubstringCompactStats, StowkenError> {
+    pub async fn compact_substrings(
+        &self,
+    ) -> Result<crate::types::SubstringCompactStats, StowkenError> {
         if self.substring_registry.is_empty() {
             return Ok(crate::types::SubstringCompactStats {
                 segments_examined: 0,
@@ -1069,10 +1093,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
 
         info!(
             examined,
-            rewritten,
-            skipped,
-            bytes_saved,
-            "compacted segments to use substring registry"
+            rewritten, skipped, bytes_saved, "compacted segments to use substring registry"
         );
         Ok(crate::types::SubstringCompactStats {
             segments_examined: examined,
@@ -1109,7 +1130,8 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                 continue;
             }
             // Body starts at byte 1 (skip version tag).
-            let ops = match crate::compression::decode_substring_frame(&stored.compressed_data[1..]) {
+            let ops = match crate::compression::decode_substring_frame(&stored.compressed_data[1..])
+            {
                 Ok(o) => o,
                 Err(_) => continue,
             };
@@ -1125,9 +1147,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
 
         info!(
             before,
-            after,
-            dropped,
-            "garbage-collected substring registry"
+            after, dropped, "garbage-collected substring registry"
         );
         Ok(crate::types::SubstringGcStats {
             registry_size_before: before,
@@ -1144,7 +1164,6 @@ impl<B: StorageBackend + 'static> Stowken<B> {
             .map_err(|e| StowkenError::Internal(e.to_string()))?
             .map_err(Into::into)
     }
-
 
     /// Result of a `train_substrings` pass.
     pub fn substring_registry(&self) -> &Arc<SubstringRegistry> {
@@ -1182,16 +1201,12 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         // 5x in one segment counts as 1 occurrence) by collecting per-
         // segment hashes into a set first.
         let registry = Arc::clone(&self.substring_registry);
-        let report = task::spawn_blocking(move || {
-            discover_substrings(&samples, min_occurrences, &registry)
-        })
-        .await
-        .map_err(|e| StowkenError::Internal(e.to_string()))??;
+        let report =
+            task::spawn_blocking(move || discover_substrings(&samples, min_occurrences, &registry))
+                .await
+                .map_err(|e| StowkenError::Internal(e.to_string()))??;
 
-        info!(
-            promoted = report.len(),
-            "trained substring registry"
-        );
+        info!(promoted = report.len(), "trained substring registry");
         Ok(report)
     }
 
@@ -1199,9 +1214,15 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     /// discovery. Skips delta segments — their tokens are derivable but
     /// they're already a near-dedup variant, so promoting substrings from
     /// them would double-count.
-    async fn collect_substring_samples(&self, count: usize) -> Result<Vec<Vec<Token>>, StowkenError> {
+    async fn collect_substring_samples(
+        &self,
+        count: usize,
+    ) -> Result<Vec<Vec<Token>>, StowkenError> {
         let query = AnalyticsQuery::default();
-        let ids = self.backend.list_conversations(&query, count as u64, 0).await?;
+        let ids = self
+            .backend
+            .list_conversations(&query, count as u64, 0)
+            .await?;
 
         let mut samples: Vec<Vec<Token>> = Vec::with_capacity(count);
         for id in &ids {
@@ -1268,7 +1289,11 @@ impl<B: StorageBackend + 'static> Stowken<B> {
 
         let actual_samples = sample_count as u32;
         let info = self.dict_registry.register(dict_bytes, actual_samples)?;
-        info!(dict_id = info.id, samples = actual_samples, "trained dictionary");
+        info!(
+            dict_id = info.id,
+            samples = actual_samples,
+            "trained dictionary"
+        );
         Ok(info)
     }
 
@@ -1287,7 +1312,10 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     ) -> Result<DictInfo, StowkenError> {
         let info = self.train_dictionary(sample_count).await?;
         self.activate_dictionary(info.id).await?;
-        Ok(DictInfo { is_active: true, ..info })
+        Ok(DictInfo {
+            is_active: true,
+            ..info
+        })
     }
 
     /// All known dictionaries, sorted by creation time. Each entry's
@@ -1309,7 +1337,10 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     /// which is the varint output (not the zstd output, not the raw tokens).
     async fn collect_training_samples(&self, count: usize) -> Result<Vec<Vec<u8>>, StowkenError> {
         let query = AnalyticsQuery::default();
-        let ids = self.backend.list_conversations(&query, count as u64, 0).await?;
+        let ids = self
+            .backend
+            .list_conversations(&query, count as u64, 0)
+            .await?;
 
         let mut samples: Vec<Vec<u8>> = Vec::with_capacity(count);
         for id in &ids {
@@ -1361,10 +1392,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
 
         // Replay every manifest through the same batch path that store() uses.
         let query = AnalyticsQuery::default();
-        let ids = self
-            .backend
-            .list_conversations(&query, u64::MAX, 0)
-            .await?;
+        let ids = self.backend.list_conversations(&query, u64::MAX, 0).await?;
 
         let mut seen: HashSet<SegmentHash> = HashSet::new();
         let mut conversations_indexed = 0u64;
@@ -1383,8 +1411,7 @@ impl<B: StorageBackend + 'static> Stowken<B> {
                 Err(_) => continue,
             };
 
-            let mut index_ops: Vec<BatchSegmentOp> =
-                Vec::with_capacity(manifest.segments.len());
+            let mut index_ops: Vec<BatchSegmentOp> = Vec::with_capacity(manifest.segments.len());
 
             for seg_ref in &manifest.segments {
                 if seen.insert(seg_ref.hash.clone()) {
@@ -1563,8 +1590,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         variant_hash: &SegmentHash,
         min_threshold: f64,
     ) -> Result<Option<(SegmentHash, f64)>, StowkenError> {
-        let band_hashes: Vec<u64> =
-            (0..near_dedup::BANDS).map(|b| signature.band_hash(b)).collect();
+        let band_hashes: Vec<u64> = (0..near_dedup::BANDS)
+            .map(|b| signature.band_hash(b))
+            .collect();
 
         let candidates: Vec<SegmentHash> = self
             .near_dup_index
@@ -1579,7 +1607,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
         let sig_map = self.near_dup_index.signatures_batch(&candidates);
         let mut best: Option<(SegmentHash, f64)> = None;
         for candidate_hash in candidates {
-            let Some(candidate_sig) = sig_map.get(&candidate_hash) else { continue };
+            let Some(candidate_sig) = sig_map.get(&candidate_hash) else {
+                continue;
+            };
             let sim = signature.jaccard(candidate_sig);
             if sim >= min_threshold && best.as_ref().is_none_or(|(_, prev)| sim > *prev) {
                 best = Some((candidate_hash, sim));
@@ -1713,8 +1743,9 @@ impl<B: StorageBackend + 'static> Stowken<B> {
     pub fn decompress_segment_async<'a>(
         &'a self,
         data: &'a [u8],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Token>, StowkenError>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<Token>, StowkenError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let canonical_hash = self
                 .compressor

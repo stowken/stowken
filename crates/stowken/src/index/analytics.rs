@@ -154,9 +154,19 @@ impl MetadataIndex {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let mut row = HashMap::new();
-        row.insert("actual_bytes".to_owned(), serde_json::Value::Number(actual.into()));
-        row.insert("naive_bytes".to_owned(), serde_json::Value::Number(naive.into()));
-        let ratio = if naive == 0 { 1.0 } else { actual as f64 / naive as f64 };
+        row.insert(
+            "actual_bytes".to_owned(),
+            serde_json::Value::Number(actual.into()),
+        );
+        row.insert(
+            "naive_bytes".to_owned(),
+            serde_json::Value::Number(naive.into()),
+        );
+        let ratio = if naive == 0 {
+            1.0
+        } else {
+            actual as f64 / naive as f64
+        };
         row.insert(
             "compression_ratio".to_owned(),
             serde_json::Value::Number(
@@ -175,9 +185,7 @@ fn sqlite_value_to_json(val: rusqlite::types::Value) -> serde_json::Value {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
-        rusqlite::types::Value::Blob(b) => {
-            serde_json::Value::String(hex::encode(b))
-        }
+        rusqlite::types::Value::Blob(b) => serde_json::Value::String(hex::encode(b)),
     }
 }
 

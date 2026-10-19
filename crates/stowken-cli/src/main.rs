@@ -108,9 +108,7 @@ enum DictAction {
     /// List all known dictionaries.
     List,
     /// Mark `id` as the dictionary new compressions will use.
-    Activate {
-        id: u32,
-    },
+    Activate { id: u32 },
 }
 
 #[derive(Subcommand)]
@@ -518,10 +516,21 @@ async fn main() -> Result<()> {
             println!("{}", data_dir.display());
             return Ok(());
         }
-        Command::Store { file, model, application, id } => {
+        Command::Store {
+            file,
+            model,
+            application,
+            id,
+        } => {
             cmd_store(&data_dir, config, file, model, application, id, cli.json).await?;
         }
-        Command::Ingest { input, application, max, #[cfg(feature = "semantic-search")] no_embed } => {
+        Command::Ingest {
+            input,
+            application,
+            max,
+            #[cfg(feature = "semantic-search")]
+            no_embed,
+        } => {
             #[cfg(feature = "semantic-search")]
             let embed = !no_embed;
             #[cfg(not(feature = "semantic-search"))]
@@ -572,10 +581,16 @@ async fn main() -> Result<()> {
             let stats = if let Some(path) = output {
                 let mut file = std::fs::File::create(&path)
                     .with_context(|| format!("creating {}", path.display()))?;
-                vault.export_training_data(export_config, &mut file).await.context("exporting")?
+                vault
+                    .export_training_data(export_config, &mut file)
+                    .await
+                    .context("exporting")?
             } else {
                 let mut stdout = io::stdout();
-                vault.export_training_data(export_config, &mut stdout).await.context("exporting")?
+                vault
+                    .export_training_data(export_config, &mut stdout)
+                    .await
+                    .context("exporting")?
             };
             eprintln!(
                 "Exported {} pairs ({} unique, {} tokens)",
@@ -597,59 +612,207 @@ async fn main() -> Result<()> {
         Command::AuditSystemPrompts { min_refs, limit } => {
             cmd_audit_system_prompts(&data_dir, config, min_refs, limit, cli.json).await?;
         }
-        Command::Cost { by, model, application } => {
+        Command::Cost {
+            by,
+            model,
+            application,
+        } => {
             cmd_cost(&data_dir, config, &by, model, application, cli.json).await?;
         }
         Command::FindDuplicates { threshold, limit } => {
             cmd_find_duplicates(&data_dir, config, threshold, limit, cli.json).await?;
         }
-        Command::FindNearDuplicates { threshold, min_refs, limit } => {
-            cmd_find_near_duplicates(&data_dir, config, threshold, min_refs, limit, cli.json).await?;
+        Command::FindNearDuplicates {
+            threshold,
+            min_refs,
+            limit,
+        } => {
+            cmd_find_near_duplicates(&data_dir, config, threshold, min_refs, limit, cli.json)
+                .await?;
         }
-        Command::Bench { input, max, retrieve, dict_warmup, with_substrings } => {
-            cmd_bench(config, split_segments, input, max, retrieve, dict_warmup, with_substrings, cli.json).await?;
+        Command::Bench {
+            input,
+            max,
+            retrieve,
+            dict_warmup,
+            with_substrings,
+        } => {
+            cmd_bench(
+                config,
+                split_segments,
+                input,
+                max,
+                retrieve,
+                dict_warmup,
+                with_substrings,
+                cli.json,
+            )
+            .await?;
         }
         #[cfg(feature = "semantic-search")]
-        Command::EmbedAll { openai_key, model, summary_strategy, summary_model } => {
-            cmd_embed_all(&data_dir, config, openai_key, model, summary_strategy, summary_model, cli.json).await?;
+        Command::EmbedAll {
+            openai_key,
+            model,
+            summary_strategy,
+            summary_model,
+        } => {
+            cmd_embed_all(
+                &data_dir,
+                config,
+                openai_key,
+                model,
+                summary_strategy,
+                summary_model,
+                cli.json,
+            )
+            .await?;
         }
         #[cfg(feature = "semantic-search")]
         Command::SemanticSearch {
-            query, openai_key, model, granularity, limit, min_score,
-            application, filter_model, segment_type,
+            query,
+            openai_key,
+            model,
+            granularity,
+            limit,
+            min_score,
+            application,
+            filter_model,
+            segment_type,
         } => {
             cmd_semantic_search(
-                &data_dir, config, query, openai_key, model, granularity, limit,
-                min_score, application, filter_model, segment_type, cli.json,
-            ).await?;
+                &data_dir,
+                config,
+                query,
+                openai_key,
+                model,
+                granularity,
+                limit,
+                min_score,
+                application,
+                filter_model,
+                segment_type,
+                cli.json,
+            )
+            .await?;
         }
         #[cfg(feature = "semantic-search")]
-        Command::SearchPrompts { query, openai_key, model, limit } => {
-            cmd_typed_search(&data_dir, config, query, openai_key, model, limit, "prompts", cli.json).await?;
+        Command::SearchPrompts {
+            query,
+            openai_key,
+            model,
+            limit,
+        } => {
+            cmd_typed_search(
+                &data_dir, config, query, openai_key, model, limit, "prompts", cli.json,
+            )
+            .await?;
         }
         #[cfg(feature = "semantic-search")]
-        Command::SearchResponses { query, openai_key, model, limit } => {
-            cmd_typed_search(&data_dir, config, query, openai_key, model, limit, "responses", cli.json).await?;
+        Command::SearchResponses {
+            query,
+            openai_key,
+            model,
+            limit,
+        } => {
+            cmd_typed_search(
+                &data_dir,
+                config,
+                query,
+                openai_key,
+                model,
+                limit,
+                "responses",
+                cli.json,
+            )
+            .await?;
         }
         #[cfg(feature = "semantic-search")]
-        Command::SearchUserQuestions { query, openai_key, model, limit } => {
-            cmd_typed_search(&data_dir, config, query, openai_key, model, limit, "user_questions", cli.json).await?;
+        Command::SearchUserQuestions {
+            query,
+            openai_key,
+            model,
+            limit,
+        } => {
+            cmd_typed_search(
+                &data_dir,
+                config,
+                query,
+                openai_key,
+                model,
+                limit,
+                "user_questions",
+                cli.json,
+            )
+            .await?;
         }
         #[cfg(feature = "semantic-search")]
-        Command::SearchToolUses { query, openai_key, model, limit } => {
-            cmd_typed_search(&data_dir, config, query, openai_key, model, limit, "tool_uses", cli.json).await?;
+        Command::SearchToolUses {
+            query,
+            openai_key,
+            model,
+            limit,
+        } => {
+            cmd_typed_search(
+                &data_dir,
+                config,
+                query,
+                openai_key,
+                model,
+                limit,
+                "tool_uses",
+                cli.json,
+            )
+            .await?;
         }
         #[cfg(feature = "semantic-search")]
-        Command::SearchConversations { query, openai_key, model, limit } => {
-            cmd_typed_search(&data_dir, config, query, openai_key, model, limit, "conversations", cli.json).await?;
+        Command::SearchConversations {
+            query,
+            openai_key,
+            model,
+            limit,
+        } => {
+            cmd_typed_search(
+                &data_dir,
+                config,
+                query,
+                openai_key,
+                model,
+                limit,
+                "conversations",
+                cli.json,
+            )
+            .await?;
         }
         #[cfg(feature = "semantic-search")]
-        Command::Cluster { openai_key, model, k, representatives } => {
-            cmd_cluster(&data_dir, config, openai_key, model, k, representatives, cli.json).await?;
+        Command::Cluster {
+            openai_key,
+            model,
+            k,
+            representatives,
+        } => {
+            cmd_cluster(
+                &data_dir,
+                config,
+                openai_key,
+                model,
+                k,
+                representatives,
+                cli.json,
+            )
+            .await?;
         }
         #[cfg(feature = "semantic-search")]
-        Command::Outliers { openai_key, model, k, threshold, limit } => {
-            cmd_outliers(&data_dir, config, openai_key, model, k, threshold, limit, cli.json).await?;
+        Command::Outliers {
+            openai_key,
+            model,
+            k,
+            threshold,
+            limit,
+        } => {
+            cmd_outliers(
+                &data_dir, config, openai_key, model, k, threshold, limit, cli.json,
+            )
+            .await?;
         }
     }
 
@@ -662,20 +825,26 @@ fn resolve_data_dir(override_path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = override_path {
         return Ok(p);
     }
-    let base = directories::BaseDirs::new()
-        .context("could not determine home directory")?;
+    let base = directories::BaseDirs::new().context("could not determine home directory")?;
     Ok(base.data_local_dir().join("stowken"))
 }
 
-async fn open_vault(data_dir: &PathBuf, config: StowkenConfig) -> Result<Stowken<FilesystemBackend>> {
+async fn open_vault(
+    data_dir: &PathBuf,
+    config: StowkenConfig,
+) -> Result<Stowken<FilesystemBackend>> {
     let db_path = data_dir.join("metadata.db");
     let backend = FilesystemBackend::new(data_dir)
         .await
         .with_context(|| format!("opening filesystem backend at {}", data_dir.display()))?;
 
-    Stowken::open(backend, config, db_path.to_str().context("non-UTF-8 db path")?)
-        .await
-        .context("opening vault")
+    Stowken::open(
+        backend,
+        config,
+        db_path.to_str().context("non-UTF-8 db path")?,
+    )
+    .await
+    .context("opening vault")
 }
 
 fn read_input(file: &str) -> Result<String> {
@@ -688,8 +857,7 @@ fn read_input(file: &str) -> Result<String> {
         }
         Ok(buf)
     } else {
-        std::fs::read_to_string(file)
-            .with_context(|| format!("reading {file}"))
+        std::fs::read_to_string(file).with_context(|| format!("reading {file}"))
     }
 }
 
@@ -707,19 +875,30 @@ fn read_input(file: &str) -> Result<String> {
 fn parse_conversation_json(raw: &str) -> Result<Conversation> {
     let v: serde_json::Value = serde_json::from_str(raw).context("parsing JSON")?;
 
-    let model = v["model"].as_str().context("missing 'model' field")?.to_owned();
+    let model = v["model"]
+        .as_str()
+        .context("missing 'model' field")?
+        .to_owned();
     let tokenizer = v["tokenizer"].as_str().unwrap_or("cl100k_base").to_owned();
     let application = v["application"].as_str().map(str::to_owned);
     let id = v["id"].as_str().map(str::to_owned);
 
-    let messages_raw = v["messages"].as_array().context("missing 'messages' array")?;
+    let messages_raw = v["messages"]
+        .as_array()
+        .context("missing 'messages' array")?;
     let mut messages = Vec::with_capacity(messages_raw.len());
 
     for msg in messages_raw {
-        let role = msg["role"].as_str().context("message missing 'role'")?.to_owned();
+        let role = msg["role"]
+            .as_str()
+            .context("message missing 'role'")?
+            .to_owned();
 
         let content = if let Some(tokens_arr) = msg.get("tokens").and_then(|t| t.as_array()) {
-            let tokens: Vec<u32> = tokens_arr.iter().map(|t| t.as_u64().unwrap_or(0) as u32).collect();
+            let tokens: Vec<u32> = tokens_arr
+                .iter()
+                .map(|t| t.as_u64().unwrap_or(0) as u32)
+                .collect();
             MessageContent::Tokens(tokens)
         } else {
             let text = match msg.get("content") {
@@ -735,11 +914,26 @@ fn parse_conversation_json(raw: &str) -> Result<Conversation> {
         };
 
         let name = msg.get("name").and_then(|v| v.as_str()).map(str::to_owned);
-        let tool_call_id = msg.get("tool_call_id").and_then(|v| v.as_str()).map(str::to_owned);
-        messages.push(Message { role, content, name, tool_call_id });
+        let tool_call_id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        messages.push(Message {
+            role,
+            content,
+            name,
+            tool_call_id,
+        });
     }
 
-    Ok(Conversation { id, model, tokenizer, application, messages, metadata: None })
+    Ok(Conversation {
+        id,
+        model,
+        tokenizer,
+        application,
+        messages,
+        metadata: None,
+    })
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -756,9 +950,15 @@ async fn cmd_store(
     let raw = read_input(&file)?;
     let mut conv = parse_conversation_json(&raw)?;
 
-    if let Some(m) = model { conv.model = m; }
-    if application.is_some() { conv.application = application; }
-    if id.is_some() { conv.id = id; }
+    if let Some(m) = model {
+        conv.model = m;
+    }
+    if application.is_some() {
+        conv.application = application;
+    }
+    if id.is_some() {
+        conv.id = id;
+    }
 
     let vault = open_vault(data_dir, config).await?;
     let result = vault.store(conv).await.context("storing conversation")?;
@@ -767,7 +967,10 @@ async fn cmd_store(
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         println!("Stored conversation: {}", result.id);
-        println!("  Segments : {} total ({} new, {} deduped)", result.total_segments, result.new_segments, result.deduped_segments);
+        println!(
+            "  Segments : {} total ({} new, {} deduped)",
+            result.total_segments, result.new_segments, result.deduped_segments
+        );
         println!("  Saved    : {} bytes", result.bytes_saved);
         println!("  Ratio    : {:.3}x", result.compression_ratio);
     }
@@ -832,18 +1035,25 @@ async fn cmd_retrieve(
     json: bool,
 ) -> Result<()> {
     let vault = open_vault(data_dir, config).await?;
-    let conv = vault.retrieve(&id).await.context("retrieving conversation")?;
+    let conv = vault
+        .retrieve(&id)
+        .await
+        .context("retrieving conversation")?;
 
     if segments {
-        let segs: Vec<serde_json::Value> = conv.segments.iter().map(|s| {
-            serde_json::json!({
-                "position": s.position,
-                "segment_type": s.segment_type.to_string(),
-                "hash": s.hash.0,
-                "token_count": s.token_count,
-                "tokens": s.tokens,
+        let segs: Vec<serde_json::Value> = conv
+            .segments
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "position": s.position,
+                    "segment_type": s.segment_type.to_string(),
+                    "hash": s.hash.0,
+                    "token_count": s.token_count,
+                    "tokens": s.tokens,
+                })
             })
-        }).collect();
+            .collect();
         println!("{}", serde_json::to_string_pretty(&segs)?);
     } else if json {
         let out = serde_json::json!({
@@ -865,12 +1075,18 @@ async fn cmd_retrieve(
         }
         println!("Tokens     : {}", conv.manifest.total_tokens);
         println!("Segments   : {}", conv.segments.len());
-        println!("Created    : {}", conv.manifest.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
+        println!(
+            "Created    : {}",
+            conv.manifest.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+        );
         println!();
         println!("{:<4}  {:<16}  {:<8}  Hash", "Pos", "Type", "Tokens");
         println!("{}", "-".repeat(80));
         for s in &conv.segments {
-            println!("{:<4}  {:<16}  {:<8}  {}", s.position, s.segment_type, s.token_count, s.hash);
+            println!(
+                "{:<4}  {:<16}  {:<8}  {}",
+                s.position, s.segment_type, s.token_count, s.hash
+            );
         }
     }
     Ok(())
@@ -898,7 +1114,10 @@ async fn cmd_retrieve_batch(
     }
     let vault = open_vault(data_dir, config).await?;
     let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-    let convs = vault.retrieve_batch(&id_refs).await.context("retrieve_batch")?;
+    let convs = vault
+        .retrieve_batch(&id_refs)
+        .await
+        .context("retrieve_batch")?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&convs)?);
@@ -946,17 +1165,44 @@ async fn cmd_stats(data_dir: &PathBuf, config: StowkenConfig, json: bool) -> Res
         println!("{}", serde_json::to_string_pretty(&s)?);
     } else {
         #[derive(Tabled)]
-        struct Row { metric: &'static str, value: String }
+        struct Row {
+            metric: &'static str,
+            value: String,
+        }
 
         let rows = vec![
-            Row { metric: "Conversations", value: s.total_conversations.to_string() },
-            Row { metric: "Total tokens",  value: s.total_tokens.to_string() },
-            Row { metric: "Unique segs",   value: s.unique_segments.to_string() },
-            Row { metric: "Total segs",    value: s.total_segments.to_string() },
-            Row { metric: "Dedup ratio",   value: format!("{:.1}%", s.dedup_ratio * 100.0) },
-            Row { metric: "Compression",   value: format!("{:.3}x", s.compression_ratio) },
-            Row { metric: "Storage bytes", value: format_bytes(s.storage_bytes) },
-            Row { metric: "Savings",       value: format!("{:.1}%", s.savings_percentage) },
+            Row {
+                metric: "Conversations",
+                value: s.total_conversations.to_string(),
+            },
+            Row {
+                metric: "Total tokens",
+                value: s.total_tokens.to_string(),
+            },
+            Row {
+                metric: "Unique segs",
+                value: s.unique_segments.to_string(),
+            },
+            Row {
+                metric: "Total segs",
+                value: s.total_segments.to_string(),
+            },
+            Row {
+                metric: "Dedup ratio",
+                value: format!("{:.1}%", s.dedup_ratio * 100.0),
+            },
+            Row {
+                metric: "Compression",
+                value: format!("{:.3}x", s.compression_ratio),
+            },
+            Row {
+                metric: "Storage bytes",
+                value: format_bytes(s.storage_bytes),
+            },
+            Row {
+                metric: "Savings",
+                value: format!("{:.1}%", s.savings_percentage),
+            },
         ];
         println!("{}", Table::new(rows));
     }
@@ -965,18 +1211,26 @@ async fn cmd_stats(data_dir: &PathBuf, config: StowkenConfig, json: bool) -> Res
 
 async fn cmd_segment_stats(data_dir: &PathBuf, config: StowkenConfig, json: bool) -> Result<()> {
     let vault = open_vault(data_dir, config).await?;
-    let stats = vault.segment_stats().await.context("fetching segment stats")?;
+    let stats = vault
+        .segment_stats()
+        .await
+        .context("fetching segment stats")?;
 
     if json {
-        let out: Vec<serde_json::Value> = stats.iter().map(|s| serde_json::json!({
-            "segment_type":      s.segment_type.to_string(),
-            "unique_count":      s.unique_count,
-            "total_references":  s.total_references,
-            "dedup_ratio":       s.dedup_ratio,
-            "avg_token_count":   s.avg_token_count,
-            "total_tokens":      s.total_tokens,
-            "compressed_bytes":  s.compressed_bytes,
-        })).collect();
+        let out: Vec<serde_json::Value> = stats
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "segment_type":      s.segment_type.to_string(),
+                    "unique_count":      s.unique_count,
+                    "total_references":  s.total_references,
+                    "dedup_ratio":       s.dedup_ratio,
+                    "avg_token_count":   s.avg_token_count,
+                    "total_tokens":      s.total_tokens,
+                    "compressed_bytes":  s.compressed_bytes,
+                })
+            })
+            .collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         #[derive(Tabled)]
@@ -995,14 +1249,17 @@ async fn cmd_segment_stats(data_dir: &PathBuf, config: StowkenConfig, json: bool
             compressed: String,
         }
 
-        let rows: Vec<Row> = stats.iter().map(|s| Row {
-            segment_type: s.segment_type.to_string(),
-            unique_count: s.unique_count,
-            total_references: s.total_references,
-            dedup_pct: format!("{:.1}%", s.dedup_ratio * 100.0),
-            avg_tokens: format!("{:.0}", s.avg_token_count),
-            compressed: format_bytes(s.compressed_bytes),
-        }).collect();
+        let rows: Vec<Row> = stats
+            .iter()
+            .map(|s| Row {
+                segment_type: s.segment_type.to_string(),
+                unique_count: s.unique_count,
+                total_references: s.total_references,
+                dedup_pct: format!("{:.1}%", s.dedup_ratio * 100.0),
+                avg_tokens: format!("{:.0}", s.avg_token_count),
+                compressed: format_bytes(s.compressed_bytes),
+            })
+            .collect();
         println!("{}", Table::new(rows));
     }
     Ok(())
@@ -1011,7 +1268,10 @@ async fn cmd_segment_stats(data_dir: &PathBuf, config: StowkenConfig, json: bool
 async fn cmd_gc(data_dir: &PathBuf, config: StowkenConfig, dry_run: bool) -> Result<()> {
     let vault = open_vault(data_dir, config).await?;
     if dry_run {
-        let candidates = vault.gc_candidates().await.context("listing GC candidates")?;
+        let candidates = vault
+            .gc_candidates()
+            .await
+            .context("listing GC candidates")?;
         if candidates.is_empty() {
             println!("Dry run: 0 segment(s) eligible for GC.");
         } else {
@@ -1049,11 +1309,13 @@ async fn cmd_audit_system_prompts(
     if json {
         let out: Vec<serde_json::Value> = filtered
             .iter()
-            .map(|p| serde_json::json!({
-                "hash":        p.hash.0,
-                "token_count": p.token_count,
-                "ref_count":   p.ref_count,
-            }))
+            .map(|p| {
+                serde_json::json!({
+                    "hash":        p.hash.0,
+                    "token_count": p.token_count,
+                    "ref_count":   p.ref_count,
+                })
+            })
             .collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else if filtered.is_empty() {
@@ -1127,7 +1389,10 @@ async fn cmd_cost(
         let mut headers: Vec<String> = group_by.clone();
         headers.push("total_tokens".to_owned());
         println!("{}", headers.join("\t"));
-        println!("{}", "-".repeat(headers.iter().map(|h| h.len()).sum::<usize>() + headers.len() * 2));
+        println!(
+            "{}",
+            "-".repeat(headers.iter().map(|h| h.len()).sum::<usize>() + headers.len() * 2)
+        );
         for row in &rows {
             let cells: Vec<String> = headers
                 .iter()
@@ -1159,13 +1424,15 @@ async fn cmd_find_duplicates(
     if json {
         let out: Vec<serde_json::Value> = dups
             .iter()
-            .map(|d| serde_json::json!({
-                "hash":         d.hash.0,
-                "segment_type": d.segment_type.to_string(),
-                "token_count":  d.token_count,
-                "ref_count":    d.ref_count,
-                "wasted_bytes": d.wasted_bytes,
-            }))
+            .map(|d| {
+                serde_json::json!({
+                    "hash":         d.hash.0,
+                    "segment_type": d.segment_type.to_string(),
+                    "token_count":  d.token_count,
+                    "ref_count":    d.ref_count,
+                    "wasted_bytes": d.wasted_bytes,
+                })
+            })
             .collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else if dups.is_empty() {
@@ -1261,8 +1528,10 @@ async fn cmd_find_near_duplicates(
             "No near-duplicate clusters found (threshold {:.2}, min_refs {}).",
             threshold, min_refs
         );
-        println!("Tip: ensure near-dedup was enabled during ingest with `--near-dedup <threshold>` \
-                  or run `stowken reindex` to populate the LSH index.");
+        println!(
+            "Tip: ensure near-dedup was enabled during ingest with `--near-dedup <threshold>` \
+                  or run `stowken reindex` to populate the LSH index."
+        );
         return Ok(());
     }
 
@@ -1318,7 +1587,10 @@ async fn cmd_substrings(
 ) -> Result<()> {
     let vault = open_vault(data_dir, config).await?;
     match action {
-        SubstringsAction::Train { samples, min_occurrences } => {
+        SubstringsAction::Train {
+            samples,
+            min_occurrences,
+        } => {
             let promoted = vault
                 .train_substrings(samples, min_occurrences)
                 .await
@@ -1589,7 +1861,10 @@ async fn cmd_bench(
         .dedup_only_bytes()
         .await
         .context("fetching dedup-only bytes")?;
-    let seg_stats = vault.segment_stats().await.context("fetching segment stats")?;
+    let seg_stats = vault
+        .segment_stats()
+        .await
+        .context("fetching segment stats")?;
 
     // Retrieval pass: sample some ingested IDs and time each retrieve.
     let retrieval = run_retrieval_pass(&vault, &ingested_ids, retrieve).await?;
@@ -1655,12 +1930,13 @@ async fn cmd_bench(
         0
     };
     if let Some(we) = warmup_elapsed {
-        println!("  Warmup        : {} convs (dict trained in {}ms)", warmup_count, we.as_millis());
+        println!(
+            "  Warmup        : {} convs (dict trained in {}ms)",
+            warmup_count,
+            we.as_millis()
+        );
     }
-    println!(
-        "  Conversations : {}  ({} failed)",
-        ingested, failures
-    );
+    println!("  Conversations : {}  ({} failed)", ingested, failures);
     println!("  Tokens        : {}", stats.total_tokens);
     println!(
         "  Time          : {}ms  ({}µs/conv, {} tok/s)",
@@ -1763,10 +2039,7 @@ async fn cmd_bench(
         println!();
         println!("Retrieval (decompression-only, MemoryBackend)");
         println!("{}", "-".repeat(60));
-        println!(
-            "  Sampled       : {} conversations",
-            r.count
-        );
+        println!("  Sampled       : {} conversations", r.count);
         println!(
             "  Time          : {}ms  ({} tok/s, {} conv/s)",
             r.elapsed.as_millis(),
@@ -1818,9 +2091,15 @@ impl RetrievalReport {
         let idx = rank.saturating_sub(1).min(self.sorted_micros.len() - 1);
         self.sorted_micros[idx]
     }
-    fn p50_us(&self) -> u128 { self.percentile_us(50.0) }
-    fn p95_us(&self) -> u128 { self.percentile_us(95.0) }
-    fn p99_us(&self) -> u128 { self.percentile_us(99.0) }
+    fn p50_us(&self) -> u128 {
+        self.percentile_us(50.0)
+    }
+    fn p95_us(&self) -> u128 {
+        self.percentile_us(95.0)
+    }
+    fn p99_us(&self) -> u128 {
+        self.percentile_us(99.0)
+    }
 }
 
 /// Time `min(retrieve_n, ingested.len())` retrievals against the bench
@@ -1889,8 +2168,7 @@ fn collect_conversations(input: &PathBuf, max: Option<u64>) -> Result<Vec<Conver
     let mut out = Vec::new();
     let limit = max.unwrap_or(u64::MAX);
 
-    let metadata = std::fs::metadata(input)
-        .with_context(|| format!("stat {}", input.display()))?;
+    let metadata = std::fs::metadata(input).with_context(|| format!("stat {}", input.display()))?;
 
     let mut paths: Vec<PathBuf> = if metadata.is_file() {
         vec![input.clone()]
@@ -1936,9 +2214,8 @@ fn collect_conversations(input: &PathBuf, max: Option<u64>) -> Result<Vec<Conver
                 if trimmed.is_empty() {
                     continue;
                 }
-                let conv = parse_conversation_json(trimmed).with_context(|| {
-                    format!("{} line {}", path.display(), lineno + 1)
-                })?;
+                let conv = parse_conversation_json(trimmed)
+                    .with_context(|| format!("{} line {}", path.display(), lineno + 1))?;
                 out.push(conv);
             }
         } else {
@@ -1995,9 +2272,9 @@ async fn open_vault_with_adapters(
         match strategy.as_str() {
             "concat" => vault.use_concat_summary(24_000),
             "llm" => vault.set_summarizer(OpenAiSummarizerAdapter::new(&key, &summary_model)),
-            other => anyhow::bail!(
-                "unknown --summary-strategy '{other}'; expected 'concat' or 'llm'"
-            ),
+            other => {
+                anyhow::bail!("unknown --summary-strategy '{other}'; expected 'concat' or 'llm'")
+            }
         }
     }
     Ok(vault)
@@ -2022,7 +2299,10 @@ async fn cmd_embed_all(
     )
     .await?;
     eprintln!("Counting unembedded items…");
-    let pending = vault.embed_all_pending_counts().await.context("counting pending")?;
+    let pending = vault
+        .embed_all_pending_counts()
+        .await
+        .context("counting pending")?;
     eprintln!(
         "  {} unique segments to embed, {} conversations to embed",
         pending.0, pending.1

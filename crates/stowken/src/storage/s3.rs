@@ -43,9 +43,7 @@ use aws_sdk_s3::Client;
 use aws_smithy_runtime_api::client::result::SdkError;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{
-    AnalyticsQuery, ConversationManifest, SegmentHash, StoredSegment,
-};
+use crate::types::{AnalyticsQuery, ConversationManifest, SegmentHash, StoredSegment};
 
 use super::backend::{StorageBackend, StorageError, StorageResult};
 
@@ -79,11 +77,7 @@ pub struct S3Backend {
 impl S3Backend {
     /// Construct from an existing `aws_sdk_s3::Client`. Useful when the
     /// caller has custom config (custom endpoint, signing, retry policy).
-    pub fn new(
-        client: Client,
-        bucket: impl Into<String>,
-        prefix: impl Into<String>,
-    ) -> Self {
+    pub fn new(client: Client, bucket: impl Into<String>, prefix: impl Into<String>) -> Self {
         let mut prefix = prefix.into();
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
@@ -362,10 +356,9 @@ impl S3Backend {
             if let Some(token) = continuation.take() {
                 req = req.continuation_token(token);
             }
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| StorageError::BackendError(format!("list_objects_v2 {prefix}: {e}")))?;
+            let resp = req.send().await.map_err(|e| {
+                StorageError::BackendError(format!("list_objects_v2 {prefix}: {e}"))
+            })?;
             for obj in resp.contents() {
                 if let Some(k) = obj.key() {
                     out.push(k.to_owned());
@@ -457,7 +450,8 @@ impl StorageBackend for S3Backend {
     }
 
     async fn increment_ref(&self, hash: &SegmentHash) -> StorageResult<()> {
-        self.cas_update_meta(hash, |meta| meta.ref_count += 1).await?;
+        self.cas_update_meta(hash, |meta| meta.ref_count += 1)
+            .await?;
         Ok(())
     }
 
@@ -535,8 +529,7 @@ impl StorageBackend for S3Backend {
             }
             other => other,
         })?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| StorageError::SerializationError(e.to_string()))
+        serde_json::from_slice(&bytes).map_err(|e| StorageError::SerializationError(e.to_string()))
     }
 
     async fn delete_manifest(&self, id: &str) -> StorageResult<()> {
@@ -614,8 +607,12 @@ impl StorageBackend for S3Backend {
         let keys = self.list_keys_with_prefix(&prefix).await?;
         let mut out = Vec::new();
         for k in keys {
-            let Some(stripped) = k.strip_prefix(&prefix) else { continue };
-            let Some(hash_str) = stripped.strip_suffix(".meta") else { continue };
+            let Some(stripped) = k.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(hash_str) = stripped.strip_suffix(".meta") else {
+                continue;
+            };
             let hash = SegmentHash(hash_str.to_owned());
             if let Ok((meta, _)) = self.read_meta_with_etag(&hash).await {
                 if meta.ref_count == 0 {
@@ -649,10 +646,9 @@ impl StorageBackend for S3Backend {
             if let Some(token) = continuation.take() {
                 req = req.continuation_token(token);
             }
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| StorageError::BackendError(format!("list_objects_v2 {prefix}: {e}")))?;
+            let resp = req.send().await.map_err(|e| {
+                StorageError::BackendError(format!("list_objects_v2 {prefix}: {e}"))
+            })?;
             for obj in resp.contents() {
                 if let Some(k) = obj.key() {
                     if k.ends_with(".meta") {
@@ -675,7 +671,10 @@ impl StorageBackend for S3Backend {
 
 // ── SDK error helpers ─────────────────────────────────────────────────
 
-fn map_get_error<E>(e: SdkError<E, aws_smithy_runtime_api::http::Response>, key: &str) -> StorageError
+fn map_get_error<E>(
+    e: SdkError<E, aws_smithy_runtime_api::http::Response>,
+    key: &str,
+) -> StorageError
 where
     E: std::fmt::Display + std::fmt::Debug,
 {

@@ -3,4 +3,4 @@
 pub mod analytics;
 pub mod metadata;
 
-pub use metadata::{MetadataIndex, MetadataError, MetadataResult};
+pub use metadata::{MetadataError, MetadataIndex, MetadataResult};

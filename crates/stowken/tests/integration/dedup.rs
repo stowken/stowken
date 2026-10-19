@@ -55,8 +55,14 @@ async fn exact_dedup_system_prompt() {
     let stats = vault.stats().await.unwrap();
     // 10 conversations, each with 3 segments = 30 total refs
     // System prompt is shared → only 1 unique, but user/assistant are different → 20 unique + 1 shared = 21
-    assert!(stats.total_segments >= 30, "expected at least 30 total segment refs");
-    assert!(stats.unique_segments < stats.total_segments, "dedup should reduce unique count");
+    assert!(
+        stats.total_segments >= 30,
+        "expected at least 30 total segment refs"
+    );
+    assert!(
+        stats.unique_segments < stats.total_segments,
+        "dedup should reduce unique count"
+    );
     assert!(stats.dedup_ratio > 0.0, "dedup ratio should be positive");
 }
 
@@ -84,7 +90,10 @@ async fn same_conversation_twice_increments_refs() {
     let r2 = vault.store(conv).await.unwrap();
 
     // Second store should report 1 deduped segment, not a new one
-    assert_eq!(r2.new_segments, 0, "segment already exists; should not create a new one");
+    assert_eq!(
+        r2.new_segments, 0,
+        "segment already exists; should not create a new one"
+    );
     assert_eq!(r2.deduped_segments, 1);
 
     let stats = vault.stats().await.unwrap();
@@ -131,8 +140,15 @@ async fn system_prompt_listing() {
     }
 
     let prompts = vault.list_system_prompts().await.unwrap();
-    assert_eq!(prompts.len(), 1, "there should be exactly one unique system prompt");
-    assert_eq!(prompts[0].ref_count, 5, "system prompt should be referenced 5 times");
+    assert_eq!(
+        prompts.len(),
+        1,
+        "there should be exactly one unique system prompt"
+    );
+    assert_eq!(
+        prompts[0].ref_count, 5,
+        "system prompt should be referenced 5 times"
+    );
 }
 
 #[tokio::test]
@@ -150,5 +166,9 @@ async fn find_conversations_by_segment_hash() {
     let hash = &prompts[0].hash;
 
     let conv_ids = vault.find_by_segment(hash).await.unwrap();
-    assert_eq!(conv_ids.len(), 3, "all 3 conversations should reference the shared system prompt");
+    assert_eq!(
+        conv_ids.len(),
+        3,
+        "all 3 conversations should reference the shared system prompt"
+    );
 }
